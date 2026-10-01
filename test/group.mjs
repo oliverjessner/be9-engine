@@ -11,7 +11,7 @@ async function publishGroupEndpoint(owner, peers, version) {
     for (const peer of peers) {
         await peer.engine.addGroupKeys(groupID, [{
             version, groupKey: structuredClone(publicKey),
-        }]);
+        }], { decisions: [{ peerID: groupID + ':' + version, trust: 'confirmed' }] });
         await peer.database.whenIdle();
     }
     return groupID + ':' + version;

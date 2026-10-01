@@ -124,9 +124,10 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
     QUnit.test('Explicit scoped migration keeps identity, group fingerprint, old ciphertexts and reload interoperability', async function (assert) {
         const fixture = await scopedFixture(this);
         const { engine, database, identity, group } = fixture;
-        await this.bob.engine.addPublicKey('104', identity[0]);
-        await this.bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: group[0] }]);
-        await engine.addPublicKey(this.bob.id, this.bob.publicKey);
+        await this.bob.engine.addPublicKey('104', identity[0], { trust: 'confirmed' });
+        await this.bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: group[0] }],
+            { decisions: [{ peerID: 'g200:1', trust: 'confirmed' }] });
+        await engine.addPublicKey(this.bob.id, this.bob.publicKey, { trust: 'confirmed' });
         const packet = await this.bob.engine.encryptTextSimple(this.bob.id, '104', 'Before migration');
         const groupPacket = await this.bob.engine.encryptTextSimple(this.bob.id, 'g200:1', 'Old group');
         const blocked = await settles(engine.setup());

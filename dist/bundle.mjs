@@ -35,6 +35,7 @@ const STORES = Object.freeze({
     publicKeys: 'be8.publicKeys',
     privateKeys: 'be8.privateKeys',
     groupKeys: 'be8.groupKeys',
+    trust: 'be8.trust',
 });
 
 function engineError(message, code = 'INVALID_STATE') {
@@ -105,6 +106,7 @@ function upgradeBe8Schema(db, transaction) {
         [STORES.publicKeys, ['namespace', 'accID']],
         [STORES.privateKeys, ['namespace', 'accID']],
         [STORES.groupKeys, ['namespace', 'groupID', 'version']],
+        [STORES.trust, ['namespace', 'peerID']],
     ];
     try {
         for (const [name, keyPath] of definitions) {
@@ -257,21 +259,36 @@ const usages = Object.freeze(['deriveKey']);
 // Copy only key fields: embedded caller metadata cannot replace storage IDs.
 function keySnapshot(key, allowPrivate = false) {
     try {
+        const has = (field) => field in key;
         if (
             !key ||
             typeof key !== 'object' ||
             Array.isArray(key) ||
+            !['kty', 'crv', 'x', 'y'].every((field) =>
+                Object.hasOwn(key, field)
+            ) ||
             key.kty !== 'EC' ||
             key.crv !== 'P-384' ||
-            typeof key.x !== 'string' ||
-            !key.x ||
-            typeof key.y !== 'string' ||
-            !key.y ||
-            typeof key.ext !== 'boolean' ||
-            !Array.isArray(key.key_ops) ||
-            !key.key_ops.every((op) => typeof op === 'string') ||
-            (key.d !== undefined &&
-                (!allowPrivate || typeof key.d !== 'string' || !key.d))
+            ![key.x, key.y].every(
+                (value) =>
+                    typeof value === 'string' &&
+                    /^[A-Za-z0-9_-]{64}$/.test(value)
+            ) ||
+            (has('ext') && typeof key.ext !== 'boolean') ||
+            (has('use') && key.use !== 'enc') ||
+            (has('alg') && key.alg !== 'ECDH-ES') ||
+            (has('key_ops') &&
+                (!Array.isArray(key.key_ops) ||
+                    (!allowPrivate && key.key_ops.length !== 0) ||
+                    !key.key_ops.every((op) =>
+                        ['deriveKey', 'deriveBits'].includes(op)
+                    ) ||
+                    new Set(key.key_ops).size !== key.key_ops.length)) ||
+            ['p', 'q', 'dp', 'dq', 'qi', 'oth', 'k'].some(has) ||
+            (has('d') &&
+                (!allowPrivate ||
+                    typeof key.d !== 'string' ||
+                    !/^[A-Za-z0-9_-]{64}$/.test(key.d)))
         ) {
             throw engineError('invalid key data', 'INVALID_KEY');
         }
@@ -280,14 +297,52 @@ function keySnapshot(key, allowPrivate = false) {
             crv: key.crv,
             x: key.x,
             y: key.y,
-            ext: key.ext,
-            key_ops: [...key.key_ops],
+            ext: has('ext') ? key.ext : true,
+            key_ops: has('key_ops') ? [...key.key_ops] : [],
         };
-        if (allowPrivate && key.d !== undefined) snapshot.d = key.d;
+        if (allowPrivate && has('d')) snapshot.d = key.d;
         return snapshot;
     } catch {
         throw engineError('invalid key data', 'INVALID_KEY');
     }
+}
+
+async function validatePublicKey(publicJWK) {
+    const key = keySnapshot(publicJWK);
+    try {
+        // Native import validates the actual curve point, beyond JSON shape.
+        await crypto.subtle.importKey('jwk', key, ecdh, key.ext, []);
+    } catch {
+        throw engineError('invalid public P-384 ECDH key', 'INVALID_KEY');
+    }
+    return key;
+}
+
+function base64url(bytes) {
+    return btoa(String.fromCharCode(...new Uint8Array(bytes)))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+}
+
+async function preparePublicKey(publicJWK) {
+    const key = await validatePublicKey(publicJWK);
+    // RFC 7638 section 3.2: only required EC public members, lexicographic order.
+    const canonical = JSON.stringify({
+        crv: key.crv,
+        kty: key.kty,
+        x: key.x,
+        y: key.y,
+    });
+    const digest = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(canonical)
+    );
+    return { key, fingerprint: base64url(digest) };
+}
+
+async function jwkThumbprint(publicJWK) {
+    return (await preparePublicKey(publicJWK)).fingerprint;
 }
 
 function publicPart(key) {
@@ -347,11 +402,11 @@ async function generatePair() {
 }
 
 async function deriveAES(publicJWK, privateKey) {
-    const pub = keySnapshot(publicJWK);
+    const pub = await validatePublicKey(publicJWK);
     const priv = privateCryptoKey(privateKey);
     let imported;
     try {
-        imported = await crypto.subtle.importKey('jwk', pub, ecdh, true, []);
+        imported = await crypto.subtle.importKey('jwk', pub, ecdh, pub.ext, []);
     } catch {
         throw engineError('invalid public ECDH key', 'INVALID_KEY');
     }
@@ -432,6 +487,88 @@ async function migratePair(publicJWK, privateJWK) {
     }
 }
 
+function fingerprintValue(value) {
+    // A canonical, unpadded base64url encoding of a 32-byte SHA-256 digest.
+    if (
+        typeof value !== 'string' ||
+        !/^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(value)
+    ) {
+        throw engineError(
+            'invalid SHA-256 JWK thumbprint',
+            'INVALID_FINGERPRINT'
+        );
+    }
+    return value;
+}
+
+// This is a separate local argument, never read from an imported key/entry.
+function trustDecision(options = {}) {
+    if (
+        !options ||
+        typeof options !== 'object' ||
+        Array.isArray(options) ||
+        (options.trust !== undefined && options.trust !== 'confirmed') ||
+        (options.tofu !== undefined && typeof options.tofu !== 'boolean')
+    ) {
+        throw engineError(
+            'invalid local trust decision',
+            'INVALID_TRUST_DECISION'
+        );
+    }
+    return {
+        ...(options.expectedFingerprint !== undefined
+            ? {
+                  expectedFingerprint: fingerprintValue(
+                      options.expectedFingerprint
+                  ),
+              }
+            : {}),
+        ...(options.trust !== undefined ? { trust: options.trust } : {}),
+        tofu: options.tofu === true,
+    };
+}
+
+function checkTrustRecord(record) {
+    if (!record) return undefined;
+    fingerprintValue(record.fingerprint);
+    if (!['unverified', 'confirmed', 'tofu'].includes(record.status)) {
+        throw engineError(
+            'invalid persisted trust state',
+            'INVALID_TRUST_STATE'
+        );
+    }
+    return record;
+}
+
+function nextTrust(current, fingerprint, decision, firstContact) {
+    checkTrustRecord(current);
+    if (
+        decision.expectedFingerprint !== undefined &&
+        decision.expectedFingerprint !== fingerprint
+    ) {
+        throw engineError(
+            'public key does not match the expected fingerprint',
+            'FINGERPRINT_MISMATCH'
+        );
+    }
+    if (current && current.fingerprint !== fingerprint) {
+        throw engineError(
+            'peer public key changed; explicit replacement required',
+            'PUBLIC_KEY_CHANGED'
+        );
+    }
+    if (
+        decision.expectedFingerprint !== undefined ||
+        decision.trust === 'confirmed'
+    )
+        return 'confirmed';
+    if (current?.status === 'confirmed' || current?.status === 'tofu')
+        return current.status;
+    // TOFU is a first-contact policy, never a later confirmation or key change.
+    if (firstContact && decision.tofu) return 'tofu';
+    return 'unverified';
+}
+
 function accountID(id) {
     if (typeof id !== 'string' || !/^(0|[1-9][0-9]*)$/.test(id)) {
         throw engineError(
@@ -471,6 +608,50 @@ function groupVersion(version) {
         throw engineError('invalid group version', 'INVALID_GROUP');
     }
     return version;
+}
+
+function peerID(id) {
+    if (typeof id === 'string' && id.startsWith('g')) {
+        const [group, version, extra] = id.split(':');
+        if (extra !== undefined)
+            throw engineError('invalid group identifier', 'INVALID_GROUP');
+        return groupID(group) + ':' + groupVersion(version);
+    }
+    return accountID(id);
+}
+
+function localDecisions(options, ids) {
+    if (
+        !options ||
+        typeof options !== 'object' ||
+        Array.isArray(options) ||
+        (options.decisions !== undefined && !Array.isArray(options.decisions))
+    ) {
+        throw engineError(
+            'invalid local trust options',
+            'INVALID_TRUST_DECISION'
+        );
+    }
+    const fallback = trustDecision({ tofu: options.tofu });
+    const decisions = new Map();
+    for (const entry of options.decisions || []) {
+        const id = peerID(entry.peerID);
+        if (!ids.includes(id) || decisions.has(id)) {
+            throw engineError(
+                'trust decision must select one imported endpoint',
+                'INVALID_TRUST_DECISION'
+            );
+        }
+        decisions.set(
+            id,
+            trustDecision({
+                expectedFingerprint: entry.expectedFingerprint,
+                trust: entry.trust,
+                tofu: entry.tofu === undefined ? fallback.tofu : entry.tofu,
+            })
+        );
+    }
+    return (id) => decisions.get(id) || fallback;
 }
 
 function samePublic(left, right) {
@@ -634,7 +815,7 @@ class KeyStore {
         );
     }
 
-    async addPublicKeys(entries) {
+    async addPublicKeys(entries, options = {}) {
         let copied;
         try {
             copied = entries.map(({ accID, publicKey }) => ({
@@ -644,43 +825,216 @@ class KeyStore {
         } catch {
             throw engineError('invalid public-key entries', 'INVALID_KEY');
         }
+        const decisionFor = localDecisions(
+            options,
+            copied.map((entry) => entry.accID)
+        );
+        const prepared = await Promise.all(
+            copied.map(async (entry) => ({
+                ...entry,
+                ...(await preparePublicKey(entry.key)),
+                decision: decisionFor(entry.accID),
+            }))
+        );
         return this.run(
-            [STORES.publicKeys, STORES.privateKeys],
+            [STORES.publicKeys, STORES.privateKeys, STORES.trust],
             'readwrite',
             (tx) => {
                 const store = tx.objectStore(STORES.publicKeys);
+                const trust = tx.objectStore(STORES.trust);
                 return requestResult(
                     tx
                         .objectStore(STORES.privateKeys)
                         .get([this.namespace, this.accID]),
                     (own) => {
-                        for (const entry of copied) {
-                            if (
-                                entry.accID === this.accID &&
-                                own &&
-                                !samePublic(
-                                    entry.key,
-                                    own.publicKey || publicPart(own.key)
-                                )
-                            ) {
-                                throw engineError(
-                                    'cannot replace the public half of an existing identity',
-                                    'IDENTITY_CONFLICT'
-                                );
-                            }
-                        }
-                        return Promise.all(
-                            copied.map((entry) =>
-                                requestResult(
-                                    store.put({
-                                        namespace: this.namespace,
-                                        accID: entry.accID,
-                                        key: entry.key,
-                                    })
-                                )
-                            )
-                        ).then(() => undefined);
+                        const next = (index) => {
+                            if (index === prepared.length) return undefined;
+                            const entry = prepared[index];
+                            const storageKey = [this.namespace, entry.accID];
+                            return requestResult(
+                                store.get(storageKey),
+                                (existing) =>
+                                    requestResult(
+                                        trust.get(storageKey),
+                                        (current) => {
+                                            if (
+                                                entry.accID === this.accID &&
+                                                own
+                                            ) {
+                                                if (
+                                                    !samePublic(
+                                                        entry.key,
+                                                        own.publicKey ||
+                                                            publicPart(own.key)
+                                                    )
+                                                ) {
+                                                    throw engineError(
+                                                        'cannot replace the public half of an existing identity',
+                                                        'IDENTITY_CONFLICT'
+                                                    );
+                                                }
+                                                nextTrust(
+                                                    undefined,
+                                                    entry.fingerprint,
+                                                    entry.decision,
+                                                    false
+                                                );
+                                                return next(index + 1);
+                                            }
+                                            if (
+                                                existing &&
+                                                !samePublic(
+                                                    keySnapshot(existing.key),
+                                                    entry.key
+                                                )
+                                            ) {
+                                                throw engineError(
+                                                    'peer public key changed; explicit replacement required',
+                                                    'PUBLIC_KEY_CHANGED'
+                                                );
+                                            }
+                                            const status = nextTrust(
+                                                current,
+                                                entry.fingerprint,
+                                                entry.decision,
+                                                !existing && !current
+                                            );
+                                            return requestResult(
+                                                store.put({
+                                                    namespace: this.namespace,
+                                                    accID: entry.accID,
+                                                    key: entry.key,
+                                                }),
+                                                () =>
+                                                    requestResult(
+                                                        trust.put({
+                                                            namespace:
+                                                                this.namespace,
+                                                            peerID: entry.accID,
+                                                            fingerprint:
+                                                                entry.fingerprint,
+                                                            status,
+                                                        }),
+                                                        () => next(index + 1)
+                                                    )
+                                            );
+                                        }
+                                    )
+                            );
+                        };
+                        return next(0);
                     }
+                );
+            }
+        );
+    }
+
+    async peerTrust(id) {
+        const peer = peerID(id);
+        return this.run([STORES.trust], 'readonly', (tx) =>
+            requestResult(
+                tx.objectStore(STORES.trust).get([this.namespace, peer]),
+                (record) => {
+                    checkTrustRecord(record);
+                    return record
+                        ? {
+                              peerID: peer,
+                              fingerprint: record.fingerprint,
+                              status: record.status,
+                          }
+                        : undefined;
+                }
+            )
+        );
+    }
+
+    async replacePublicKey(
+        id,
+        publicKey,
+        { expectedPreviousFingerprint, confirmedNewFingerprint } = {}
+    ) {
+        const peer = accountID(id);
+        if (peer === this.accID)
+            throw engineError(
+                'own identity cannot be replaced through the peer API',
+                'IDENTITY_CONFLICT'
+            );
+        const previous = fingerprintValue(expectedPreviousFingerprint);
+        const confirmed = fingerprintValue(confirmedNewFingerprint);
+        const prepared = await preparePublicKey(publicKey);
+        if (confirmed !== prepared.fingerprint) {
+            throw engineError(
+                'new key does not match the confirmed fingerprint',
+                'FINGERPRINT_MISMATCH'
+            );
+        }
+        const snapshot = await this.run(
+            [STORES.publicKeys, STORES.trust],
+            'readonly',
+            (tx) =>
+                Promise.all([
+                    requestResult(
+                        tx
+                            .objectStore(STORES.publicKeys)
+                            .get([this.namespace, peer])
+                    ),
+                    requestResult(
+                        tx.objectStore(STORES.trust).get([this.namespace, peer])
+                    ),
+                ])
+        );
+        checkTrustRecord(snapshot[1]);
+        if (
+            !snapshot[0] ||
+            !snapshot[1] ||
+            snapshot[1].fingerprint !== previous ||
+            (await jwkThumbprint(snapshot[0].key)) !== previous
+        ) {
+            throw engineError(
+                'previous fingerprint no longer matches; replacement refused',
+                'TRUST_CONFLICT'
+            );
+        }
+        const originalKey = keySnapshot(snapshot[0].key);
+        return this.run(
+            [STORES.publicKeys, STORES.trust],
+            'readwrite',
+            (tx) => {
+                const store = tx.objectStore(STORES.publicKeys);
+                const trust = tx.objectStore(STORES.trust);
+                const storageKey = [this.namespace, peer];
+                return requestResult(store.get(storageKey), (existing) =>
+                    requestResult(trust.get(storageKey), (current) => {
+                        checkTrustRecord(current);
+                        if (
+                            !existing ||
+                            !current ||
+                            current.fingerprint !== previous ||
+                            !samePublic(existing.key, originalKey)
+                        ) {
+                            throw engineError(
+                                'previous fingerprint no longer matches; replacement refused',
+                                'TRUST_CONFLICT'
+                            );
+                        }
+                        return requestResult(
+                            store.put({
+                                namespace: this.namespace,
+                                accID: peer,
+                                key: prepared.key,
+                            }),
+                            () =>
+                                requestResult(
+                                    trust.put({
+                                        namespace: this.namespace,
+                                        peerID: peer,
+                                        fingerprint: prepared.fingerprint,
+                                        status: 'confirmed',
+                                    }),
+                                    () => undefined
+                                )
+                        );
+                    })
                 );
             }
         );
@@ -751,7 +1105,7 @@ class KeyStore {
         );
     }
 
-    async addGroupKeys(id, entries) {
+    async addGroupKeys(id, entries, options = {}) {
         const group = groupID(id);
         let copied;
         try {
@@ -762,13 +1116,25 @@ class KeyStore {
         } catch {
             throw engineError('invalid group-key entries', 'INVALID_KEY');
         }
-        return this.run([STORES.groupKeys], 'readwrite', (tx) => {
+        const decisionFor = localDecisions(
+            options,
+            copied.map((entry) => group + ':' + entry.version)
+        );
+        const prepared = await Promise.all(
+            copied.map(async (entry) => ({
+                ...entry,
+                ...(await preparePublicKey(entry.key)),
+                decision: decisionFor(group + ':' + entry.version),
+            }))
+        );
+        return this.run([STORES.groupKeys, STORES.trust], 'readwrite', (tx) => {
             const store = tx.objectStore(STORES.groupKeys);
+            const trust = tx.objectStore(STORES.trust);
             // Chain native success events to validate each immutable version,
             // including repeated versions within the same caller batch.
             const putNext = (index) => {
-                if (index === copied.length) return undefined;
-                const { version, key } = copied[index];
+                if (index === prepared.length) return undefined;
+                const { version, key, fingerprint, decision } = prepared[index];
                 const storageKey = [this.namespace, group, version];
                 return requestResult(store.get(storageKey), (existing) => {
                     if (existing && !samePublic(existing.key, key)) {
@@ -781,21 +1147,47 @@ class KeyStore {
                     if (existing?.key.d !== undefined)
                         privateCryptoKey(existing.key);
                     const retained = existing || { key };
+                    const write = () =>
+                        requestResult(
+                            store.put({
+                                namespace: this.namespace,
+                                groupID: group,
+                                version,
+                                key: retained.key,
+                                ...(retained.privateKey
+                                    ? {
+                                          privateKey: privateCryptoKey(
+                                              retained.privateKey
+                                          ),
+                                      }
+                                    : {}),
+                            }),
+                            () => putNext(index + 1)
+                        );
+                    if (retained.privateKey) {
+                        nextTrust(undefined, fingerprint, decision, false);
+                        return write();
+                    }
+                    const peer = group + ':' + version;
                     return requestResult(
-                        store.put({
-                            namespace: this.namespace,
-                            groupID: group,
-                            version,
-                            key: retained.key,
-                            ...(retained.privateKey
-                                ? {
-                                      privateKey: privateCryptoKey(
-                                          retained.privateKey
-                                      ),
-                                  }
-                                : {}),
-                        }),
-                        () => putNext(index + 1)
+                        trust.get([this.namespace, peer]),
+                        (current) => {
+                            const status = nextTrust(
+                                current,
+                                fingerprint,
+                                decision,
+                                !existing && !current
+                            );
+                            return requestResult(
+                                trust.put({
+                                    namespace: this.namespace,
+                                    peerID: peer,
+                                    fingerprint,
+                                    status,
+                                }),
+                                write
+                            );
+                        }
                     );
                 });
             };
@@ -835,7 +1227,7 @@ class KeyStore {
         });
     }
 
-    async endpointKeys(publicID, privateID) {
+    async endpointKeys(publicID, privateID, requireTrust = false) {
         const parse = (id) => {
             if (typeof id === 'string' && id.startsWith('g')) {
                 const parts = id.split(':');
@@ -861,25 +1253,173 @@ class KeyStore {
         const pub = parse(publicID);
         const priv = parse(privateID);
         if (priv.store === STORES.publicKeys) priv.store = STORES.privateKeys;
-        return this.run([pub.store, priv.store], 'readonly', (tx) =>
-            Promise.all([
-                requestResult(
-                    tx.objectStore(pub.store).get(pub.key),
-                    (record) => (record ? publicPart(record.key) : undefined)
-                ),
-                // Only this scope's account private identity may ever be selected.
-                priv.store === STORES.privateKeys && privateID !== this.accID
-                    ? undefined
-                    : requestResult(
-                          tx.objectStore(priv.store).get(priv.key),
-                          (record) =>
-                              record
-                                  ? priv.store === STORES.privateKeys
-                                      ? privateCryptoKey(record.key)
-                                      : groupPair(record)[1]
-                                  : undefined
-                      ),
-            ])
+        const [publicRecord, privateKey, trust] = await this.run(
+            [pub.store, priv.store, ...(requireTrust ? [STORES.trust] : [])],
+            'readonly',
+            (tx) =>
+                Promise.all([
+                    requestResult(tx.objectStore(pub.store).get(pub.key)),
+                    // Only this scope's account private identity may ever be selected.
+                    priv.store === STORES.privateKeys &&
+                    privateID !== this.accID
+                        ? undefined
+                        : requestResult(
+                              tx.objectStore(priv.store).get(priv.key),
+                              (record) =>
+                                  record
+                                      ? priv.store === STORES.privateKeys
+                                          ? privateCryptoKey(record.key)
+                                          : groupPair(record)[1]
+                                      : undefined
+                          ),
+                    requireTrust
+                        ? requestResult(
+                              tx
+                                  .objectStore(STORES.trust)
+                                  .get([this.namespace, peerID(publicID)])
+                          )
+                        : undefined,
+                ])
+        );
+        const publicKey = publicRecord
+            ? pub.store === STORES.groupKeys
+                ? publicPart(publicRecord.key)
+                : keySnapshot(publicRecord.key)
+            : undefined;
+        const local =
+            publicID === this.accID ||
+            (pub.store === STORES.groupKeys && publicRecord?.privateKey);
+        if (publicKey && requireTrust && !local) {
+            checkTrustRecord(trust);
+            if (!trust || trust.status === 'unverified') {
+                throw engineError(
+                    'peer public key requires an explicit local trust decision',
+                    'UNTRUSTED_PUBLIC_KEY'
+                );
+            }
+            if ((await jwkThumbprint(publicKey)) !== trust.fingerprint) {
+                throw engineError(
+                    'persisted key and trust fingerprint disagree',
+                    'INVALID_TRUST_STATE'
+                );
+            }
+        }
+        return [publicKey, privateKey];
+    }
+
+    async migratePublicKeyTrust() {
+        const snapshot = await this.run(
+            [STORES.publicKeys, STORES.groupKeys],
+            'readonly',
+            (tx) =>
+                Promise.all([
+                    requestResult(
+                        tx
+                            .objectStore(STORES.publicKeys)
+                            .index('namespace')
+                            .getAll(this.namespace)
+                    ),
+                    requestResult(
+                        tx
+                            .objectStore(STORES.groupKeys)
+                            .index('namespace')
+                            .getAll(this.namespace)
+                    ),
+                ])
+        );
+        const entries = [
+            ...snapshot[0]
+                .filter((record) => record.accID !== this.accID)
+                .map((record) => ({
+                    peerID: accountID(record.accID),
+                    store: STORES.publicKeys,
+                    storageKey: [this.namespace, record.accID],
+                    key: record.key,
+                })),
+            ...snapshot[1]
+                .filter(
+                    (record) =>
+                        !record.privateKey && record.key?.d === undefined
+                )
+                .map((record) => ({
+                    peerID:
+                        groupID(record.groupID) +
+                        ':' +
+                        groupVersion(record.version),
+                    store: STORES.groupKeys,
+                    storageKey: [
+                        this.namespace,
+                        record.groupID,
+                        record.version,
+                    ],
+                    key: record.key,
+                })),
+        ];
+        const prepared = await Promise.all(
+            entries.map(async (entry) => ({
+                ...entry,
+                ...(await preparePublicKey(entry.key)),
+            }))
+        );
+        return this.run(
+            [STORES.publicKeys, STORES.groupKeys, STORES.trust],
+            'readwrite',
+            (tx) => {
+                const trust = tx.objectStore(STORES.trust);
+                let migratedPeers = 0;
+                const next = (index) => {
+                    if (index === prepared.length) return { migratedPeers };
+                    const entry = prepared[index];
+                    return requestResult(
+                        tx.objectStore(entry.store).get(entry.storageKey),
+                        (existing) => {
+                            if (
+                                !existing ||
+                                !samePublic(
+                                    keySnapshot(existing.key),
+                                    entry.key
+                                ) ||
+                                (entry.store === STORES.groupKeys &&
+                                    existing.privateKey)
+                            ) {
+                                throw engineError(
+                                    'public records changed during trust migration',
+                                    'MIGRATION_CONFLICT'
+                                );
+                            }
+                            return requestResult(
+                                trust.get([this.namespace, entry.peerID]),
+                                (current) => {
+                                    checkTrustRecord(current);
+                                    if (current) {
+                                        if (
+                                            current.fingerprint !==
+                                            entry.fingerprint
+                                        ) {
+                                            throw engineError(
+                                                'persisted key and trust state disagree',
+                                                'INVALID_TRUST_STATE'
+                                            );
+                                        }
+                                        return next(index + 1);
+                                    }
+                                    migratedPeers++;
+                                    return requestResult(
+                                        trust.add({
+                                            namespace: this.namespace,
+                                            peerID: entry.peerID,
+                                            fingerprint: entry.fingerprint,
+                                            status: 'unverified',
+                                        }),
+                                        () => next(index + 1)
+                                    );
+                                }
+                            );
+                        }
+                    );
+                };
+                return next(0);
+            }
         );
     }
 
@@ -1135,7 +1675,12 @@ class KeyStore {
 
     async clear() {
         await this.run(
-            [STORES.publicKeys, STORES.privateKeys, STORES.groupKeys],
+            [
+                STORES.publicKeys,
+                STORES.privateKeys,
+                STORES.groupKeys,
+                STORES.trust,
+            ],
             'readwrite',
             (tx) =>
                 Promise.all(
@@ -1143,6 +1688,7 @@ class KeyStore {
                         STORES.publicKeys,
                         STORES.privateKeys,
                         STORES.groupKeys,
+                        STORES.trust,
                     ].map((name) => {
                         const store = tx.objectStore(name);
                         return requestResult(
@@ -1165,6 +1711,7 @@ class KeyStore {
 class Be8 {
     static upgradeBe8Schema = upgradeBe8Schema;
     static STORES = STORES;
+    static jwkThumbprint = jwkThumbprint;
 
     #keys;
     #accID;
@@ -1256,24 +1803,41 @@ class Be8 {
         return id === this.#accID && !!(await this.#keys.identity());
     }
 
-    async addPublicKeys(publicKeys = []) {
+    async addPublicKeys(publicKeys = [], options = {}) {
         if (!Array.isArray(publicKeys))
             throw engineError('public keys must be an array', 'INVALID_KEY');
-        await this.#keys.addPublicKeys(publicKeys);
+        await this.#keys.addPublicKeys(publicKeys, options);
     }
 
-    async addPublicKey(accID, key) {
-        await this.addPublicKeys([{ accID, publicKey: key }]);
+    async addPublicKey(
+        accID,
+        key,
+        { expectedFingerprint, trust, tofu = false } = {}
+    ) {
+        await this.addPublicKeys([{ accID, publicKey: key }], {
+            tofu,
+            decisions: [{ peerID: accID, expectedFingerprint, trust }],
+        });
     }
 
-    async addGroupKeys(group, groupKeys) {
+    async getPeerTrust(id) {
+        return this.#keys.peerTrust(id);
+    }
+    async migratePublicKeyTrust() {
+        return this.#keys.migratePublicKeyTrust();
+    }
+    async replacePublicKey(id, publicKey, confirmation) {
+        return this.#keys.replacePublicKey(id, publicKey, confirmation);
+    }
+
+    async addGroupKeys(group, groupKeys, options = {}) {
         if (!Array.isArray(groupKeys) || !groupKeys.length) {
             throw engineError(
                 'group keys must be a nonempty array',
                 'INVALID_KEY'
             );
         }
-        await this.#keys.addGroupKeys(group, groupKeys);
+        await this.#keys.addGroupKeys(group, groupKeys, options);
     }
 
     async getMyPublicKey() {
@@ -1401,7 +1965,8 @@ class Be8 {
     async encryptTextSimple(accIDSender, accIDReceiver, text) {
         const [publicKey, privateKey] = await this.#keys.endpointKeys(
             accIDReceiver,
-            accIDSender
+            accIDSender,
+            true
         );
 
         if (!publicKey) {
@@ -1423,7 +1988,8 @@ class Be8 {
     async decryptTextSimple(accIDSender, accIDReceiver, cipherText, iv) {
         const [publicKey, privateKey] = await this.#keys.endpointKeys(
             accIDSender,
-            accIDReceiver
+            accIDReceiver,
+            true
         );
 
         if (!publicKey) {
@@ -1486,7 +2052,8 @@ class Be8 {
     async encryptImageSimple(accIDSender, accIDReceiver, base64Image) {
         const [publicKey, privateKey] = await this.#keys.endpointKeys(
             accIDReceiver,
-            accIDSender
+            accIDSender,
+            true
         );
 
         if (!publicKey) {
@@ -1508,7 +2075,8 @@ class Be8 {
     async decryptImageSimple(accIDSender, accIDReceiver, cipherImage, iv) {
         const [publicKey, privateKey] = await this.#keys.endpointKeys(
             accIDSender,
-            accIDReceiver
+            accIDReceiver,
+            true
         );
 
         if (!publicKey) {
@@ -1532,4 +2100,4 @@ class Be8 {
     }
 }
 
-export { STORES, Be8 as default, upgradeBe8Schema };
+export { STORES, Be8 as default, jwkThumbprint, upgradeBe8Schema };

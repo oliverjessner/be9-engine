@@ -51,8 +51,9 @@ or replaced. The engine uses these dedicated stores alongside application stores
 | `be8.publicKeys` | `[namespace, accID]` | Public JWK in a separate `key` field |
 | `be8.privateKeys` | `[namespace, accID]` | Non-extractable private ECDH `CryptoKey` in `key`, public JWK in `publicKey` |
 | `be8.groupKeys` | `[namespace, groupID, version]` | Public JWK in `key`, optional non-extractable ECDH `CryptoKey` in `privateKey` |
+| `be8.trust` | `[namespace, peerID]` | SHA-256 thumbprint and local `unverified`, `confirmed`, or `tofu` status |
 
-The three key stores have a nonunique `namespace` index. A namespace is bound to
+The three key stores and the trust store have a nonunique `namespace` index. A namespace is bound to
 one account on its first successful mutation. A different account cannot read,
 write, initialize, or clear it. The same account can use multiple explicitly
 chosen namespaces, each with its own identity. The application must treat these
@@ -73,7 +74,8 @@ capability. No private-JWK fallback is attempted. Raw request errors, key values
 logged or attached as error causes.
 
 Persistent reads use `readonly`. There are no per-instance key caches: simplified
-encryption/decryption reads both endpoint keys in one committed database snapshot.
+encryption/decryption reads both endpoint keys and the peer trust record in one
+committed database snapshot.
 Independent instances/connections therefore see committed mutations on their next
 operation. Concurrent overlapping write transactions are ordered by IndexedDB.
 Commit completion is not a guarantee against every hardware or power-loss failure;
@@ -86,6 +88,149 @@ inconsistent coordinates, and database failures reject instead of replacing the
 identity. There is no implicit identity rotation.
 `setup()` accepts no migration options. Migration is a separate explicit
 operation; setup never silently imports old private JWKs.
+
+### Public-key validation, fingerprints and local trust
+
+All public import paths validate EC/P-384 keys with canonical unpadded base64url
+coordinates of exactly 48 bytes each, then use native WebCrypto import to check
+that they describe a valid curve point. Private fields (including an explicitly
+present `d: undefined`) are rejected. Optional `ext` must be boolean, `key_ops`
+must be an empty array for ECDH public keys, `use` may only be `enc`, and `alg`
+may only be `ECDH-ES`. Absent `ext`/`key_ops` normalize to `true`/`[]`. Other
+public labels and account metadata are ignored. Accepting the key's ECDH usage
+label does not implement JOSE ECDH-ES or its KDF/envelope. Primitive derivation
+validates the same supported public-key profile.
+
+```javascript
+import Be8, { jwkThumbprint } from 'be8-engine';
+const fingerprint = await jwkThumbprint(bobPublicJWK);
+// Also available as Be8.jwkThumbprint(), including on the IIFE constructor.
+```
+
+The thumbprint follows [RFC 7638](https://www.rfc-editor.org/rfc/rfc7638.html):
+SHA-256 of UTF-8 JSON containing only `crv`, `kty`, `x`, `y`, in that exact
+lexicographic order, without whitespace. The returned digest is canonical
+unpadded base64url (43 characters). Optional JWK members, property order,
+account IDs, namespace, and verification labels do not enter the hash.
+
+Ordinary imports never replace an existing different point. New peer keys are
+stored with a separate namespace-local trust record as `unverified` by default.
+Convenience text/image encryption **and** decryption reject these peers with
+`UNTRUSTED_PUBLIC_KEY`. The application can confirm the key through a separate
+local argument, either using an independently established expected fingerprint
+or making its own explicit trust decision:
+
+```javascript
+// Default: retain the key for inspection, without authorizing convenience use.
+await be8.addPublicKey('2', bobPublicJWK);
+
+// A fingerprint supplied by the application from its independent trust process.
+await be8.addPublicKey('2', bobPublicJWK, { expectedFingerprint: independentlyConfirmedFingerprint });
+
+// Alternatively, the application explicitly takes responsibility for trust.
+await be8.addPublicKey('2', bobPublicJWK, { trust: 'confirmed' });
+const trust = await be8.getPeerTrust('2');
+// { peerID: '2', fingerprint, status: 'unverified' | 'confirmed' | 'tofu' }
+// undefined means no persisted decision exists; it never grants authorization.
+```
+
+**A fingerprint from the same unconfirmed source as the key does not independently
+confirm the peer's identity.** The engine checks equality, not the provenance of
+an application's decision. Imported `verified: true`, `trust`, or fingerprint
+fields inside a JWK or key entry are never evidence of trust. Do not copy network
+objects into the separate local decision argument.
+
+TOFU is enabled only explicitly, per import:
+
+```javascript
+await be8.addPublicKey('2', bobPublicJWK, { tofu: true });
+```
+
+TOFU grants convenience use only for a genuinely new contact with neither an
+existing public record nor a trust record. Its status remains `tofu`, distinct
+from `confirmed`; it offers no independent identity proof on first contact. It
+cannot retroactively approve an old unverified contact, authorize a changed key,
+or downgrade a confirmed decision. Confirming the same key later can promote
+TOFU to `confirmed`. Reimporting an unchanged confirmed/TOFU key without a new
+decision preserves its status. A wrong expected fingerprint rejects with
+`FINGERPRINT_MISMATCH`; a different ordinary peer import rejects with
+`PUBLIC_KEY_CHANGED`, preserving the old public key and trust record.
+
+Bulk decisions are a separate application-owned list selected by `peerID`:
+
+```javascript
+await be8.addPublicKeys([
+    { accID: '2', publicKey: bobPublicJWK },
+    { accID: '3', publicKey: carolPublicJWK },
+], { decisions: [
+    { peerID: '2', expectedFingerprint: independentlyConfirmedBobFingerprint },
+    { peerID: '3', trust: 'confirmed' },
+] });
+// Optional { tofu: true } applies first-contact TOFU to undecided entries.
+```
+
+Every key is validated and hashed before the write transaction. Bulk imports
+recheck keys and trust under one write lock, including repeated peer IDs. Any
+validation, fingerprint, replacement, or native write failure rejects the entire
+batch. Public records and trust records commit together. Decisions cannot override
+separately supplied account or namespace metadata.
+
+Remote public group endpoints use the same policy, with `peerID: 'g10300:1'`:
+
+```javascript
+await be8.addGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }], {
+    decisions: [{ peerID: 'g10300:1', expectedFingerprint: independentlyConfirmedGroupFingerprint }],
+});
+```
+
+Existing group versions remain immutable (`GROUP_CONFLICT` on changed coordinates);
+use a new explicit version rather than replacing a retained group identity.
+The namespace's own identity and locally generated/migrated private group keys
+are local keys, not remote peer trust decisions. Primitive `getDerivedKey()` and
+raw AES methods do not infer peer identity: callers of these lower-level APIs
+must enforce their own trust policy. Use the convenience methods for persisted
+peer-trust enforcement.
+
+### Explicit peer key replacement and old trust records
+
+Peer replacement is a separate compare-and-swap operation:
+
+```javascript
+await be8.replacePublicKey('2', newBobPublicJWK, {
+    expectedPreviousFingerprint: previouslyStoredBobFingerprint,
+    confirmedNewFingerprint: independentlyConfirmedNewBobFingerprint,
+});
+```
+
+Both fingerprints are required. The new confirmed fingerprint must match the
+validated candidate. The engine validates the current point/fingerprint and
+rechecks it in the write transaction. If another connection changes the peer,
+the stale replacement rejects with `TRUST_CONFLICT`. Public key and `confirmed`
+trust state replace the previous records atomically, only reporting success after
+commit. This API cannot rotate the local private identity or mutate a group
+version. It does not create a public-key history; callers needing old public keys
+for old ciphertexts must retain that public context explicitly. Already-running
+crypto operations may finish with the committed snapshot they read before a
+replacement; a trust update is not cancellation of in-flight work.
+
+Existing applications must increment their own database version and call
+`upgradeBe8Schema()` in their upgrade handler to create `be8.trust`. The helper
+only creates/checks dedicated engine schema; it does not validate or confirm old
+keys. Records lacking trust remain unauthorized. After integrating the schema,
+the application can explicitly initialize trust records for the old scoped public
+peer/group records:
+
+```javascript
+const { migratedPeers } = await be8.migratePublicKeyTrust();
+```
+
+This validates existing public keys and atomically adds only missing `unverified`
+trust records. It preserves public keys, private identity, application data, and
+existing valid local decisions. Old `verified` flags are ignored. Invalid data or
+concurrent changes reject without partial migration. Old unchecked contacts cannot
+become TOFU by reimport; confirm the unchanged key explicitly, or use the separate
+replacement API after the old fingerprint is recorded. Private-JWK migration
+remains a separate operation and never confirms old remote public keys.
 
 ### Non-extractable local keys and migration
 
@@ -182,10 +327,14 @@ It also does not guarantee forensic erasure of prior JWK storage.
 - Group IDs match `g[A-Za-z0-9_-]+`; versions are positive safe integers, with
   canonical decimal strings accepted and normalized for new records. A group
   version cannot be replaced with different public coordinates.
-- `panic()` still explicitly clears only the current namespace's key records
+- `panic()` still explicitly clears only the current namespace's key and trust records
   atomically, retaining its account binding, application stores, other namespaces,
   and unselected legacy records. It never deletes the application database.
-- Named ESM/static integration exports are `upgradeBe8Schema` and `STORES`.
+- Public imports remain async but no longer silently replace peers. Calls without
+  local trust options retain first-contact data as unverified. Convenience calls
+  now require a confirmed or explicitly TOFU peer; update callers accordingly.
+- Added `getPeerTrust()`, `replacePublicKey()`, and `migratePublicKeyTrust()`.
+- Named ESM/static exports are `upgradeBe8Schema`, `STORES`, and `jwkThumbprint`.
   The IIFE remains a callable `be8` constructor with the same static helpers.
 
 ## hasGeneratedKeys()
@@ -203,26 +352,30 @@ Return the accID.
 be8.getAccID();
 ```
 
-## async addPublicKeys(publicKeys = [])
-Stores a caller-selected batch of peer public keys atomically in the current namespace.
+## async addPublicKeys(publicKeys = [], options = {})
+Stores a validated batch and its local trust decisions atomically. Without
+separate decisions, first-contact keys remain unverified. Changed peer keys reject.
 
 ```javascript
 const publicKeys = [{ accID: '2', publicKey: bobPublicJWK }];
 await be8.addPublicKeys(publicKeys);
 ```
 
-## async addPublicKey(accID, key)
-Stores one peer public key and resolves only after commit.
+## async addPublicKey(accID, key, decision = {})
+Stores one peer public key and local trust state, resolving only after commit.
+Confirm through a separate local argument before convenience use.
 
 ```javascript
-await be8.addPublicKey('2', bobPublicJWK);
+await be8.addPublicKey('2', bobPublicJWK, { expectedFingerprint: independentlyConfirmedFingerprint });
 ```
 
-## async addGroupKeys(groupID, keys)
-Group keys are stored separately in the current namespace.
+## async addGroupKeys(groupID, keys, options = {})
+Remote public group endpoints require their own separate local trust decision.
 
 ```javascript
-await be8.addGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }]);
+await be8.addGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }], {
+    decisions: [{ peerID: 'g10300:1', trust: 'confirmed' }],
+});
 ```
 
 ## async generatePrivAndPubKey()
@@ -384,7 +537,13 @@ and AES export refusal, records without `d`, opaque references, reload
 interoperability, fingerprint preservation, old ciphertext readability, scoped
 and selected unscoped group migration, abort after writes/deletions, mismatched
 scalars, missing clone capability, native DataCloneError rollback, and concurrent
-migration conflict handling. The previous commit contract assertions remain strict and now pass.
+migration conflict handling. `test/trust.mjs` verifies an independent RFC 7638
+vector, strict native point/usage validation, first-contact quarantine, ignored
+network verification flags, wrong expected fingerprints, TOFU, idempotent
+reimports, bulk rollback, explicit replacements and concurrent compare-and-swap,
+trust persistence/isolation, and old schema migration without false verification.
+The participant fixtures make separate explicit local decisions for their known
+synthetic peers; no trust record is taken from an exchanged key object.
 Timeouts in the runner and failure tests are failure deadlines, not readiness
 waits. Test output excludes assertion data and raw browser errors.
 

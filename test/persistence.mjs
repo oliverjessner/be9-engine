@@ -76,6 +76,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         database.observe(undefined);
         assert.strictEqual(database.acknowledgeAborts(), 1, 'The failed batch was aborted');
         assert.deepEqual(await storedIDs(database, 'publicKeys'), ['104'], 'No partial batch is stored');
+        assert.strictEqual(await engine.getPeerTrust('102'), undefined, 'The earlier trust record was rolled back with its public key');
         await assert.rejects(engine.encryptTextSimple('104', '102', 'Input'), /Missing public key/,
             'An uncommitted peer key is unavailable to the engine');
         await outcome(engine.addPublicKey('102', this.bob.publicKey));
@@ -188,32 +189,39 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const regenerated = await right.generatePrivAndPubKey();
         assert.true(regenerated.publicKey.x === leftKey.x, 'Explicit generation is idempotent rather than implicit rotation');
         assert.deepEqual(await storedIDs(database), ['104'], 'One private identity is committed');
-        await left.addPublicKey(this.bob.id, this.bob.publicKey);
-        await this.bob.engine.addPublicKey('104', leftKey);
+        await left.addPublicKey(this.bob.id, this.bob.publicKey, { trust: 'confirmed' });
+        await this.bob.engine.addPublicKey('104', leftKey, { trust: 'confirmed' });
         const packet = await right.encryptTextSimple('104', this.bob.id, 'Independent connection');
         assert.true(await this.bob.engine.decryptTextSimple('104', this.bob.id, packet.cipherText, packet.iv) === 'Independent connection',
             'The other connection sees a committed public-key mutation without stale state');
     });
 
-    QUnit.test('Parallel mutations on independent connections agree with the final database state', async function (assert) {
+    QUnit.test('Conflicting parallel first-contact imports retain one atomic key and trust record', async function (assert) {
         const database = this.alice.database;
         const secondDB = await this.open(database.name);
         const other = new Be8(this.alice.id, secondDB.connection);
         await other.setup();
-        const result = await outcome(Promise.all([
-            this.alice.engine.addPublicKey(this.bob.id, this.bob.publicKey),
-            other.addPublicKey(this.bob.id, this.eve.publicKey),
+        const result = await outcome(Promise.allSettled([
+            this.alice.engine.addPublicKey(this.bob.id, this.bob.publicKey, { trust: 'confirmed' }),
+            other.addPublicKey(this.bob.id, this.eve.publicKey, { trust: 'confirmed' }),
         ]));
-        assert.strictEqual(result.status, 'fulfilled', 'Both concurrent mutations commit');
+        assert.strictEqual(result.status, 'fulfilled', 'Both concurrent import promises settle');
+        assert.strictEqual(result.value.filter(entry => entry.status === 'fulfilled').length, 1, 'Exactly one first-contact import commits');
+        assert.true(result.value.find(entry => entry.status === 'rejected').reason.code === 'PUBLIC_KEY_CHANGED',
+            'The competing key is rejected as a key change');
+        database.acknowledgeAborts();
+        secondDB.acknowledgeAborts();
         const stored = await readRecord(database, 'publicKeys', [this.alice.id, this.bob.id]);
-        assert.true(stored.x === this.eve.publicKey.x, 'The last scheduled transaction wins');
-        const packet = await this.alice.engine.encryptTextSimple(this.alice.id, this.bob.id, 'Latest committed key');
-        const eveKey = await this.eve.derive(this.alice.publicKey);
-        assert.true(await this.eve.engine.decryptText(eveKey, packet.cipherText, packet.iv) === 'Latest committed key',
-            'The earlier instance reads the final committed key instead of an older cached value');
-        const bobKey = await this.bob.derive(this.alice.publicKey);
-        await assert.rejects(this.bob.engine.decryptText(bobKey, packet.cipherText, packet.iv),
-            isAuthenticationFailure, 'The replaced peer key is no longer used for encryption');
+        const winner = stored.x === this.bob.publicKey.x ? this.bob : this.eve;
+        const loser = winner === this.bob ? this.eve : this.bob;
+        assert.true(stored.x === winner.publicKey.x, 'The winning committed public key is retained');
+        const packet = await this.alice.engine.encryptTextSimple(this.alice.id, this.bob.id, 'Committed trust snapshot');
+        const winnerKey = await winner.derive(this.alice.publicKey);
+        assert.true(await winner.engine.decryptText(winnerKey, packet.cipherText, packet.iv) === 'Committed trust snapshot',
+            'Convenience operations use the committed key and matching trust decision');
+        const loserKey = await loser.derive(this.alice.publicKey);
+        await assert.rejects(loser.engine.decryptText(loserKey, packet.cipherText, packet.iv),
+            isAuthenticationFailure, 'The rejected key is never silently selected');
     });
 
     QUnit.test('All read methods open readonly transactions', async function (assert) {
@@ -272,7 +280,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         await outcome(Promise.all([alice.setup(), bob.setup()]));
         const alicePub = await alice.getMyPublicKey();
         const bobPub = await bob.getMyPublicKey();
-        await outcome(Promise.all([alice.addPublicKey('202', bobPub), bob.addPublicKey('201', alicePub)]));
+        await outcome(Promise.all([alice.addPublicKey('202', bobPub, { trust: 'confirmed' }), bob.addPublicKey('201', alicePub, { trust: 'confirmed' })]));
         const packet = await alice.encryptTextSimple('201', '202', 'Shared database');
         assert.true(await bob.decryptTextSimple('201', '202', packet.cipherText, packet.iv) === 'Shared database',
             'Separate scopes interoperate using public exchange in the same application database');
@@ -353,7 +361,8 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         assert.true(result.value[0].publicKey.x === result.value[1].publicKey.x, 'Both receive the committed group identity');
         const groupPublic = result.value[0].publicKey;
         await exchangePublicKeys(alice, bob);
-        await bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: groupPublic }]);
+        await bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: groupPublic }],
+            { decisions: [{ peerID: 'g200:1', trust: 'confirmed' }] });
         await alice.engine.addGroupKeys('g200', [{ version: 1, groupKey: groupPublic }]);
         rejected(assert, await outcome(alice.engine.addGroupKeys('g200', [{ version: 1, groupKey: bob.publicKey }])),
             'A different key cannot overwrite the same group version');

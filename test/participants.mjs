@@ -24,7 +24,11 @@ export async function exchangePublicKeys(...participants) {
         await receiver.engine.addPublicKeys(peers.map(peer => ({
             accID: peer.id,
             publicKey: structuredClone(peer.publicKey),
-        })));
+        })), {
+            // The test application explicitly trusts its known local participants.
+            // No decision is read from the exchanged key objects.
+            decisions: peers.map(peer => ({ peerID: peer.id, trust: 'confirmed' })),
+        });
         await receiver.database.whenIdle();
     }
 }
