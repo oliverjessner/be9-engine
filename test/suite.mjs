@@ -27,4 +27,5 @@ await import('./group.mjs');
 await import('./image.mjs');
 await import('./exceptions.mjs');
 await import('./aes.mjs');
+await import('./persistence.mjs');
 QUnit.start();

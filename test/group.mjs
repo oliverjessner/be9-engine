@@ -32,7 +32,7 @@ QUnit.module('Groups / public endpoint interoperability', hooks => {
             'Bob uses his own private key and the public group endpoint key');
         assert.true(await alice.engine.decryptTextSimple(bob.id, group, toGroup.cipherText, toGroup.iv) === 'To the group endpoint',
             'Alice uses her retained private group key and Bob public key');
-        const stored = await readRecord(bob.database, 'groupKeys', [groupID, 1]);
+        const stored = await readRecord(bob.database, 'groupKeys', [bob.id, groupID, 1]);
         assert.false(Object.hasOwn(stored, 'd'), 'Bob stores only the public group JWK');
         await assert.rejects(eve.engine.decryptTextSimple(group, eve.id, toBob.cipherText, toBob.iv),
             isAuthenticationFailure, 'Another private key cannot decrypt the Bob packet even with the public group key');

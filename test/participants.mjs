@@ -32,8 +32,8 @@ export async function exchangePublicKeys(...participants) {
 export function participantHooks(hooks) {
     hooks.beforeEach(async function () {
         this.databases = [];
-        this.open = async name => {
-            const database = await openDatabase(name);
+        this.open = async (name, options) => {
+            const database = await openDatabase(name, options);
             this.databases.push(database);
             return database;
         };

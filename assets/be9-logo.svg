@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1024" height="1024" viewBox="0 0 1024 1024"
+     role="img" aria-labelledby="title desc">
+  <title id="title">be9 Messenger</title>
+  <desc id="desc">Weiße 9 mit einer Sprechblase als Innenform und drei Punkten auf einem einfarbig grünen, quadratischen Hintergrund.</desc>
+  <rect width="1024" height="1024" fill="#00C471"/>
+  <g fill="#FFFFFF" transform="translate(-74.09 -74.5) scale(0.94)">
+    <path fill-rule="evenodd" d="M 625 149
+C 802 149 946 288 946 464
+C 946 575 908 665 846 753
+L 617 1066
+C 594 1098 548 1109 516 1085
+C 482 1061 477 1019 502 985
+L 659 779
+C 663 773 661 765 654 764
+C 638 766 622 767 604 767
+C 437 767 301 635 301 464
+C 301 290 446 149 625 149 Z
+M 624 251
+A 214 214 0 1 1 517.000 650.329
+L 418 671
+L 448.701 587.745
+A 214 214 0 0 1 624 251 Z"/>
+    <circle cx="510" cy="465" r="37"/>
+    <circle cx="624" cy="465" r="37"/>
+    <circle cx="738" cy="465" r="37"/>
+  </g>
+</svg>

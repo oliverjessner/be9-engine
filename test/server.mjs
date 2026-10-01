@@ -9,9 +9,9 @@ const assets = new Map([
     ['/', ['test/index.html', 'text/html']],
     ['/vendor/qunit.js', ['node_modules/qunit/qunit/qunit.js', 'text/javascript']],
     ['/vendor/qunit.css', ['node_modules/qunit/qunit/qunit.css', 'text/css']],
-    ...['suite', 'database', 'participants', 'basics', 'text', 'image', 'group', 'exceptions', 'aes']
+    ...['suite', 'database', 'participants', 'basics', 'text', 'image', 'group', 'exceptions', 'aes', 'persistence']
         .map(name => ['/test/' + name + '.mjs', ['test/' + name + '.mjs', 'text/javascript']]),
-    ...['bundle', 'util'].map(name => ['/lib/' + name + '.mjs', ['lib/' + name + '.mjs', 'text/javascript']]),
+    ...['bundle', 'util', 'persistence', 'key-store'].map(name => ['/lib/' + name + '.mjs', ['lib/' + name + '.mjs', 'text/javascript']]),
 ]);
 
 export async function createTestServer(port = 0) {

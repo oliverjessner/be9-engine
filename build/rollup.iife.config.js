@@ -7,7 +7,7 @@ const prettierConfig = {
     parser: 'babel',
 };
 const config = {
-  input: 'lib/bundle.mjs',
+  input: 'lib/iife.mjs',
   output: {
     format: 'iife',
     name: 'be8',

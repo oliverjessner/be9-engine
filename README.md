@@ -1,23 +1,146 @@
 # be8-engine
-Be8 uses a Elliptic Curve Diffie-Hellman 384 bit prime curve encryption to ensure
-safe e2ee communications.
+Be8 is a reusable JavaScript ESM cryptography engine using native WebCrypto
+ECDH with P-384 and AES-GCM. Applications supply data, public keys, trust
+decisions, context, and an application-owned IndexedDB connection.
 
 ## usage
-The constructer takes one parameter the accID. 
-In case of no id passed it throws an error. ID has to be
-a string that is a number.
+
+The constructor takes a canonical nonnegative decimal account ID, a ready native
+`IDBDatabase` (or an existing request/adapter whose `result` is that database),
+and optional `{ namespace }`. The namespace defaults to the account ID. IDs such
+as empty strings, whitespace, negative numbers, `01`, and exponent notation are
+rejected. Namespace strings must be nonempty, trimmed, and free of control
+characters. The engine does not open, close, replace, or upgrade the database.
+
+The application integrates the engine schema into its own upgrade handler and
+chooses its database name and version:
 
 ```javascript
-const be8 = new Be8('1');
+import Be8, { upgradeBe8Schema } from 'be8-engine';
+
+const request = indexedDB.open('my-application', 2); // Application-owned version.
+let upgradeError;
+request.onupgradeneeded = () => {
+    try {
+        upgradeBe8Schema(request.result, request.transaction);
+        // Integrate other application stores here.
+    } catch (error) {
+        upgradeError = error; // The helper has already aborted its failed upgrade.
+    }
+};
+const db = await new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(upgradeError || new Error('Application database open failed'));
+    request.onblocked = () => reject(new Error('Application database upgrade blocked'));
+});
+db.addEventListener('versionchange', () => db.close()); // Application lifecycle.
+
+const be8 = new Be8('1', db, { namespace: '1' });
+await be8.setup();
+const hasKeys = await be8.hasGeneratedKeys();
 ```
+
+`upgradeBe8Schema(db, transaction)` is synchronous and requires the application's
+native versionchange transaction. Repeated calls are safe for a matching schema.
+Incompatible engine store/index definitions abort the upgrade; no store is deleted
+or replaced. The engine uses these dedicated stores alongside application stores:
+
+| Store | Primary key | Contents |
+| --- | --- | --- |
+| `be8.scopes` | `namespace` | Permanent account/namespace binding |
+| `be8.publicKeys` | `[namespace, accID]` | Public JWK in a separate `key` field |
+| `be8.privateKeys` | `[namespace, accID]` | Local private identity JWK in `key` |
+| `be8.groupKeys` | `[namespace, groupID, version]` | Local public or private group JWK in `key` |
+
+The three key stores have a nonunique `namespace` index. A namespace is bound to
+one account on its first successful mutation. A different account cannot read,
+write, initialize, or clear it. The same account can use multiple explicitly
+chosen namespaces, each with its own identity. The application must treat these
+stores as engine-owned records; arbitrary direct edits are not a synchronization
+or authorization API.
+
+Public/private identity writes share one native transaction. Group private keys
+are persisted together with their public coordinates in one record. Cryptographic
+generation/import happens before the write transaction. All mutation promises
+resolve only after native transaction completion; request success alone cannot
+report a commit. Request errors force rollback even if another event listener
+prevents the default abort. Persistence and storage validation failures are
+`Error` objects with generic messages and stable `code` values; persistence
+failures use `PERSISTENCE_ERROR` and a sanitized
+native category in `name`. Raw request errors, key values, and plaintexts are not
+logged or attached as error causes.
+
+Persistent reads use `readonly`. There are no per-instance key caches: simplified
+encryption/decryption reads both endpoint keys in one committed database snapshot.
+Independent instances/connections therefore see committed mutations on their next
+operation. Concurrent overlapping write transactions are ordered by IndexedDB.
+Commit completion is not a guarantee against every hardware or power-loss failure;
+see [native transaction semantics](https://developer.mozilla.org/en-US/docs/Web/API/IDBTransaction).
+
+`setup()` coalesces parallel calls on one instance. Independent instances recheck
+the identity under the same write lock, retaining whichever complete pair was
+committed first. Repeated setup/generation retains that pair. Missing one half,
+inconsistent coordinates, and database failures reject instead of replacing the
+identity. There is no implicit identity rotation.
+Parallel calls use the options of the first pending `setup()` call; after a
+failure, the application can retry with an explicit legacy adoption decision.
+
+### Legacy identity integration
+
+Old `publicKeys`, `privateKeys`, and `groupKeys` stores are left intact. If an old
+identity exists for this account but no scoped identity exists, default
+`setup()` rejects with `LEGACY_IDENTITY`. It does not silently generate new keys.
+
+After an explicit application decision, `await be8.setup({ legacyIdentity: true })`
+reads and validates that account's old pair, then copies it atomically into the
+selected namespace. It rechecks the legacy pair under the write lock and rejects
+if it changed. This copies only the local identity, retaining the original
+records. It does not infer ownership of old peer/group caches or migrate any
+ciphertexts. The application must explicitly select trusted peer/group records
+and import them through `addPublicKeys()`/`addGroupKeys()` when needed.
+
+The named `readLegacyIdentity(connection, accID)` export provides an explicit,
+readonly inspection of the old local pair. It returns `[publicJWK, privateJWK]`
+or `null`; incomplete data rejects. None of these paths runs automatically after
+a ciphertext authentication error. This storage upgrade does not change the KDF,
+nonce, cipher, or envelope profile.
+
+### Caller changes
+
+- `hasGeneratedKeys()` and `hasKey(id)` now return promises: callers must `await`
+  them instead of testing the truthiness of a promise.
+- `addPublicKey()` is asynchronous; `addPublicKey()`, `addPublicKeys()`, and
+  `addGroupKeys()` resolve to `undefined` after commit. They no longer expose
+  mutable internal maps or meaningless arrays of `undefined`.
+- `generatePrivAndPubKey()` is idempotent and consistently returns the existing
+  or newly committed `[publicJWK, privateJWK]`. It cannot silently rotate keys.
+- `generateGroupKeys(version, groupID)` requires both arguments, persists the
+  local group identity, and always returns `[publicJWK, privateJWK]`. Group IDs
+  match `g[A-Za-z0-9_-]+`; versions are positive safe integers (canonical decimal
+  strings are accepted and normalized). A group key at an existing version
+  cannot be replaced by different coordinates/private material. Reimporting its
+  public half retains an already stored private half.
+- Caller key objects are snapshotted and only JWK fields are copied. Embedded
+  `accID`, `namespace`, `groupID`, or `version` cannot override explicit metadata.
+  Public-key insertion rejects private JWKs and rejects replacing the public
+  half of this namespace's own identity with different coordinates.
+- `panic()` explicitly clears only the current namespace's key records in one
+  transaction. It retains the account binding, application stores, other
+  namespaces, and legacy records. It never deletes the application's database.
+- The ESM build adds named `upgradeBe8Schema`, `STORES`, and
+  `readLegacyIdentity` exports. The IIFE remains a callable `be8` constructor;
+  its integration helpers are `be8.upgradeBe8Schema`, `be8.STORES`, and
+  `be8.readLegacyIdentity` (also available on the ESM constructor).
+
+Local identity/group export APIs can return private JWKs to their owner as before.
+Only their public halves belong in participant-to-participant exchanges.
 
 ## hasGeneratedKeys()
 
-Checks if the object already generated keys and if they are stored.
-Returns a boolean.
+Checks the committed identity pair in this namespace. Returns a Promise<boolean>.
 
 ```javascript
-be8.hasGeneratedKeys();
+await be8.hasGeneratedKeys();
 ```
 
 ## getAccID
@@ -27,72 +150,48 @@ Return the accID.
 be8.getAccID();
 ```
 
-## addPublicKeys (publicKeys = [])
-Takes an array of public key accid key pair values and calls addPublicKey for every pair. 
-
-```javascript 
-const publicKeys = [{
-    accID: '',
-    publicKey: {
-        crv: 'P-384'
-        ext: 'true'
-        key_ops: ['deriveKey', 'deriveBits']
-        kty: 'EC'
-        x: 'A8QYrJJeE5iEshV3ycX2DNvgltSq9NHQypmkDybLHII'
-        y: 'IxbSJxIfvjuBvyTlNt_RToCgYzqvBHsIvWVB8bW-EFs'
-    }
-}]; 
-
-be8.addPublicKeys(publicKeys);
-```
-
-## addPublicKey(accID, key)
-Adds an accID publicKey pair value to a private map.
+## async addPublicKeys(publicKeys = [])
+Stores a caller-selected batch of peer public keys atomically in the current namespace.
 
 ```javascript
-const publicKey = {
-    accID: '10101',
-    publicKey: {
-        crv: 'P-384'
-        ext: 'true'
-        key_ops: ['deriveKey', 'deriveBits']
-        kty: 'EC'
-        x: 'A8QYrJJeE5iEshV3ycX2DNvgltSq9NHQypmkDybLHII'
-        y: 'IxbSJxIfvjuBvyTlNt_RToCgYzqvBHsIvWVB8bW-EFs'
-    }
-};
-
-be8.addPublicKey(publicKey);
+const publicKeys = [{ accID: '2', publicKey: bobPublicJWK }];
+await be8.addPublicKeys(publicKeys);
 ```
 
-## addGroupKey(groupID, key)
-Group keys are stored seperately from the other keys.
+## async addPublicKey(accID, key)
+Stores one peer public key and resolves only after commit.
 
 ```javascript
-be8.addGroupKey('g10300', {});
+await be8.addPublicKey('2', bobPublicJWK);
+```
+
+## async addGroupKeys(groupID, keys)
+Group keys are stored separately in the current namespace.
+
+```javascript
+await be8.addGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }]);
 ```
 
 ## async generatePrivAndPubKey()
-Returns freshly generated private and public keys. Automatically stores the keys in the localstorage.
+Returns the existing or newly generated public/private pair after atomic IndexedDB storage. Existing identities are retained.
 
 ```javascript
 const [publicKey, privateKey] = await be8.generatePrivAndPubKey();
 ```
 
-## async generateGroupKeys
-Generates a group key and stores it in a private map.
+## async generateGroupKeys(version, groupID)
+Generates or restores a local group identity in the current namespace after commit.
 
 ```javascript
-const [publicKey, privateKey] = await be8.generateGroupKeys();
+const [publicKey, privateKey] = await be8.generateGroupKeys(1, 'g10300');
 ```
 
 ## async getDerivedKey(publicKey, privateKey)
 Generates a derived key out of the public and private key. 
 
 ```javascript
-const privateKey = {};
-const publicKey = {};
-const derivedKey = await be8.getDerivedKey(publicKey, privateKey);
+const [, ownPrivateJWK] = await be8.generatePrivAndPubKey();
+const derivedKey = await be8.getDerivedKey(bobPublicJWK, ownPrivateJWK);
 ```
 
 ## async encryptText(derivedKey, text = '')
@@ -111,7 +210,7 @@ With the help of the key, the cipherText and an iv, we can decrypt messages.
 const cipherText = 'ASDASD9324/&§$jn';
 const iv = '213210931249713409';
 const derivedKey = await be8.getDerivedKey(publicKey, privateKey);
-const text = await be8.decryptText(derivedKey, cipherText);
+const text = await be8.decryptText(derivedKey, cipherText, iv);
 ```
 
 ## encryptTextSimple(accIDSender, accIDReceiver, text)
@@ -119,8 +218,8 @@ encryptTextSimple is a compound function of [encryptText](#async-encrypttextderi
 The derivedKey is generated inside the function.
 
 ```javascript
-const accIDSender = '101010';
-const accIDReceiver = '101011';
+const accIDSender = be8.getAccID();
+const accIDReceiver = '2';
 const text = 'Hello World';
 const cipherText = await be8.encryptTextSimple(accIDSender, accIDReceiver, text);
 ```
@@ -130,11 +229,11 @@ decryptTextSimple is a compound function of [decryptText](#async-decrypttextderi
 The derivedKey is generated inside the function.
 
 ```javascript
-const accIDSender = '101010';
-const accIDReceiver = '101011';
+const accIDSender = be8.getAccID();
+const accIDReceiver = '2';
 const cipherText = 'sadadwWE=)AWLKASDS';
 const iv = '2139484765456789';
-const cipherText = await be8.decryptTextSimple(accIDSender, accIDReceiver, cipherText, iv);
+const text = await bobEngine.decryptTextSimple(accIDSender, accIDReceiver, cipherText, iv);
 ```
 
 ## async encryptImage(derivedKey, base64Image)
@@ -149,7 +248,7 @@ const { cipherImage, iv } = await be8.encryptImage(derivedKey, base64Image);
 Uses the derivedKey, the cipherImage and the iv to decrypt a base64Image.
 
 ```javascript
-const base64Image = await be8.encryptImage(derivedKey, cipherImage, iv);
+const base64Image = await be8.decryptImage(derivedKey, cipherImage, iv);
 ```
 
 ## async encryptImageSimple (accIDSender, accIDReceiver, base64Image)
@@ -219,31 +318,24 @@ broadcast encryption, membership enforcement, invitation handling, or protection
 based on group membership. Different versions must authenticate independently;
 old installed versions remain available.
 
-#### Current findings and limits
+#### Validation and remaining limits
 
-The Chromium run of the revised suite reports 36 tests, with 34 passing and two
-failing (129 of 131 assertions passing, exit code `1`):
+The revised persistence suite extends the independent-participant tests with
+native transaction aborts after successful requests, real unique-index write
+errors, prevented-default error events, closed connections, pending-request
+abort settlement, synchronous scheduling errors, parallel setup and mutations,
+restart, namespace ownership races, schema upgrade rollback, and legacy identity
+adoption. The previous commit contract assertions remain strict and now pass.
+Timeouts in the runner and failure tests are failure deadlines, not readiness
+waits. Test output excludes assertion data and raw browser errors.
 
-- `generatePrivAndPubKey()` resolves while its native write transactions are
-  still pending. It awaits `transaction.complete`, which does not exist on
-  native IndexedDB transactions.
-- `addPublicKeys()` resolves while its write transaction is still pending.
-  Its `map` callback does not return a promise for a write or transaction.
+The suite exercises native Chromium WebCrypto/IndexedDB. Other browsers,
+hardware failures, and storage exhaustion beyond native constraint/abort error
+paths were not validated here. Application-level trust decisions remain with the
+caller. Group tests establish pairwise ECDH, not broadcast encryption or group
+membership enforcement. This change does not define or implement the v2 KDF,
+nonce, or envelope profile and is not a security audit.
 
-These contract tests remain ordinary failing assertions; they are not skipped,
-marked as expected failures, or hidden by a persistence mock. The test database
-adapter observes and forwards native transactions without adding a `.complete`
-property. Fixtures explicitly await those real transactions to test reopening
-after completed storage. Consequently, successful reopen tests do not establish
-that awaiting the current engine write methods guarantees a commit.
-
-Generated private group keys currently remain in the owner's in-memory state;
-the group reopen test covers the recipient's explicitly stored public group keys.
-The suite covers the existing ECDH/AES-GCM and IV format. It does not define or
-implement a v2 KDF, nonce, or envelope profile, legacy migration, or additional
-security features. It tests Chromium only and is not a security audit.
-
-The engine API and build outputs are unchanged. Tooling changes: `npm test` now
-finishes automatically with an exit code; use `npm run test:manual` for the
-previous interactive test-server workflow. Tests import `lib/` directly, so the
-suite checks current source without requiring or modifying `dist/`.
+Run `npm test` for the automated source suite and `npm run build` to regenerate
+both outputs in `dist/`. The suite imports `lib/` directly. No runtime dependency
+was added for persistence.

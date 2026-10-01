@@ -9,7 +9,7 @@ QUnit.module('Basics / isolated persistence', hooks => {
         const participants = [this.alice, this.bob, this.eve];
         assert.strictEqual(new Set(participants.map(peer => peer.database.name)).size, 3, 'Three separate databases');
         for (const peer of participants) {
-            assert.true(peer.engine.hasGeneratedKeys(), 'The endpoint has generated its own key pair');
+            assert.true(await peer.engine.hasGeneratedKeys(), 'The endpoint has generated its own key pair');
             assert.deepEqual(await storedIDs(peer.database), [peer.id], 'Only its own private key is persisted');
             assert.false(Object.hasOwn(peer.publicKey, 'd'), 'The exchanged JWK has no private component');
         }
@@ -37,7 +37,7 @@ QUnit.module('Basics / isolated persistence', hooks => {
         await bob.database.whenIdle();
         bob.database.close();
         const reopened = await createParticipant(bob.id, await this.open(bob.database.name));
-        assert.true(reopened.engine.hasGeneratedKeys(), 'setup restores both keys');
+        assert.true(await reopened.engine.hasGeneratedKeys(), 'setup restores both keys');
         assert.true(JSON.stringify(reopened.publicKey) === JSON.stringify(publicBefore), 'The persisted public key is unchanged');
         assert.deepEqual(await storedIDs(reopened.database), [bob.id], 'Only the recipient private key is restored');
         assert.true(await reopened.engine.decryptTextSimple(alice.id, bob.id, packet.cipherText, packet.iv) === 'Before reopening',
