@@ -1,24 +1,47 @@
-import Express from 'express';
-import cors from 'cors';
-import bodyParser from 'body-parser';
-import compression from 'compression';
+// Local static test tooling only. No engine transport or participant API.
+import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 
-const app = Express();
-const port = 3000;
+const root = fileURLToPath(new URL('../', import.meta.url));
+const assets = new Map([
+    ['/', ['test/index.html', 'text/html']],
+    ['/vendor/qunit.js', ['node_modules/qunit/qunit/qunit.js', 'text/javascript']],
+    ['/vendor/qunit.css', ['node_modules/qunit/qunit/qunit.css', 'text/css']],
+    ...['suite', 'database', 'participants', 'basics', 'text', 'image', 'group', 'exceptions', 'aes']
+        .map(name => ['/test/' + name + '.mjs', ['test/' + name + '.mjs', 'text/javascript']]),
+    ...['bundle', 'util'].map(name => ['/lib/' + name + '.mjs', ['lib/' + name + '.mjs', 'text/javascript']]),
+]);
 
-app.disable('x-powered-by');
-app.use(cors());
-app.use(bodyParser.json({ 
-    limit: '5mb',
-    type: 'application/json'
-}));
-app.use(bodyParser.urlencoded({
-    limit: '5mb',
-    extended: true,
-    parameterLimit: 5
-}));
-app.use(compression());
-app.use('/', Express.static('./dist/'));
-app.use('/', Express.static('./test/'));
-app.use('/', Express.static('./node_modules/'));
-app.listen(port, () => console.log(`Open http://localhost:${port}/`));
+export async function createTestServer(port = 0) {
+    const server = createServer(async (request, response) => {
+        const pathname = new URL(request.url, 'http://127.0.0.1').pathname;
+        const asset = assets.get(pathname);
+        if (request.method !== 'GET' || !asset) {
+            response.writeHead(404).end();
+            return;
+        }
+        try {
+            const body = await readFile(resolve(root, asset[0]));
+            response.writeHead(200, { 'Content-Type': asset[1], 'Cache-Control': 'no-store' }).end(body);
+        } catch {
+            response.writeHead(500).end('Test asset unavailable');
+        }
+    });
+    await new Promise((resolveListen, reject) => {
+        server.once('error', reject);
+        server.listen(port, '127.0.0.1', resolveListen);
+    });
+    return {
+        url: 'http://127.0.0.1:' + server.address().port + '/',
+        async close() {
+            await new Promise((resolveClose, reject) => server.close(error => error ? reject(error) : resolveClose()));
+        },
+    };
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+    const server = await createTestServer(3000);
+    console.log('Open ' + server.url);
+}

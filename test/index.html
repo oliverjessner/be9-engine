@@ -1,19 +1,15 @@
-<html>
+<!doctype html>
+<html lang="en">
 <head>
-<title>Be8 Tests</title>
-<link rel="stylesheet" href="https://code.jquery.com/qunit/qunit-2.19.1.css">
+    <meta charset="utf-8">
+    <title>Be8 browser tests</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/vendor/qunit.css">
 </head>
 <body>
-<div id="qunit"></div>
-<div id="qunit-fixture"></div>
-<script src="https://code.jquery.com/qunit/qunit-2.19.1.js"></script>
-<script src="qunit-reporter-lcov/qunit-reporter-lcov.js"></script>
-<script type="module" src="database.mjs"></script>
-<script type="module" src="bundle.mjs"></script>
-<script type="module" src="basics.mjs"></script>
-<script type="module" src="text.mjs"></script>
-<script type="module" src="exceptions.mjs"></script>
-<script type="module" src="group.mjs"></script>
-<script type="module" src="image.mjs"></script>
+    <div id="qunit"></div>
+    <div id="qunit-fixture"></div>
+    <script src="/vendor/qunit.js"></script>
+    <script type="module" src="/test/suite.mjs"></script>
 </body>
 </html>

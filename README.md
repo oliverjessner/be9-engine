@@ -174,10 +174,76 @@ Both can be found in /dist.
 npm run build
 ```
 
-### Testing 
-Open http://localhost:3000/ in your browser to see the 
-qunit suite.
+### Testing
+
+The automated QUnit suite runs the source modules in headless Chromium with
+native WebCrypto and IndexedDB. It requires Node.js 20 or newer. Install the
+development dependencies and the Playwright browser once:
+
+```bash
+npm ci
+npx playwright install chromium
+```
+
+On Linux CI hosts, use `npx playwright install --with-deps chromium` when browser
+system libraries are missing. Playwright is a development dependency only.
+See the [Playwright library documentation](https://playwright.dev/docs/library).
+
+Run the full suite:
 
 ```bash
 npm test
 ```
+
+Exit codes are `0` for a complete passing suite, `1` for failed assertions, and
+`2` for browser, resource, capability, timeout, or infrastructure errors. Output
+contains test names and assertion counts; assertion values, browser exceptions,
+console data, and stacks are not copied into the runner output.
+
+For the interactive QUnit page, run `npm run test:manual` and open
+http://127.0.0.1:3000/. QUnit assets are served locally, with no CDN dependency.
+The loopback server only serves test assets; participants exchange public keys,
+public metadata, and encrypted packets directly in test code, without networking.
+
+Each test creates separate, uniquely named databases for Alice, Bob, and Eve.
+Each participant retains its own private key. Integration tests derive a key
+independently at each endpoint or use the simplified API on the actual recipient.
+Private JWKs and derived AES keys are never exchanged between participants.
+Readiness and cleanup use native IndexedDB open, request, complete, and abort
+events, rather than fixed delays. Only the test-created databases are deleted.
+
+`test/aes.mjs` contains separate single-instance AES unit tests. Group tests
+exercise pairwise ECDH with Alice's local private group key, Bob's own private
+identity key, and the corresponding exchanged public keys. They do not claim
+broadcast encryption, membership enforcement, invitation handling, or protection
+based on group membership. Different versions must authenticate independently;
+old installed versions remain available.
+
+#### Current findings and limits
+
+The Chromium run of the revised suite reports 36 tests, with 34 passing and two
+failing (129 of 131 assertions passing, exit code `1`):
+
+- `generatePrivAndPubKey()` resolves while its native write transactions are
+  still pending. It awaits `transaction.complete`, which does not exist on
+  native IndexedDB transactions.
+- `addPublicKeys()` resolves while its write transaction is still pending.
+  Its `map` callback does not return a promise for a write or transaction.
+
+These contract tests remain ordinary failing assertions; they are not skipped,
+marked as expected failures, or hidden by a persistence mock. The test database
+adapter observes and forwards native transactions without adding a `.complete`
+property. Fixtures explicitly await those real transactions to test reopening
+after completed storage. Consequently, successful reopen tests do not establish
+that awaiting the current engine write methods guarantees a commit.
+
+Generated private group keys currently remain in the owner's in-memory state;
+the group reopen test covers the recipient's explicitly stored public group keys.
+The suite covers the existing ECDH/AES-GCM and IV format. It does not define or
+implement a v2 KDF, nonce, or envelope profile, legacy migration, or additional
+security features. It tests Chromium only and is not a security audit.
+
+The engine API and build outputs are unchanged. Tooling changes: `npm test` now
+finishes automatically with an exit code; use `npm run test:manual` for the
+previous interactive test-server workflow. Tests import `lib/` directly, so the
+suite checks current source without requiring or modifying `dist/`.
