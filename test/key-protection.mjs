@@ -2,6 +2,7 @@ import Be8, { STORES } from '../lib/bundle.mjs';
 import { participantHooks, exchangePublicKeys } from './participants.mjs';
 import { readRecord, requestResult, storedIDs } from './database.mjs';
 import { withTransaction, requestResult as nativeResult } from '../lib/persistence.mjs';
+import { encryptLegacyFixture } from './legacy-fixture.mjs';
 
 const algorithm = { name: 'ECDH', namedCurve: 'P-384' };
 
@@ -64,7 +65,7 @@ async function legacyPacket(participant, recipientPublic, text) {
     try {
         bytes = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: publicKey }, local, 384));
         const key = await crypto.subtle.importKey('raw', bytes.subarray(0, 32), { name: 'AES-GCM' }, false, ['encrypt']);
-        return participant.engine.encryptText(key, text);
+        return encryptLegacyFixture(key, text);
     } finally { bytes?.fill(0); }
 }
 
@@ -167,7 +168,7 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         assert.true(await reopened.decryptTextSimpleLegacy(this.bob.id, '104', packet.cipherText, packet.iv) === 'Before migration', 'Old identity ciphertext decrypts after migration and reload');
         const declaredV2 = await this.bob.createContext(identity[0], { receiver: '104' });
         await assert.rejects(reopened.decryptTextSimple(this.bob.id, '104', packet.cipherText, packet.iv, declaredV2.derivation),
-            error => error.name === 'OperationError', 'Even readable legacy ciphertext is not retried with the old KDF after v2 authentication fails');
+            error => error.code === 'INVALID_IV', 'The v2 reader rejects a legacy IV before crypto; it does not auto-detect or retry legacy');
         assert.true(await reopened.decryptTextSimpleLegacy(this.bob.id, 'g200:1', groupPacket.cipherText, groupPacket.iv) === 'Old group', 'Old group ciphertext decrypts after migration and reload');
         const reply = await reopened.encryptTextSimple('104', this.bob.id, 'Migrated reply');
         assert.true(await this.bob.engine.decryptTextSimple('104', this.bob.id, reply.cipherText, reply.iv, reply.derivation) === 'Migrated reply', 'Migrated owner encrypts in the opposite direction');

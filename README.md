@@ -52,8 +52,10 @@ or replaced. The engine uses these dedicated stores alongside application stores
 | `be8.privateKeys` | `[namespace, accID]` | Non-extractable private ECDH `CryptoKey` in `key`, public JWK in `publicKey` |
 | `be8.groupKeys` | `[namespace, groupID, version]` | Public JWK in `key`, optional non-extractable ECDH `CryptoKey` in `privateKey` |
 | `be8.trust` | `[namespace, peerID]` | SHA-256 thumbprint and local `unverified`, `confirmed`, or `tofu` status |
+| `be8.keyUsage` | `derivationID` | Database-wide encryption/GHASH counters keyed by validated actual derivation |
 
-The three key stores and the trust store have a nonunique `namespace` index. A namespace is bound to
+The three key stores and the trust store have a nonunique `namespace` index. The
+usage store is global to this database and has no namespace index. A namespace is bound to
 one account on its first successful mutation. A different account cannot read,
 write, initialize, or clear it. The same account can use multiple explicitly
 chosen namespaces, each with its own identity. The application must treat these
@@ -317,9 +319,25 @@ It also does not guarantee forensic erasure of prior JWK storage.
   v2 AES key using that metadata and the actual stored local public fingerprint.
   It requires an opaque local reference. See the [v2 profile](docs/v2-profile.md)
   for exact field encoding, purposes, examples and errors.
-- Simplified encryption now returns `derivation` alongside ciphertext and IV.
+- Simplified encryption returns `derivation` alongside ciphertext and IV.
   Simplified decryption requires that metadata as its fifth argument. The
   optional final `{ contextID }` argument supplies/checks application context.
+  Other convenience options, including custom IVs/random sources/key aliases,
+  reject with `INVALID_OPTIONS`.
+- New IVs are 12 random bytes and all new encrypted wire values are canonical
+  unpadded Base64url. All AES-GCM operations explicitly use a 128-bit tag. Modern
+  readers reject UUID IVs and padded standard Base64; use explicit legacy readers
+  for retained old packets. Text/image APIs share the byte codec and a 16 MiB
+  plaintext limit. Raw helpers require non-extractable AES-256-GCM keys.
+  Added `encryptBytes()` / `decryptBytes()` and named/static
+  `encodeBase64url()`, `decodeBase64url()`, `V2_LIMITS`.
+- Registered v2 keys have a persistent per-actual-key budget: 65,536 encryptions
+  and 2^24 GHASH blocks. Reservations commit before encryption. The application
+  must increment its database version and integrate `be8.keyUsage` through
+  `upgradeBe8Schema()`; missing integration reports `SCHEMA_UPGRADE_REQUIRED`.
+  Re-derivation, reload and namespace aliases cannot reset the counter. Incoming
+  directional keys cannot encrypt through the engine; create a reverse context.
+  Raw caller-owned/cloned keys and native WebCrypto require caller accounting.
 - Old ciphertext must use `getLegacyDerivedKey()`, `decryptTextSimpleLegacy()`
   or `decryptImageSimpleLegacy()` explicitly. No missing metadata or authentication
   failure triggers fallback. Existing non-extractable `deriveKey`-only identities
@@ -342,13 +360,16 @@ It also does not guarantee forensic erasure of prior JWK storage.
   version cannot be replaced with different public coordinates.
 - `panic()` still explicitly clears only the current namespace's key and trust records
   atomically, retaining its account binding, application stores, other namespaces,
-  and unselected legacy records. It never deletes the application database.
+  unselected legacy records and database-wide usage counters. Retained counters
+  prevent resetting an old derivation budget; they are not automatically removed.
+  It never deletes the application database.
 - Public imports remain async but no longer silently replace peers. Calls without
   local trust options retain first-contact data as unverified. Convenience calls
   now require a confirmed or explicitly TOFU peer; update callers accordingly.
 - Added `getPeerTrust()`, `replacePublicKey()`, and `migratePublicKeyTrust()`.
 - Named ESM/static exports are `upgradeBe8Schema`, `STORES`, `jwkThumbprint`,
-  `V2_SUITE`, and `encodeV2DerivationInfo`.
+  `V2_SUITE`, `encodeV2DerivationInfo`, `encodeBase64url`, `decodeBase64url`, and
+  `V2_LIMITS`.
   The IIFE remains a callable `be8` constructor with the same static helpers.
 
 ## hasGeneratedKeys()
@@ -409,7 +430,8 @@ const { publicKey, keyReference } = await be8.generateGroupKeys(1, 'g10300');
 ## v2 derivation and encryption
 
 The [v2 profile](docs/v2-profile.md) specifies full-width P-384 ECDH,
-HKDF-SHA-256, AES-256-GCM, salt transfer and exact length-prefixed info encoding.
+HKDF-SHA-256, AES-256-GCM, salt transfer, exact length-prefixed info encoding,
+96-bit random nonces, canonical Base64url and persistent usage limits.
 Only public keys, public metadata and encrypted packets travel between peers.
 Applications own peer trust and context; the engine binds the actual key
 fingerprints and ordered endpoints.
@@ -431,10 +453,18 @@ const text = await bob.decryptText(receiverKey, packet.cipherText, packet.iv);
 ```
 
 `encryptText(key, text = '')` / `decryptText(key, cipherText, iv)` retain their
-raw AES signatures. `encryptImage(key, base64Image)` / `decryptImage(key,
-cipherImage, iv)` retain the existing base64 image API. Use a separately created
-`attachment` derivation context for images. Primitive APIs require the
-application's own peer-trust and expected-context checks.
+raw AES signatures, with ciphertext/IV now encoded as canonical Base64url.
+`encryptImage(key, base64Image)` / `decryptImage(key, cipherImage, iv)` retain the
+existing image-string API. Use a separately created `attachment` context for
+images. `encryptBytes(key, bytes)` / `decryptBytes(key, ciphertext, iv)` handle
+raw binary plaintext; decryption returns a Uint8Array. Text decoding is strict
+UTF-8 and preserves BOMs. Primitive APIs require the application's own
+peer-trust and expected-context checks.
+
+Only the originating engine registers v2 keys for persistent usage accounting.
+Caller-supplied or cloned native AES keys and direct WebCrypto operations remain
+low-level APIs: the caller must coordinate nonce discipline and the same per-key
+  invocation/block limits across all writers. See the [budget contract](docs/v2-profile.md#persistent-usage-budget).
 
 ## simplified text and image APIs
 
@@ -468,8 +498,13 @@ Explicit old-data readers are `getLegacyDerivedKey(publicJWK, localReference)`,
 `decryptTextSimpleLegacy(sender, receiver, cipherText, iv)` and
 `decryptImageSimpleLegacy(sender, receiver, cipherImage, iv)`. Legacy derivation
 returns a non-extractable decrypt-only AES key. No automatic detection or retry
-exists. These payload helpers do not yet implement the authenticated v2 envelope
-or new nonce contract; see [integration limits](docs/v2-profile.md#envelope-integration-status-and-limits).
+exists. UUID/UTF-8 IVs and padded Base64 are accepted only by explicit
+`decryptTextLegacy()` / `decryptImageLegacy()` or the legacy convenience readers.
+For older HKDF packets with UUID IVs, derive with their original v2 metadata and
+use the explicit legacy wire decoder, retaining HKDF rather than selecting the
+old direct-ECDH KDF. Existing ciphertext is not rewritten or deleted.
+These helpers do not yet implement the authenticated v2 envelope; see
+[integration limits](docs/v2-profile.md#envelope-integration-status-and-limits).
 
 ## Scripts
 ### building
@@ -547,8 +582,14 @@ trust persistence/isolation, and old schema migration without false verification
 full-width P-384/HKDF/AES-GCM vector, independent peer derivation, salt/context/
 direction/purpose separation, strict field encoding, native wrapping usages,
 actual key fingerprints, transferred salt, and old deriveKey-only identity
-retention. Readable legacy ciphertext cannot trigger fallback after a v2
-authentication failure. No derived key export is enabled for equality tests.
+retention. Historical UUID packets reject before v2 crypto; authentication
+failure with modern metadata also never triggers a legacy retry. No derived key
+export is enabled for equality tests. `test/encoding.mjs` verifies binary and
+large-array roundtrips, native fixed IV fixtures, Unicode/BOM, image text over
+2 MiB, strict encoding/IV/tag/size limits, pre-derivation validation, and committed
+usage counters across reload, re-derivation, parallel connections, namespace
+aliases and panic. Native transaction aborts and unique-index write errors
+verify reservation rollback; application-owned schema integration is covered.
 The participant fixtures make separate explicit local decisions for their known
 synthetic peers; no trust record is taken from an exchanged key object.
 Timeouts in the runner and failure tests are failure deadlines, not readiness
@@ -559,9 +600,11 @@ hardware failures, and storage exhaustion beyond native constraint/abort error
 paths were not validated here. Application-level trust decisions remain with the
 caller. Group tests establish pairwise ECDH, not broadcast encryption or group
 membership enforcement. The [v2 KDF and field encoding](docs/v2-profile.md)
-are implemented; the authenticated envelope and new nonce contract remain
-outstanding. The raw AES payload/IV representation remains unchanged. This is
-not a security audit, and no guaranteed secret-memory erasure is claimed.
+and nonce/Base64url/budget rules are implemented. The authenticated envelope,
+header/AAD rules and replay state remain outstanding. Random IVs do not guarantee
+collision freedom; state coordination is limited to one application-owned
+database and assumes preserved counters. This is not a security audit, and no
+guaranteed secret-memory erasure is claimed.
 
 Run `npm test` for the automated source suite and `npm run build` to regenerate
 both outputs in `dist/`. The suite imports `lib/` directly. No runtime dependency

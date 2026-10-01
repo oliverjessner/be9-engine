@@ -1,10 +1,11 @@
-# Be8 v2 derivation profile
+# Be8 v2 cryptographic profile
 
 This specifies the implemented KDF and its public metadata for protocol version
 `2`, suite `BE8-P384-HKDF-SHA256-A256GCM`. It is one v2 profile, not a menu of
 automatically detected algorithms. Unsupported versions/suites reject. The
-authenticated v2 envelope and its nonce rules are still to be specified and
-implemented; these helpers do not claim to implement that envelope.
+nonce, binary encoding and encryption budget are specified below. The
+authenticated v2 envelope is still to be specified and implemented; these
+helpers do not claim to implement that envelope.
 
 ## Cryptographic derivation
 
@@ -132,6 +133,11 @@ metadata. Applications using primitive APIs own their peer-trust checks and
 expected context/purpose checks; fingerprints supplied in metadata do not grant
 trust. Keys and references remain local and are not exchanged.
 
+Keys created/re-derived through an engine are registered for its persistent
+encryption budget. An incoming directional key cannot encrypt through that
+engine: create a reverse context instead. Native WebCrypto remains accessible,
+and its direct use is a low-level caller responsibility described below.
+
 Convenience operations retain the persisted peer-trust policy and read local
 public/private keys and peer public/trust state from one committed snapshot:
 
@@ -165,7 +171,7 @@ Old ciphertext uses the historical direct ECDH-to-AES-256 derivation exclusively
 
 ```javascript
 const key = await bob.getLegacyDerivedKey(alicePublicJWK, bobLocalReference);
-const text = await bob.decryptText(key, oldCipherText, oldIV);
+const text = await bob.decryptTextLegacy(key, oldCipherText, oldIV);
 // Or use the persisted, trusted peer keys with the explicit convenience reader:
 const text2 = await bob.decryptTextSimpleLegacy('1', '2', oldCipherText, oldIV);
 // decryptImageSimpleLegacy(sender, receiver, cipherImage, iv) is equivalent.
@@ -189,6 +195,143 @@ exported. Existing private-JWK migration imports the same validated identity
 with only `deriveBits`; it preserves fingerprints, enables v2, and retains the
 explicit legacy reader. No new migration/export path bypasses non-extractability.
 
+Only explicit `decryptTextLegacy()` / `decryptImageLegacy()` and the legacy
+convenience readers accept historical lowercase v4 UUID IV strings (36 ASCII
+bytes, the same bytes as the old UTF-8 encoding) and canonical padded standard
+Base64 ciphertext. Modern readers reject UUID IVs before key lookup or GCM;
+they do not infer format from them. Legacy reads also enforce the bounded
+ciphertext size below; oversized original packets are retained but refused.
+No legacy writer is provided.
+
+Packets created during the earlier HKDF implementation with UUID IVs retain
+their HKDF key selection: explicitly derive using their original v2 metadata,
+then call `decryptTextLegacy()` or `decryptImageLegacy()` for the old wire format.
+Do not select the old direct-ECDH KDF for those packets. This is an explicit
+application decision; neither authentication failure nor format validation
+triggers a second algorithm or decoder.
+
+## Nonces, binary encoding and input limits
+
+All new engine AES encryption uses
+`crypto.getRandomValues(new Uint8Array(12))`. AES-GCM parameters explicitly set
+`tagLength: 128` on both encryption and decryption. The ciphertext is WebCrypto's
+raw ciphertext followed by its 16-byte authentication tag. An empty plaintext
+therefore produces 16 ciphertext bytes. The IV is exactly 12 bytes.
+
+Engine encryption returns IV and ciphertext as canonical **unpadded Base64url**:
+alphabet `A-Z a-z 0-9 - _`, no whitespace, no `+`, `/`, or `=`, no non-ASCII
+characters. A length congruent to 1 modulo 4 is invalid; unused bits in the last
+sextet must be zero. An IV serializes to exactly 16 characters. No TextEncoder or
+TextDecoder operates on IVs, ciphertext, or other random byte material. Neither
+standard padded Base64 nor a UUID string is a valid modern wire value.
+
+The public named ESM / constructor static `encodeBase64url()` and
+`decodeBase64url()` helpers implement this encoding. The decoder's optional byte
+limit may lower the fixed maximum, never increase it. Encoding uses bounded
+12,288-byte chunks aligned to three bytes, without variadic calls over a whole
+array. Binary inputs are ArrayBuffer or views over an ordinary ArrayBuffer;
+view offsets are respected and data is snapshotted before asynchronous work.
+SharedArrayBuffer-backed inputs reject rather than permit concurrent mutations.
+
+`encryptBytes(key, bytes)` returns `{ cipherText, iv }` in Base64url;
+`decryptBytes(key, ciphertext, iv)` returns a Uint8Array. The decryptor accepts
+either Base64url or binary BufferSources, including binary IVs. Text/image
+decryptors accept the same encrypted representation. TextEncoder/TextDecoder
+are reserved for actual text; decoding is fatal UTF-8 and preserves an initial
+BOM. Lone surrogates are refused on text encryption. The existing image API
+still encrypts/decrypts its base64/data-URL **text**, using the shared payload
+helpers; use the byte API for raw image bytes.
+
+`V2_LIMITS` is a frozen named ESM / constructor static object:
+
+| Rule | Limit |
+| --- | --- |
+| IV | Exactly 12 bytes |
+| GCM tag | Exactly 128 bits / 16 bytes |
+| Plaintext | At most 16 MiB after UTF-8 encoding, or binary byte length |
+| Ciphertext including tag | 16 bytes through 16 MiB + 16 bytes |
+| Encrypted payload Base64url | At most `ceil((16 MiB + 16) * 8 / 6)` characters |
+| Encryptions per derived key | 65,536 (`2^16`) |
+| Aggregate GHASH blocks reserved for encryption per derived key | `2^24` |
+
+Encoded lengths are checked before decoding/allocation. Invalid encodings, IV
+lengths and partial tags reject before GCM, and before key lookup/HKDF in the
+convenience path. UTF-8 plaintext size is counted before its allocation. Errors
+are sanitized `Error` objects: `INVALID_ENCODING`, `INVALID_IV`,
+`INVALID_CIPHERTEXT`, `INVALID_TEXT` or `INPUT_TOO_LARGE`. No bytes, text or keys
+are copied into messages. Convenience options allow only `contextID`; custom
+IVs, random sources and key-ID aliases reject with `INVALID_OPTIONS`. No production
+encryption API accepts a caller IV. Deterministic IVs occur only in native test
+fixtures, not through mocked cryptographic primitives.
+
+## Persistent usage budget
+
+The budget is a conservative engine policy based on the IV uniqueness and
+invocation constraints of [NIST SP 800-38D, sections 5.2.1, 8.2.2 and
+8.3](https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf).
+Its random-IV ceiling is `2^32` invocations per key; this profile chooses `2^16`.
+For independent uniformly random 96-bit nonces, the union/birthday bound is
+`q(q-1)/2^97`, below `2^-65` at our ceiling. It is a probability bound, not
+absolute collision freedom. The 16 MiB message cap is far below GCM's
+`2^36 - 32` byte plaintext limit. The additional `2^24`-block lifetime cap is a
+conservative engineering choice to limit aggregate GHASH input, not a claim of
+full 256-bit authentication security. Full 128-bit tags are always required.
+
+Each operation reserves `ceil(plaintextBytes / 16) + 1` GHASH blocks: ciphertext
+blocks plus the mandatory length block. Current helpers have no AAD; a future
+AAD envelope must include its additional blocks in the accounting. Reservations
+are counted even if a subsequent GCM operation fails; they are never refunded.
+Validation failures occurring before a reservation consume nothing. These
+counters account for encryption; reading ciphertext does not consume encryption
+capacity or establish a verification-attempt limit.
+
+All convenience encryption and engine helper encryption with a v2 key created
+or re-derived by that same engine reserve capacity atomically in native IndexedDB
+**before nonce generation or GCM**. The promise waits for transaction commit.
+Exhaustion rejects with `KEY_USAGE_EXHAUSTED`; invalid persisted counters reject
+with `INVALID_USAGE_STATE`. Native write/abort failures reject rather than return
+ciphertext. Concurrent instances/connections are serialized under the same
+write lock. Re-deriving a CryptoKey, reloading an engine or changing a storage
+namespace does not reset the budget.
+
+The actual derivation identity is canonical Base64url SHA-256 of this byte
+sequence: ASCII `BE8-GCM-USAGE` (13 bytes), the 32 raw salt bytes, then the complete
+`encodeV2DerivationInfo()` result. Fingerprints have already been verified against
+the actual keys before registration. Identity thus includes all key-selecting
+HKDF inputs and purposes; its equality relies on the hash/KDF's collision
+resistance. There is no independently selectable `keyId`. Changing a genuine KDF
+input derives a different key and legitimately starts a different budget.
+
+The application must increment its own IndexedDB version and invoke
+`upgradeBe8Schema()` in its upgrade handler to add `be8.keyUsage`. Its primary key
+is `derivationID`; records contain only that hash and numeric `encryptions` and
+`blocks`. It has no namespace index: the same actual derivation shares one budget
+throughout this database, including namespace aliases. No identity or ciphertext
+is rewritten by the upgrade. Encryption with a registered key before integration
+rejects with `SCHEMA_UPGRADE_REQUIRED`; there is no implicit upgrade or volatile
+counter fallback. `panic()` retains these security counters to prevent resetting
+retained derivations. Records are not automatically garbage-collected.
+
+This is coordination **within one application-owned database**. Applications
+must not restore counters backwards, selectively delete them, or copy the same
+identity/context to independent databases and expect global accounting. Native
+commit signals are not guarantees against every storage or power-loss rollback.
+
+### Low-level caller responsibilities
+
+Raw AES keys supplied by the caller, transferred/cloned CryptoKeys, and direct
+WebCrypto calls have no engine-owned derivation registration. The raw byte/text/
+image helpers still generate 96-bit random nonces and validate sizes/encoding,
+and require non-extractable AES-256-GCM keys with the appropriate native usages,
+but cannot identify such keys across arbitrary native clones or maintain their
+usage state. The caller must enforce the same per-actual-key invocation/block
+limits across all writers and ensure nonce discipline. A key obtained from a
+different engine does not transfer its registration. Engine-created keys used
+outside their originating engine likewise require caller accounting. Native
+key wrapping/unwrapping remains a low-level operation: use purpose `key-wrap`,
+96-bit nonces and `tagLength: 128`, with caller-owned limits. No counter guarantee
+is claimed for direct native operations or copied databases.
+
 ## Envelope integration status and limits
 
 Persist and transfer the entire public `derivation` object alongside the encrypted
@@ -198,9 +341,10 @@ authenticate an envelope header as AES-GCM AAD. Changing a KDF field changes the
 key and causes native authentication failure, but that does not implement header
 canonicalization, envelope validation, or replay state.
 
-The raw text/image AES helpers retain their existing payload representation and
-UUID-based IV encoding; they are profile-neutral primitives, not the finalized
-v2 nonce/envelope contract. No automatic envelope/profile detection is provided.
+The new binary/Base64url representation and nonce rules above apply to all new
+engine payloads. No automatic envelope/profile detection is provided. The
+authenticated envelope, header/AAD canonicalization and replay state remain
+outside these helpers.
 
 Malicious JavaScript in the same execution context can still misuse stored
 CryptoKeys or invoke engine operations. Non-extractable does not mean XSS-safe
@@ -215,6 +359,12 @@ P-384/HKDF/AES-GCM vector covering the full 48-byte ECDH output and exact Unicod
 field encoding. Other tests cover independently stored participant identities,
 fresh/reused salt, changed salt/context/direction/purpose, actual fingerprints,
 wrapping separation/usages, strict metadata, explicit legacy reads, and retained
-old `deriveKey`-only identities. Migration tests verify that a readable historical
-ciphertext still fails under v2, with no legacy retry. Integration key equality is
+old `deriveKey`-only identities. Migration tests verify that a historical UUID
+packet is rejected before v2 crypto, with no legacy retry. Integration key equality is
 established through successful decryption; derived key export remains disabled.
+`test/encoding.mjs` covers binary 0x00/0xff and offset/large array roundtrips,
+native fixed binary IV fixtures, Unicode/BOM, image text over 2 MiB, strict
+Base64url/IV/tag/size validation, input snapshots, and persistent count/block
+exhaustion across re-derivation, reload, concurrent connections and namespace
+aliases. Native transaction abort and unique-index write errors verify rollback;
+schema upgrade and explicit legacy-format reads are also covered.

@@ -1,5 +1,6 @@
 import Be8 from '../lib/bundle.mjs';
 import { openDatabase, deleteDatabase } from './database.mjs';
+import { encodeBase64url, decodeBase64url } from '../lib/encoding.mjs';
 
 // Opaque local key references stay inside each participant's closure. Only public JWKs are
 // exchanged. The derive method always uses this participant's local private key.
@@ -60,14 +61,15 @@ export function participantHooks(hooks) {
 }
 
 export function changedCiphertext(ciphertext) {
-    const bytes = Uint8Array.from(atob(ciphertext), character => character.charCodeAt(0));
+    const bytes = decodeBase64url(ciphertext);
     bytes[0] ^= 1;
-    return btoa(String.fromCharCode(...bytes));
+    return encodeBase64url(bytes);
 }
 
 export function changedIV(iv) {
-    // Preserve the legacy IV's length and encoding while changing one byte.
-    return (iv[0] === '0' ? '1' : '0') + iv.slice(1);
+    const bytes = decodeBase64url(iv);
+    bytes[0] ^= 1;
+    return encodeBase64url(bytes);
 }
 
 export function isAuthenticationFailure(error) {

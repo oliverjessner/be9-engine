@@ -35,11 +35,12 @@ import Be8, { STORES, V2_SUITE, encodeV2DerivationInfo, jwkThumbprint } from '..
 import { hkdfAES, decode32, encodeBase64url } from '../lib/v2.mjs';
 import { participantHooks, exchangePublicKeys, isAuthenticationFailure } from './participants.mjs';
 import { readRecord } from './database.mjs';
+import { encryptLegacyFixture } from './legacy-fixture.mjs';
 
 const hex = value => Uint8Array.from(value.match(/../g) || [], byte => parseInt(byte, 16));
 const hexString = bytes => [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('');
 const range = (start, length) => Uint8Array.from({ length }, (_, index) => start + index);
-const encryption = { name: 'AES-GCM', iv: new Uint8Array(12) };
+const encryption = { name: 'AES-GCM', iv: new Uint8Array(12), tagLength: 128 };
 const knownMessage = new TextEncoder().encode('Public HKDF fixture');
 
 async function fixedOwner(context, id, scalar, publicKey) {
@@ -235,12 +236,12 @@ QUnit.module('v2 / P-384 ECDH plus HKDF-SHA-256', hooks => {
         const pub = await crypto.subtle.importKey('jwk', this.bob.publicKey, { name: 'ECDH', namedCurve: 'P-384' }, true, []);
         const historical = await crypto.subtle.deriveKey({ name: 'ECDH', public: pub }, oldPair.privateKey,
             { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
-        const packet = await engine.encryptText(historical, 'Historical direct ECDH ciphertext');
+        const packet = await encryptLegacyFixture(historical, 'Historical direct ECDH ciphertext');
         const reader = await engine.getLegacyDerivedKey(this.bob.publicKey, keyReference);
         assert.deepEqual(reader.usages, ['decrypt'], 'The explicit old KDF exposes only a decrypt-capable AES key');
-        assert.true(await engine.decryptText(reader, packet.cipherText, packet.iv) === 'Historical direct ECDH ciphertext', 'Old data remains readable with the exact original KDF');
+        assert.true(await engine.decryptTextLegacy(reader, packet.cipherText, packet.iv) === 'Historical direct ECDH ciphertext', 'Old data remains readable with the exact original KDF');
         const newPeerReader = await this.bob.engine.getLegacyDerivedKey(ownPublic, (await this.bob.engine.generatePrivAndPubKey()).keyReference);
-        assert.true(await this.bob.engine.decryptText(newPeerReader, packet.cipherText, packet.iv) === 'Historical direct ECDH ciphertext', 'deriveBits-only peers reproduce the explicit historical AES prefix');
+        assert.true(await this.bob.engine.decryptTextLegacy(newPeerReader, packet.cipherText, packet.iv) === 'Historical direct ECDH ciphertext', 'deriveBits-only peers reproduce the explicit historical AES prefix');
         await assert.rejects(engine.encryptText(reader, 'Forbidden legacy write'), error => error.name === 'InvalidAccessError', 'The old KDF cannot silently encrypt new data');
         await assert.rejects(crypto.subtle.exportKey('jwk', await readRecord(database, 'privateKeys', '104')),
             error => error.name === 'InvalidAccessError', 'The retained old private key is still non-extractable');

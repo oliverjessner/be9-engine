@@ -1,21 +1,3 @@
-// generates an Initialization vector
-function generateIV() {
-    // a nonce (number once) is an arbitrary string that can be used just once in a cryptographic communication
-    const nonce = self.crypto.randomUUID();
-    return new TextEncoder().encode(nonce);
-}
-
-function arrayBufferToBase64(buffer) {
-    const bytes = new Uint8Array(buffer);
-    let binary = '';
-
-    for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
-    }
-
-    return window.btoa(binary);
-}
-
 function getTypeOfKey(id) {
     if (!id) {
         throw new Error('engine: id is required in getTypeOfKey');
@@ -36,6 +18,7 @@ const STORES = Object.freeze({
     privateKeys: 'be8.privateKeys',
     groupKeys: 'be8.groupKeys',
     trust: 'be8.trust',
+    keyUsage: 'be8.keyUsage',
 });
 
 function engineError(message, code = 'INVALID_STATE') {
@@ -107,6 +90,7 @@ function upgradeBe8Schema(db, transaction) {
         [STORES.privateKeys, ['namespace', 'accID']],
         [STORES.groupKeys, ['namespace', 'groupID', 'version']],
         [STORES.trust, ['namespace', 'peerID']],
+        [STORES.keyUsage, 'derivationID'],
     ];
     try {
         for (const [name, keyPath] of definitions) {
@@ -122,7 +106,7 @@ function upgradeBe8Schema(db, transaction) {
                     'SCHEMA_ERROR'
                 );
             }
-            if (name !== STORES.scopes) {
+            if (name !== STORES.scopes && name !== STORES.keyUsage) {
                 if (!store.indexNames.contains('namespace')) {
                     store.createIndex('namespace', 'namespace');
                 }
@@ -253,6 +237,147 @@ async function withTransaction(connection, stores, mode, operation) {
     return work.value;
 }
 
+const V2_LIMITS = Object.freeze({
+    ivBytes: 12,
+    tagBits: 128,
+    plaintextBytes: 16 * 1024 * 1024,
+    encryptions: 2 ** 16,
+    blocks: 2 ** 24,
+});
+
+const alphabet =
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+const ciphertextLimit = V2_LIMITS.plaintextBytes + V2_LIMITS.tagBits / 8;
+
+function invalid() {
+    return engineError('invalid binary encoding', 'INVALID_ENCODING');
+}
+function oversized() {
+    return engineError('input exceeds the v2 size limit', 'INPUT_TOO_LARGE');
+}
+
+// Always snapshot caller-owned BufferSources before an asynchronous operation.
+function bytesSnapshot(value, limit = ciphertextLimit) {
+    if (!Number.isSafeInteger(limit) || limit < 0 || limit > ciphertextLimit)
+        throw invalid();
+    try {
+        let view;
+        if (value instanceof ArrayBuffer) view = new Uint8Array(value);
+        else if (
+            ArrayBuffer.isView(value) &&
+            value.buffer instanceof ArrayBuffer
+        ) {
+            view = new Uint8Array(
+                value.buffer,
+                value.byteOffset,
+                value.byteLength
+            );
+        } else throw invalid();
+        if (view.length > limit) throw oversized();
+        return new Uint8Array(view);
+    } catch (error) {
+        if (error?.code) throw error;
+        throw invalid();
+    }
+}
+
+function encodeBase64url(value) {
+    const bytes = bytesSnapshot(value);
+    const parts = [];
+    // Multiples of three let separately encoded chunks join without padding.
+    for (let offset = 0; offset < bytes.length; offset += 12288) {
+        let binary = '';
+        const end = Math.min(offset + 12288, bytes.length);
+        for (let index = offset; index < end; index++)
+            binary += String.fromCharCode(bytes[index]);
+        parts.push(btoa(binary));
+    }
+    return parts
+        .join('')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+}
+
+function decodeBase64url(value, limit = ciphertextLimit) {
+    if (!Number.isSafeInteger(limit) || limit < 0 || limit > ciphertextLimit)
+        throw invalid();
+    if (typeof value !== 'string') throw invalid();
+    if (value.length > Math.ceil((limit * 8) / 6)) throw oversized();
+    const remainder = value.length % 4;
+    if (remainder === 1 || !/^[A-Za-z0-9_-]*$/.test(value)) throw invalid();
+    const last = alphabet.indexOf(value[value.length - 1]);
+    if ((remainder === 2 && last & 15) || (remainder === 3 && last & 3))
+        throw invalid();
+    const length = Math.floor((value.length * 6) / 8);
+    if (length > limit) throw oversized();
+    let binary;
+    try {
+        binary = atob(
+            value.replace(/-/g, '+').replace(/_/g, '/') +
+                '='.repeat((4 - remainder) % 4)
+        );
+    } catch {
+        throw invalid();
+    }
+    const bytes = new Uint8Array(length);
+    for (let index = 0; index < length; index++)
+        bytes[index] = binary.charCodeAt(index);
+    return bytes;
+}
+
+function decodeBytes(value, limit = ciphertextLimit) {
+    return typeof value === 'string'
+        ? decodeBase64url(value, limit)
+        : bytesSnapshot(value, limit);
+}
+
+function encodeText(value) {
+    if (typeof value !== 'string')
+        throw engineError('text must be a Unicode string', 'INVALID_TEXT');
+    if (value.length > V2_LIMITS.plaintextBytes) throw oversized();
+    let length = 0;
+    for (const character of value) {
+        const point = character.codePointAt(0);
+        if (point >= 0xd800 && point <= 0xdfff)
+            throw engineError(
+                'text contains an invalid Unicode scalar',
+                'INVALID_TEXT'
+            );
+        length += point < 128 ? 1 : point < 2048 ? 2 : point < 65536 ? 3 : 4;
+        if (length > V2_LIMITS.plaintextBytes) throw oversized();
+    }
+    return new TextEncoder().encode(value);
+}
+
+function decodeText(bytes) {
+    try {
+        return new TextDecoder('utf-8', {
+            fatal: true,
+            ignoreBOM: true,
+        }).decode(bytes);
+    } catch {
+        throw engineError(
+            'decrypted content is not valid UTF-8 text',
+            'INVALID_TEXT'
+        );
+    }
+}
+
+// Exact historical padded standard Base64; never used by v2 decoding.
+function decodeLegacyBase64(value) {
+    if (typeof value !== 'string') throw invalid();
+    if (value.length > 4 * Math.ceil(ciphertextLimit / 3)) throw oversized();
+    const unpadded = value.replace(/=+$/, '');
+    if (
+        value.length % 4 ||
+        value.length - unpadded.length !== (4 - (unpadded.length % 4)) % 4 ||
+        !/^[A-Za-z0-9+/]*$/.test(unpadded)
+    )
+        throw invalid();
+    return decodeBase64url(unpadded.replace(/\+/g, '-').replace(/\//g, '_'));
+}
+
 const ecdh = Object.freeze({ name: 'ECDH', namedCurve: 'P-384' });
 const usages = Object.freeze(['deriveBits']);
 
@@ -318,13 +443,6 @@ async function validatePublicKey(publicJWK) {
     return key;
 }
 
-function base64url(bytes) {
-    return btoa(String.fromCharCode(...new Uint8Array(bytes)))
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=+$/, '');
-}
-
 async function preparePublicKey(publicJWK) {
     const key = await validatePublicKey(publicJWK);
     // RFC 7638 section 3.2: only required EC public members, lexicographic order.
@@ -338,7 +456,7 @@ async function preparePublicKey(publicJWK) {
         'SHA-256',
         new TextEncoder().encode(canonical)
     );
-    return { key, fingerprint: base64url(digest) };
+    return { key, fingerprint: encodeBase64url(digest) };
 }
 
 async function jwkThumbprint(publicJWK) {
@@ -746,6 +864,70 @@ class KeyStore {
             mode,
             (tx) => this.#scope(tx, mode === 'readwrite', work)
         );
+    }
+
+    async reserveUsage(derivationID, byteLength) {
+        fingerprintValue(derivationID);
+        if (
+            !databaseConnection(this.connection).objectStoreNames.contains(
+                STORES.keyUsage
+            )
+        ) {
+            throw engineError(
+                'application must upgrade its schema with upgradeBe8Schema() before v2 encryption',
+                'SCHEMA_UPGRADE_REQUIRED'
+            );
+        }
+        if (
+            !Number.isSafeInteger(byteLength) ||
+            byteLength < 0 ||
+            byteLength > V2_LIMITS.plaintextBytes
+        ) {
+            throw engineError(
+                'input exceeds the v2 size limit',
+                'INPUT_TOO_LARGE'
+            );
+        }
+        const blocks = Math.ceil(byteLength / 16) + 1; // Ciphertext GHASH blocks plus length block; no AAD yet.
+        return this.run([STORES.keyUsage], 'readwrite', (tx) => {
+            const store = tx.objectStore(STORES.keyUsage);
+            return requestResult(store.get(derivationID), (current) => {
+                const record = current || {
+                    derivationID,
+                    encryptions: 0,
+                    blocks: 0,
+                };
+                if (
+                    !Number.isSafeInteger(record.encryptions) ||
+                    record.encryptions < 0 ||
+                    record.encryptions > V2_LIMITS.encryptions ||
+                    !Number.isSafeInteger(record.blocks) ||
+                    record.blocks < record.encryptions ||
+                    record.blocks > V2_LIMITS.blocks
+                ) {
+                    throw engineError(
+                        'invalid persisted GCM usage state',
+                        'INVALID_USAGE_STATE'
+                    );
+                }
+                if (
+                    record.encryptions >= V2_LIMITS.encryptions ||
+                    record.blocks + blocks > V2_LIMITS.blocks
+                ) {
+                    throw engineError(
+                        'GCM key usage budget exhausted; create a new derivation context',
+                        'KEY_USAGE_EXHAUSTED'
+                    );
+                }
+                return requestResult(
+                    store.put({
+                        derivationID,
+                        encryptions: record.encryptions + 1,
+                        blocks: record.blocks + blocks,
+                    })
+                );
+            });
+        });
     }
 
     async identity() {
@@ -1776,19 +1958,9 @@ function scalarString(value, maxBytes = 1024) {
     return bytes;
 }
 
-function encodeBase64url(bytes) {
-    return btoa(String.fromCharCode(...bytes))
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=+$/, '');
-}
-
 function decode32(value) {
     fingerprintValue(value);
-    const bytes = Uint8Array.from(
-        atob(value.replace(/-/g, '+').replace(/_/g, '/') + '='),
-        (char) => char.charCodeAt(0)
-    );
+    const bytes = decodeBase64url(value, 32);
     if (bytes.length !== 32) throw fail();
     return bytes;
 }
@@ -1995,17 +2167,117 @@ async function deriveV2AES(
     }
 }
 
+function requireAES(key, usage) {
+    if (!key)
+        throw engineError(
+            'no derived key passed to AES operation',
+            'INVALID_KEY'
+        );
+    if (
+        !(key instanceof CryptoKey) ||
+        key.type !== 'secret' ||
+        key.algorithm.name !== 'AES-GCM' ||
+        key.algorithm.length !== 256 ||
+        key.extractable
+    ) {
+        throw engineError(
+            'a non-extractable AES-256-GCM key is required',
+            'INVALID_KEY'
+        );
+    }
+    if (!key.usages.includes(usage))
+        throw new DOMException(
+            'AES key does not permit this operation',
+            'InvalidAccessError'
+        );
+}
+
+function payloadSnapshot(ciphertext, iv, legacy = false) {
+    if (iv === undefined || iv === null)
+        throw engineError(
+            'no iv (Initialization vector) passed to decrypt',
+            'INVALID_IV'
+        );
+    let nonce;
+    if (legacy) {
+        if (
+            typeof iv !== 'string' ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+                iv
+            )
+        ) {
+            throw engineError('invalid legacy UUID IV', 'INVALID_IV');
+        }
+        // UUID bytes were ASCII/UTF-8. No random bytes pass through text codecs.
+        nonce = Uint8Array.from(iv, (character) => character.charCodeAt(0));
+    } else {
+        try {
+            nonce = decodeBytes(iv, V2_LIMITS.ivBytes);
+        } catch {
+            throw engineError(
+                'v2 IV must be exactly 12 bytes in canonical base64url or binary',
+                'INVALID_IV'
+            );
+        }
+        if (nonce.length !== V2_LIMITS.ivBytes)
+            throw engineError('v2 IV must be exactly 12 bytes', 'INVALID_IV');
+    }
+    const bytes = legacy
+        ? decodeLegacyBase64(ciphertext)
+        : decodeBytes(ciphertext);
+    if (bytes.length < V2_LIMITS.tagBits / 8)
+        throw engineError(
+            'ciphertext is shorter than the GCM tag',
+            'INVALID_CIPHERTEXT'
+        );
+    return { bytes, iv: nonce };
+}
+
+async function encryptPayload(key, bytes) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv, tagLength: 128 },
+        key,
+        bytes
+    );
+    return { cipherText: encodeBase64url(ciphertext), iv: encodeBase64url(iv) };
+}
+
+function decryptPayload(key, payload) {
+    return crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: payload.iv, tagLength: 128 },
+        key,
+        payload.bytes
+    );
+}
+
+// Only actual, validated derivation inputs enter this identity. No caller alias
+// or storage namespace can make the same HKDF key get a fresh local budget.
+async function derivationUsageID(derivation) {
+    const info = encodeV2DerivationInfo(derivation);
+    const prefix = new TextEncoder().encode('BE8-GCM-USAGE');
+    const bytes = new Uint8Array(prefix.length + 32 + info.length);
+    bytes.set(prefix);
+    bytes.set(decode32(derivation.salt), prefix.length);
+    bytes.set(info, prefix.length + 32);
+    return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
+}
+
 class Be8 {
     static upgradeBe8Schema = upgradeBe8Schema;
     static STORES = STORES;
     static jwkThumbprint = jwkThumbprint;
     static V2_SUITE = V2_SUITE;
     static encodeV2DerivationInfo = encodeV2DerivationInfo;
+    static encodeBase64url = encodeBase64url;
+    static decodeBase64url = decodeBase64url;
+    static V2_LIMITS = V2_LIMITS;
 
     #keys;
     #accID;
     #setupPromise;
     #references = new WeakMap();
+    #derivedKeys = new WeakMap();
 
     constructor(accID, indexedDB, { namespace = accID } = {}) {
         this.#accID = accountID(accID);
@@ -2232,6 +2504,7 @@ class Be8 {
             local.privateKey,
             derivation
         );
+        await this.#trackDerivedKey(key, local.endpoint, derivation);
         return { key, derivation };
     }
 
@@ -2245,13 +2518,15 @@ class Be8 {
         // Copy transferred metadata synchronously, before storage or crypto yields.
         const context = metadata ? derivationSnapshot(metadata) : undefined;
         const local = await this.#localPair(keyReference);
-        return deriveV2AES(
+        const key = await deriveV2AES(
             local.endpoint,
             local.publicKey,
             publicKey,
             local.privateKey,
             context
         );
+        await this.#trackDerivedKey(key, local.endpoint, context);
+        return key;
     }
 
     // Explicit, decrypt-only legacy KDF. Never selected after an auth failure.
@@ -2279,6 +2554,17 @@ class Be8 {
         const peerID = sending ? receiver : sender;
         const context =
             !sending && metadata ? derivationSnapshot(metadata) : undefined;
+        if (
+            !options ||
+            typeof options !== 'object' ||
+            Array.isArray(options) ||
+            Reflect.ownKeys(options).some((field) => field !== 'contextID')
+        ) {
+            throw engineError(
+                'convenience options allow only contextID, never a custom IV or key alias',
+                'INVALID_OPTIONS'
+            );
+        }
         const contextID = options.contextID;
         const [publicKey, privateKey, ownPublic] =
             await this.#keys.endpointKeys(peerID, localID, true);
@@ -2315,70 +2601,80 @@ class Be8 {
                 );
             }
         }
-        return {
-            key: await deriveV2AES(
-                localID,
-                ownPublic,
-                publicKey,
-                privateKey,
-                derivation
-            ),
-            derivation,
-        };
-    }
-
-    async encryptText(derivedKey, text = '') {
-        const encodedText = new TextEncoder().encode(text);
-        const iv = generateIV();
-        const stringifiedIV = new TextDecoder().decode(iv);
-        const algorithm = {
-            name: 'AES-GCM',
-            iv,
-        };
-
-        if (!derivedKey) {
-            throw new Error('engine: no derived key passed to encryptText');
-        }
-
-        return window.crypto.subtle
-            .encrypt(algorithm, derivedKey, encodedText)
-            .then(function (encryptedData) {
-                const uintArray = new Uint8Array(encryptedData);
-                const string = String.fromCharCode.apply(null, uintArray);
-                const cipherText = window.btoa(string);
-
-                return { cipherText, iv: stringifiedIV };
-            });
-    }
-
-    async decryptText(derivedKey, cipherText = '', iv) {
-        const mstring = window.atob(cipherText);
-        const uintArray = new Uint8Array(
-            [...mstring].map((char) => char.charCodeAt(0))
+        const key = await deriveV2AES(
+            localID,
+            ownPublic,
+            publicKey,
+            privateKey,
+            derivation
         );
-        const parsedIV = new TextEncoder('utf-8').encode(iv);
-        const algorithm = {
-            name: 'AES-GCM',
-            iv: parsedIV,
-        };
+        await this.#trackDerivedKey(key, localID, derivation);
+        return { key, derivation };
+    }
 
-        if (!derivedKey) {
-            throw new Error('engine: no derived key passed to decryptText');
-        }
-        if (!iv) {
-            throw new Error(
-                'engine: no iv (Initialization vector) passed to decryptText'
+    async #trackDerivedKey(key, localID, derivation) {
+        this.#derivedKeys.set(key, {
+            derivationID: await derivationUsageID(derivation),
+            sending: localID === derivation.sender,
+        });
+    }
+
+    async #encryptBytes(key, bytes) {
+        requireAES(key, 'encrypt');
+        const registered = this.#derivedKeys.get(key);
+        if (registered) {
+            if (!registered.sending)
+                throw engineError(
+                    'incoming directional key cannot encrypt; create a reverse context',
+                    'INVALID_DERIVATION_CONTEXT'
+                );
+            // Reservation commits before generating a nonce or invoking AES.
+            // Failure after commit consumes the reservation; never refund it.
+            await this.#keys.reserveUsage(
+                registered.derivationID,
+                bytes.length
             );
         }
-
-        return window.crypto.subtle
-            .decrypt(algorithm, derivedKey, uintArray)
-            .then(function (decryptedData) {
-                return new TextDecoder().decode(decryptedData);
-            });
+        return encryptPayload(key, bytes);
     }
 
-    async encryptTextSimple(sender, receiver, text, options = {}) {
+    async encryptBytes(key, value) {
+        requireAES(key, 'encrypt');
+        return this.#encryptBytes(
+            key,
+            bytesSnapshot(value, V2_LIMITS.plaintextBytes)
+        );
+    }
+
+    async decryptBytes(key, ciphertext, iv) {
+        requireAES(key, 'decrypt');
+        const payload = payloadSnapshot(ciphertext, iv);
+        return new Uint8Array(await decryptPayload(key, payload));
+    }
+
+    async encryptText(key, text = '') {
+        requireAES(key, 'encrypt');
+        return this.#encryptBytes(key, encodeText(text));
+    }
+
+    async decryptText(key, ciphertext, iv) {
+        requireAES(key, 'decrypt');
+        const payload = payloadSnapshot(ciphertext, iv);
+        return decodeText(await decryptPayload(key, payload));
+    }
+
+    async encryptImage(key, base64Image) {
+        requireAES(key, 'encrypt');
+        const packet = await this.#encryptBytes(key, encodeText(base64Image));
+        return { cipherImage: packet.cipherText, iv: packet.iv };
+    }
+
+    async decryptImage(key, cipherImage, iv) {
+        return this.decryptText(key, cipherImage, iv);
+    }
+
+    async encryptTextSimple(sender, receiver, text = '', options = {}) {
+        const bytes = encodeText(text);
         const context = await this.#simpleDerivation(
             sender,
             receiver,
@@ -2388,7 +2684,7 @@ class Be8 {
             options
         );
         return {
-            ...(await this.encryptText(context.key, text)),
+            ...(await this.#encryptBytes(context.key, bytes)),
             derivation: context.derivation,
         };
     }
@@ -2396,11 +2692,12 @@ class Be8 {
     async decryptTextSimple(
         sender,
         receiver,
-        cipherText,
+        ciphertext,
         iv,
         derivation,
         options = {}
     ) {
+        const payload = payloadSnapshot(ciphertext, iv);
         const context = await this.#simpleDerivation(
             sender,
             receiver,
@@ -2409,74 +2706,11 @@ class Be8 {
             derivation,
             options
         );
-        return this.decryptText(context.key, cipherText, iv);
-    }
-
-    async decryptTextSimpleLegacy(sender, receiver, cipherText, iv) {
-        const [publicKey, privateKey] = await this.#keys.endpointKeys(
-            sender,
-            receiver,
-            true
-        );
-        if (!publicKey)
-            throw engineError(
-                'Missing public key for selected peer',
-                'INVALID_KEY'
-            );
-        if (!privateKey)
-            throw engineError(
-                'Missing private key for local endpoint',
-                'INVALID_PRIVATE_KEY'
-            );
-        return this.decryptText(
-            await deriveLegacyAES(publicKey, privateKey),
-            cipherText,
-            iv
-        );
-    }
-
-    async encryptImage(derivedKey, base64Image) {
-        const encodedText = new TextEncoder().encode(base64Image);
-        const iv = generateIV();
-        const stringifiedIV = new TextDecoder().decode(iv);
-
-        if (!derivedKey) {
-            throw new Error('engine: no derived key passed to decryptText');
-        }
-
-        return window.crypto.subtle
-            .encrypt({ name: 'AES-GCM', iv }, derivedKey, encodedText)
-            .then(function (encryptedData) {
-                return {
-                    cipherImage: arrayBufferToBase64(encryptedData),
-                    iv: stringifiedIV,
-                };
-            });
-    }
-
-    async decryptImage(derivedKey, cipherImage, iv) {
-        const mstring = window.atob(cipherImage);
-        const uintArray = new Uint8Array(
-            [...mstring].map((char) => char.charCodeAt(0))
-        );
-        const parsedIV = new TextEncoder('utf-8').encode(iv);
-        const algorithm = {
-            name: 'AES-GCM',
-            iv: parsedIV,
-        };
-
-        if (!derivedKey) {
-            throw new Error('engine: no derived key passed to decryptText');
-        }
-
-        return window.crypto.subtle
-            .decrypt(algorithm, derivedKey, uintArray)
-            .then(function (decryptedData) {
-                return new TextDecoder().decode(decryptedData);
-            });
+        return decodeText(await decryptPayload(context.key, payload));
     }
 
     async encryptImageSimple(sender, receiver, base64Image, options = {}) {
+        const bytes = encodeText(base64Image);
         const context = await this.#simpleDerivation(
             sender,
             receiver,
@@ -2485,8 +2719,10 @@ class Be8 {
             undefined,
             options
         );
+        const packet = await this.#encryptBytes(context.key, bytes);
         return {
-            ...(await this.encryptImage(context.key, base64Image)),
+            cipherImage: packet.cipherText,
+            iv: packet.iv,
             derivation: context.derivation,
         };
     }
@@ -2499,6 +2735,7 @@ class Be8 {
         derivation,
         options = {}
     ) {
+        const payload = payloadSnapshot(cipherImage, iv);
         const context = await this.#simpleDerivation(
             sender,
             receiver,
@@ -2507,10 +2744,21 @@ class Be8 {
             derivation,
             options
         );
-        return this.decryptImage(context.key, cipherImage, iv);
+        return decodeText(await decryptPayload(context.key, payload));
     }
 
-    async decryptImageSimpleLegacy(sender, receiver, cipherImage, iv) {
+    async decryptTextLegacy(key, ciphertext, iv) {
+        requireAES(key, 'decrypt');
+        const payload = payloadSnapshot(ciphertext, iv, true);
+        return decodeText(await decryptPayload(key, payload));
+    }
+
+    async decryptImageLegacy(key, cipherImage, iv) {
+        return this.decryptTextLegacy(key, cipherImage, iv);
+    }
+
+    async #legacySimple(sender, receiver, ciphertext, iv) {
+        const payload = payloadSnapshot(ciphertext, iv, true);
         const [publicKey, privateKey] = await this.#keys.endpointKeys(
             sender,
             receiver,
@@ -2526,11 +2774,16 @@ class Be8 {
                 'Missing private key for local endpoint',
                 'INVALID_PRIVATE_KEY'
             );
-        return this.decryptImage(
-            await deriveLegacyAES(publicKey, privateKey),
-            cipherImage,
-            iv
-        );
+        const key = await deriveLegacyAES(publicKey, privateKey);
+        return decodeText(await decryptPayload(key, payload));
+    }
+
+    async decryptTextSimpleLegacy(sender, receiver, ciphertext, iv) {
+        return this.#legacySimple(sender, receiver, ciphertext, iv);
+    }
+
+    async decryptImageSimpleLegacy(sender, receiver, cipherImage, iv) {
+        return this.#legacySimple(sender, receiver, cipherImage, iv);
     }
 
     async panic() {
@@ -2540,8 +2793,11 @@ class Be8 {
 
 export {
     STORES,
+    V2_LIMITS,
     V2_SUITE,
+    decodeBase64url,
     Be8 as default,
+    encodeBase64url,
     encodeV2DerivationInfo,
     jwkThumbprint,
     upgradeBe8Schema,

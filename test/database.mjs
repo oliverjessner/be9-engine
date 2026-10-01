@@ -74,10 +74,10 @@ export function requestResult(request) {
 export async function readRecord(database, store, key) {
     const name = STORES[store] || store;
     const tx = database.transaction(name, 'readonly');
-    const scopedKey = STORES[store] && !Array.isArray(key) ? [key, key] : key;
+    const scopedKey = STORES[store] && store !== 'keyUsage' && !Array.isArray(key) ? [key, key] : key;
     const value = await requestResult(tx.objectStore(name).get(scopedKey));
     await database.whenIdle();
-    return STORES[store] ? value?.key : value;
+    return STORES[store] && store !== 'keyUsage' ? value?.key : value;
 }
 
 export async function storedIDs(database, store = 'privateKeys', namespace) {
@@ -87,7 +87,7 @@ export async function storedIDs(database, store = 'privateKeys', namespace) {
     const request = namespace === undefined ? objectStore.getAllKeys() : objectStore.index('namespace').getAllKeys(namespace);
     const ids = await requestResult(request);
     await database.whenIdle();
-    return STORES[store] ? ids.map(key => key[1]) : ids;
+    return STORES[store] && store !== 'keyUsage' ? ids.map(key => key[1]) : ids;
 }
 
 export async function deleteDatabase(name) {
