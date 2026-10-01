@@ -11,10 +11,12 @@ export async function createParticipant(id, database) {
     const storedPublicKey = await engine.getMyPublicKey();
     await database.whenIdle();
     const { crv, ext, key_ops, kty, x, y } = storedPublicKey;
-    const publicKey = { crv, ext, key_ops, kty, x, y };
+    const publicKey = { crv, ext, key_ops, kty, x, y, accID: id };
     return {
         id, engine, database, publicKey,
-        derive: peerPublicKey => engine.getDerivedKey(peerPublicKey, keyReference),
+        createContext: (peerPublicKey, { purpose = 'data', contextID = crypto.randomUUID(), receiver = peerPublicKey.accID } = {}) =>
+            engine.createDerivationContext(peerPublicKey, keyReference, { contextID, sender: id, receiver, purpose }),
+        derive: (peerPublicKey, derivation) => engine.getDerivedKey(peerPublicKey, keyReference, derivation),
     };
 }
 

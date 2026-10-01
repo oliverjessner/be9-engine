@@ -11,18 +11,22 @@ QUnit.module('Images / independent participants', hooks => {
     for (const [label, image] of [['existing PNG data URL', base64Img], ['empty content', '']]) {
         QUnit.test('Low-level image API, both directions: ' + label, async function (assert) {
             const { alice, bob } = this;
-            const aliceKey = await alice.derive(bob.publicKey);
-            const bobKey = await bob.derive(alice.publicKey);
+            const aliceContext = await alice.createContext(bob.publicKey, { purpose: 'attachment' });
+            const bobContext = await bob.createContext(alice.publicKey, { purpose: 'attachment' });
+            const aliceKey = aliceContext.key;
+            const bobKey = await bob.derive(alice.publicKey, aliceContext.derivation);
+            const reverseSenderKey = bobContext.key;
+            const reverseReceiverKey = await alice.derive(bob.publicKey, bobContext.derivation);
             assert.true(aliceKey !== bobKey, 'Separate locally derived CryptoKeys');
             const toBob = structuredClone(await alice.engine.encryptImage(aliceKey, image));
-            const toAlice = structuredClone(await bob.engine.encryptImage(bobKey, image));
+            const toAlice = structuredClone(await bob.engine.encryptImage(reverseSenderKey, image));
             for (const packet of [toBob, toAlice]) {
                 assert.true(packet.cipherImage !== image, 'Encrypted output differs from input');
                 assert.true(packet.cipherImage.length > image.length, 'Ciphertext includes authentication overhead');
             }
             assert.true(await bob.engine.decryptImage(bobKey, toBob.cipherImage, toBob.iv) === image,
                 'Bob independently restores the exact image input');
-            assert.true(await alice.engine.decryptImage(aliceKey, toAlice.cipherImage, toAlice.iv) === image,
+            assert.true(await alice.engine.decryptImage(reverseReceiverKey, toAlice.cipherImage, toAlice.iv) === image,
                 'Alice independently restores the exact image input');
         });
 
@@ -31,9 +35,9 @@ QUnit.module('Images / independent participants', hooks => {
             await exchangePublicKeys(alice, bob);
             const toBob = structuredClone(await alice.engine.encryptImageSimple(alice.id, bob.id, image));
             const toAlice = structuredClone(await bob.engine.encryptImageSimple(bob.id, alice.id, image));
-            assert.true(await bob.engine.decryptImageSimple(alice.id, bob.id, toBob.cipherImage, toBob.iv) === image,
+            assert.true(await bob.engine.decryptImageSimple(alice.id, bob.id, toBob.cipherImage, toBob.iv, toBob.derivation) === image,
                 'The Bob engine decrypts Alice to Bob');
-            assert.true(await alice.engine.decryptImageSimple(bob.id, alice.id, toAlice.cipherImage, toAlice.iv) === image,
+            assert.true(await alice.engine.decryptImageSimple(bob.id, alice.id, toAlice.cipherImage, toAlice.iv, toAlice.derivation) === image,
                 'The Alice engine decrypts Bob to Alice');
         });
     }
@@ -43,9 +47,9 @@ QUnit.module('Images / independent participants', hooks => {
         await exchangePublicKeys(alice, bob, eve);
         for (const [sender, receiver] of [[alice, bob], [bob, alice]]) {
             const packet = structuredClone(await sender.engine.encryptImageSimple(sender.id, receiver.id, base64Img));
-            await assert.rejects(eve.engine.decryptImageSimple(sender.id, eve.id, packet.cipherImage, packet.iv),
-                isAuthenticationFailure, 'A third locally generated private key fails authentication');
-            await assert.rejects(eve.engine.decryptImageSimple(sender.id, receiver.id, packet.cipherImage, packet.iv),
+            await assert.rejects(eve.engine.decryptImageSimple(sender.id, eve.id, packet.cipherImage, packet.iv, packet.derivation),
+                error => error.code === 'INVALID_DERIVATION_CONTEXT', 'The third local endpoint does not match the bound recipient');
+            await assert.rejects(eve.engine.decryptImageSimple(sender.id, receiver.id, packet.cipherImage, packet.iv, packet.derivation),
                 /Missing private key/, 'The third endpoint has no recipient private key');
         }
     });
@@ -54,12 +58,13 @@ QUnit.module('Images / independent participants', hooks => {
         QUnit.test('Image API rejects a wrong ' + scenario + ' in both directions', async function (assert) {
             const { alice, bob, eve } = this;
             for (const [sender, receiver] of [[alice, bob], [bob, alice]]) {
-                const senderKey = await sender.derive(receiver.publicKey);
-                const receiverKey = await receiver.derive(sender.publicKey);
+                const context = await sender.createContext(receiver.publicKey, { purpose: 'attachment' });
+                const senderKey = context.key;
+                const receiverKey = await receiver.derive(sender.publicKey, context.derivation);
                 const packet = structuredClone(await sender.engine.encryptImage(senderKey, base64Img));
                 const ciphertext = scenario === 'ciphertext' ? changedCiphertext(packet.cipherImage) : packet.cipherImage;
                 const iv = scenario === 'IV' ? changedIV(packet.iv) : packet.iv;
-                const key = scenario === 'key' ? await receiver.derive(eve.publicKey) : receiverKey;
+                const key = scenario === 'key' ? (await receiver.createContext(eve.publicKey, { purpose: 'attachment' })).key : receiverKey;
                 await assert.rejects(receiver.engine.decryptImage(key, ciphertext, iv), isAuthenticationFailure,
                     'Validly encoded but incorrect image inputs fail authentication');
                 assert.true(await receiver.engine.decryptImage(receiverKey, packet.cipherImage, packet.iv) === base64Img,

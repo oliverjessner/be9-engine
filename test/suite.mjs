@@ -30,4 +30,5 @@ await import('./aes.mjs');
 await import('./persistence.mjs');
 await import('./key-protection.mjs');
 await import('./trust.mjs');
+await import('./v2.mjs');
 QUnit.start();

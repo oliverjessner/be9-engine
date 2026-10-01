@@ -55,6 +55,19 @@ async function records(database, names) {
     return rows;
 }
 
+// Construct historical ciphertexts using genuine native legacy primitives.
+// The sender's private CryptoKey stays in its own database and test closure.
+async function legacyPacket(participant, recipientPublic, text) {
+    const local = await readRecord(participant.database, 'privateKeys', participant.id);
+    const publicKey = await crypto.subtle.importKey('jwk', recipientPublic, algorithm, true, []);
+    let bytes;
+    try {
+        bytes = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: publicKey }, local, 384));
+        const key = await crypto.subtle.importKey('raw', bytes.subarray(0, 32), { name: 'AES-GCM' }, false, ['encrypt']);
+        return participant.engine.encryptText(key, text);
+    } finally { bytes?.fill(0); }
+}
+
 QUnit.module('Non-extractable local keys / explicit migration', hooks => {
     participantHooks(hooks);
 
@@ -68,13 +81,14 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         for (const key of [privateKey, groupPrivate]) {
             assert.true(key instanceof CryptoKey && key.type === 'private' && !key.extractable,
                 'IndexedDB restores a native non-extractable private CryptoKey');
-            assert.deepEqual(key.usages, ['deriveKey'], 'Only the required ECDH usage is allowed');
+            assert.deepEqual(key.usages, ['deriveBits'], 'Only the required ECDH usage is allowed');
             for (const format of ['jwk', 'pkcs8']) {
                 await assert.rejects(crypto.subtle.exportKey(format, key),
                     error => error instanceof DOMException && error.name === 'InvalidAccessError', 'Private export is denied');
             }
         }
-        const aes = await alice.engine.getDerivedKey(bob.publicKey, generated.keyReference);
+        const { key: aes } = await alice.engine.createDerivationContext(bob.publicKey, generated.keyReference,
+            { contextID: 'private export test', sender: alice.id, receiver: bob.id, purpose: 'data' });
         assert.false(aes.extractable, 'Derived AES keys are non-extractable');
         assert.deepEqual(aes.usages, ['encrypt', 'decrypt'], 'AES allows only encryption and decryption');
         await assert.rejects(crypto.subtle.exportKey('raw', aes),
@@ -86,8 +100,10 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         assert.deepEqual(Object.keys(generated).sort(), ['keyReference', 'publicKey'], 'Generation has a documented public result');
         assert.deepEqual(Object.keys(generated.keyReference), [], 'The local reference contains no enumerable key material');
         const receiver = await bob.engine.generatePrivAndPubKey();
-        const groupAES = await alice.engine.getDerivedKey(bob.publicKey, group.keyReference);
-        const receiverAES = await bob.engine.getDerivedKey(group.publicKey, receiver.keyReference);
+        const groupContext = await alice.engine.createDerivationContext(bob.publicKey, group.keyReference,
+            { contextID: 'private group test', sender: 'g200:1', receiver: bob.id, purpose: 'data' });
+        const groupAES = groupContext.key;
+        const receiverAES = await bob.engine.getDerivedKey(group.publicKey, receiver.keyReference, groupContext.derivation);
         const packet = await alice.engine.encryptText(groupAES, 'Local group reference');
         assert.true(await bob.engine.decryptText(receiverAES, packet.cipherText, packet.iv) === 'Local group reference',
             'A local group reference derives interoperably without exposing private material');
@@ -110,11 +126,12 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         await reopened.setup();
         const after = await reopened.generatePrivAndPubKey();
         assert.true(await fingerprint(before.publicKey) === await fingerprint(after.publicKey), 'Reload preserves the fingerprint');
-        assert.true(await reopened.decryptTextSimple(bob.id, alice.id, packet.cipherText, packet.iv) === 'Before reload',
+        assert.true(await reopened.decryptTextSimple(bob.id, alice.id, packet.cipherText, packet.iv, packet.derivation) === 'Before reload',
             'An already encrypted packet decrypts after reload');
-        const derived = await reopened.getDerivedKey(bob.publicKey, after.keyReference);
+        const { key: derived, derivation } = await reopened.createDerivationContext(bob.publicKey, after.keyReference,
+            { contextID: 'reloaded reply', sender: alice.id, receiver: bob.id, purpose: 'data' });
         const reply = await reopened.encryptText(derived, 'After reload');
-        assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, reply.cipherText, reply.iv) === 'After reload',
+        assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, reply.cipherText, reply.iv, derivation) === 'After reload',
             'A fresh local reference encrypts interoperably after reload');
         const stored = await readRecord(database, 'privateKeys', alice.id);
         await assert.rejects(crypto.subtle.exportKey('jwk', stored),
@@ -128,8 +145,8 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         await this.bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: group[0] }],
             { decisions: [{ peerID: 'g200:1', trust: 'confirmed' }] });
         await engine.addPublicKey(this.bob.id, this.bob.publicKey, { trust: 'confirmed' });
-        const packet = await this.bob.engine.encryptTextSimple(this.bob.id, '104', 'Before migration');
-        const groupPacket = await this.bob.engine.encryptTextSimple(this.bob.id, 'g200:1', 'Old group');
+        const packet = await legacyPacket(this.bob, identity[0], 'Before migration');
+        const groupPacket = await legacyPacket(this.bob, group[0], 'Old group');
         const blocked = await settles(engine.setup());
         assert.true(blocked.error instanceof Error && blocked.error.code === 'PRIVATE_KEY_MIGRATION_REQUIRED',
             'Default setup requires an explicit migration, without generating a replacement');
@@ -147,10 +164,13 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         database.close();
         const reopened = new Be8('104', (await this.open(database.name)).connection);
         await reopened.setup();
-        assert.true(await reopened.decryptTextSimple(this.bob.id, '104', packet.cipherText, packet.iv) === 'Before migration', 'Old identity ciphertext decrypts after migration and reload');
-        assert.true(await reopened.decryptTextSimple(this.bob.id, 'g200:1', groupPacket.cipherText, groupPacket.iv) === 'Old group', 'Old group ciphertext decrypts after migration and reload');
+        assert.true(await reopened.decryptTextSimpleLegacy(this.bob.id, '104', packet.cipherText, packet.iv) === 'Before migration', 'Old identity ciphertext decrypts after migration and reload');
+        const declaredV2 = await this.bob.createContext(identity[0], { receiver: '104' });
+        await assert.rejects(reopened.decryptTextSimple(this.bob.id, '104', packet.cipherText, packet.iv, declaredV2.derivation),
+            error => error.name === 'OperationError', 'Even readable legacy ciphertext is not retried with the old KDF after v2 authentication fails');
+        assert.true(await reopened.decryptTextSimpleLegacy(this.bob.id, 'g200:1', groupPacket.cipherText, groupPacket.iv) === 'Old group', 'Old group ciphertext decrypts after migration and reload');
         const reply = await reopened.encryptTextSimple('104', this.bob.id, 'Migrated reply');
-        assert.true(await this.bob.engine.decryptTextSimple('104', this.bob.id, reply.cipherText, reply.iv) === 'Migrated reply', 'Migrated owner encrypts in the opposite direction');
+        assert.true(await this.bob.engine.decryptTextSimple('104', this.bob.id, reply.cipherText, reply.iv, reply.derivation) === 'Migrated reply', 'Migrated owner encrypts in the opposite direction');
         const repeated = await reopened.migratePrivateKeys();
         assert.true(!repeated.migratedIdentity && repeated.migratedGroups === 0, 'Repeat migration does not rotate keys');
     });

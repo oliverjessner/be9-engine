@@ -37,8 +37,8 @@ QUnit.module('Exceptions / independent participants', hooks => {
     QUnit.test('Actual recipient rejects a missing text IV', async function (assert) {
         const { alice, bob } = this;
         await exchangePublicKeys(alice, bob);
-        const { cipherText } = await alice.engine.encryptTextSimple(alice.id, bob.id, 'Test input');
-        await assert.rejects(bob.engine.decryptTextSimple(alice.id, bob.id, cipherText),
+        const { cipherText, derivation } = await alice.engine.encryptTextSimple(alice.id, bob.id, 'Test input');
+        await assert.rejects(bob.engine.decryptTextSimple(alice.id, bob.id, cipherText, undefined, derivation),
             /no iv/, 'The actual recipient rejects a missing IV');
     });
 });

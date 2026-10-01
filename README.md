@@ -1,6 +1,6 @@
 # be8-engine
 Be8 is a reusable JavaScript ESM cryptography engine using native WebCrypto
-ECDH with P-384 and AES-GCM. Applications supply data, public keys, trust
+P-384 ECDH plus HKDF-SHA-256 and AES-256-GCM. Applications supply data, public keys, trust
 decisions, context, and an application-owned IndexedDB connection.
 
 ## usage
@@ -235,9 +235,10 @@ remains a separate operation and never confirms old remote public keys.
 ### Non-extractable local keys and migration
 
 New identity and local group private keys are P-384 ECDH `CryptoKey` objects with
-`extractable: false` and only `['deriveKey']`. Public keys remain exportable JWKs.
-Derived AES-GCM keys also have `extractable: false`, with only
-`['encrypt', 'decrypt']`. No normal engine operation exports private keys.
+`extractable: false` and only `['deriveBits']`. Public keys remain exportable JWKs.
+Derived AES-GCM keys also have `extractable: false`. Data and attachment keys
+allow only `['encrypt', 'decrypt']`; wrapping keys allow only
+`['wrapKey', 'unwrapKey']`. Explicit legacy AES readers allow only `decrypt`. No normal engine operation exports private keys.
 The required browser capabilities are native WebCrypto, IndexedDB CryptoKey
 Structured Clone, and `structuredClone()` preserving a non-extractable CryptoKey.
 Missing clone support rejects with `CRYPTOKEY_STORAGE_UNSUPPORTED`; it does not
@@ -288,9 +289,10 @@ private group it owns; the engine does not migrate unrelated data or infer trust
 for old peer public keys. Old public group records can still be imported through
 `addGroupKeys()`.
 
-This operation preserves public fingerprints and cryptographic identity. It does
-not change the KDF, nonce, cipher, or envelope profile, and it never runs after
-ciphertext authentication failure. Existing browser/application backups outside
+This operation preserves public fingerprints and cryptographic identity. It
+imports private keys with only `deriveBits`, enabling the v2 KDF and the explicit
+legacy reader without rewriting any ciphertext. It never runs after ciphertext
+authentication failure. Existing browser/application backups outside
 these selected records are not erased by this migration.
 
 **Malicious JavaScript in the same execution context can still misuse these keys**,
@@ -309,10 +311,21 @@ It also does not guarantee forensic erasure of prior JWK storage.
   be serialized or cloned into a usable reference, and becomes invalid if the
   selected identity is cleared/replaced. After reopening, call generation again
   to obtain a fresh reference to the same committed key.
-- `getDerivedKey(publicJWK, keyReference)` derives a non-extractable AES key.
-  It also accepts a native non-extractable P-384 ECDH private CryptoKey with exactly
-  `['deriveKey']` for local caller-owned keys. Private JWKs and extractable private
-  CryptoKeys are rejected; there is no implicit JWK import path.
+- `createDerivationContext(publicJWK, keyReference, { contextID, sender, receiver,
+  purpose })` creates a fresh public salt and returns `{ key, derivation }`.
+  `getDerivedKey(publicJWK, keyReference, derivation)` derives the non-extractable
+  v2 AES key using that metadata and the actual stored local public fingerprint.
+  It requires an opaque local reference. See the [v2 profile](docs/v2-profile.md)
+  for exact field encoding, purposes, examples and errors.
+- Simplified encryption now returns `derivation` alongside ciphertext and IV.
+  Simplified decryption requires that metadata as its fifth argument. The
+  optional final `{ contextID }` argument supplies/checks application context.
+- Old ciphertext must use `getLegacyDerivedKey()`, `decryptTextSimpleLegacy()`
+  or `decryptImageSimpleLegacy()` explicitly. No missing metadata or authentication
+  failure triggers fallback. Existing non-extractable `deriveKey`-only identities
+  are retained for legacy reads; v2 reports `V2_KEY_USAGE_UNAVAILABLE` rather than
+  generating a new identity. Private JWKs and extractable private CryptoKeys
+  remain rejected outside explicit migration.
 - `getMyPublicKey()`, `getCachedKeys()`, and `getCachedGroupKeys()` expose only
   public JWKs and public metadata. Group getters project the public half of old
   records as well; they never return a private `d` or stored private CryptoKey.
@@ -322,8 +335,8 @@ It also does not guarantee forensic erasure of prior JWK storage.
   Existing private-JWK groups must be migrated before mutation or private use.
 - `setup({ legacyIdentity: true })` and the named/static `readLegacyIdentity()`
   private-JWK export are removed. Use `migratePrivateKeys()` explicitly, then
-  `setup()`. Public async APIs and the simplified text/image call signatures
-  remain available. `hasGeneratedKeys()`/`hasKey()` are promises; await them.
+  `setup()`. `hasGeneratedKeys()`/`hasKey()` are promises; await them. The
+  simplified decryption signature now additionally requires v2 metadata.
 - Group IDs match `g[A-Za-z0-9_-]+`; versions are positive safe integers, with
   canonical decimal strings accepted and normalized for new records. A group
   version cannot be replaced with different public coordinates.
@@ -334,7 +347,8 @@ It also does not guarantee forensic erasure of prior JWK storage.
   local trust options retain first-contact data as unverified. Convenience calls
   now require a confirmed or explicitly TOFU peer; update callers accordingly.
 - Added `getPeerTrust()`, `replacePublicKey()`, and `migratePublicKeyTrust()`.
-- Named ESM/static exports are `upgradeBe8Schema`, `STORES`, and `jwkThumbprint`.
+- Named ESM/static exports are `upgradeBe8Schema`, `STORES`, `jwkThumbprint`,
+  `V2_SUITE`, and `encodeV2DerivationInfo`.
   The IIFE remains a callable `be8` constructor with the same static helpers.
 
 ## hasGeneratedKeys()
@@ -392,83 +406,70 @@ Generates or restores a local group identity in the current namespace after comm
 const { publicKey, keyReference } = await be8.generateGroupKeys(1, 'g10300');
 ```
 
-## async getDerivedKey(publicKey, keyReference)
-Derives a non-extractable AES-GCM key from a peer public JWK and a local key reference.
+## v2 derivation and encryption
+
+The [v2 profile](docs/v2-profile.md) specifies full-width P-384 ECDH,
+HKDF-SHA-256, AES-256-GCM, salt transfer and exact length-prefixed info encoding.
+Only public keys, public metadata and encrypted packets travel between peers.
+Applications own peer trust and context; the engine binds the actual key
+fingerprints and ordered endpoints.
 
 ```javascript
-const { keyReference } = await be8.generatePrivAndPubKey();
-const derivedKey = await be8.getDerivedKey(bobPublicJWK, keyReference);
+// Independent engines, each with its own database and private key.
+const aliceLocal = await alice.generatePrivAndPubKey();
+const bobLocal = await bob.generatePrivAndPubKey();
+const context = await alice.createDerivationContext(
+    bobLocal.publicKey, aliceLocal.keyReference,
+    { contextID: 'example', sender: '1', receiver: '2', purpose: 'data' },
+);
+const packet = { ...await alice.encryptText(context.key, 'Hello World'),
+    derivation: context.derivation };
+const receiverKey = await bob.getDerivedKey(
+    aliceLocal.publicKey, bobLocal.keyReference, packet.derivation,
+);
+const text = await bob.decryptText(receiverKey, packet.cipherText, packet.iv);
 ```
 
-## async encryptText(derivedKey, text = '')
-After creating a [derivedKey](#async-getderivedkeypublickey-keyreference) we can start to encrypt text messages. encryptText returns a cipherText and a iv (Initialization vector).
+`encryptText(key, text = '')` / `decryptText(key, cipherText, iv)` retain their
+raw AES signatures. `encryptImage(key, base64Image)` / `decryptImage(key,
+cipherImage, iv)` retain the existing base64 image API. Use a separately created
+`attachment` derivation context for images. Primitive APIs require the
+application's own peer-trust and expected-context checks.
+
+## simplified text and image APIs
+
+After each engine separately imports and locally confirms the other's public
+key (or explicitly enables first-contact TOFU), the convenience APIs perform
+committed peer-trust checks and internal v2 derivation:
 
 ```javascript
-const text = 'Hello World';
-const derivedKey = await be8.getDerivedKey(publicKey, keyReference);
-const { cipherText, iv } = await be8.encryptText(derivedKey, text);
+const packet = await alice.encryptTextSimple('1', '2', 'Hello World', {
+    contextID: 'example',
+});
+const text = await bob.decryptTextSimple(
+    '1', '2', packet.cipherText, packet.iv, packet.derivation,
+    { contextID: 'example' },
+);
+
+const imagePacket = await alice.encryptImageSimple('1', '2', base64Image);
+const image = await bob.decryptImageSimple(
+    '1', '2', imagePacket.cipherImage, imagePacket.iv, imagePacket.derivation,
+);
 ```
 
-## async decryptText(derivedKey, cipherText, iv)
-With the help of the key, the cipherText and an iv, we can decrypt messages.
+Text uses purpose `data`; images use `attachment`. An omitted sender context ID
+gets a public random UUID. Every new context gets a fresh public 32-byte salt;
+the recipient always reuses the transferred salt. Encryption returns ciphertext,
+IV and `derivation`; decryption requires all three. Sender/receiver arguments
+keep the original packet direction on both engines. Reverse communication creates
+a new context with reversed endpoints and actual fingerprints.
 
-```javascript
-const cipherText = 'ASDASD9324/&§$jn';
-const iv = '213210931249713409';
-const derivedKey = await be8.getDerivedKey(publicKey, keyReference);
-const text = await be8.decryptText(derivedKey, cipherText, iv);
-```
-
-## encryptTextSimple(accIDSender, accIDReceiver, text)
-encryptTextSimple is a compound function of [encryptText](#async-encrypttextderivedkey-text) and [getDerivedKey](#async-getderivedkeypublickey-keyreference). It uses the ids instead of keys.
-The derivedKey is generated inside the function.
-
-```javascript
-const accIDSender = be8.getAccID();
-const accIDReceiver = '2';
-const text = 'Hello World';
-const cipherText = await be8.encryptTextSimple(accIDSender, accIDReceiver, text);
-```
-
-## async decryptTextSimple(accIDSender, accIDReceiver, cipherText, iv)
-decryptTextSimple is a compound function of [decryptText](#async-decrypttextderivedkey-text) and [getDerivedKey](#async-getderivedkeypublickey-keyreference). It uses the ids instead of keys.
-The derivedKey is generated inside the function.
-
-```javascript
-const accIDSender = be8.getAccID();
-const accIDReceiver = '2';
-const cipherText = 'sadadwWE=)AWLKASDS';
-const iv = '2139484765456789';
-const text = await bobEngine.decryptTextSimple(accIDSender, accIDReceiver, cipherText, iv);
-```
-
-## async encryptImage(derivedKey, base64Image)
-Accepts the derivedKey and an image encoded as base64 so it can creates a "cipherImage" and
-an iv.
-
-```javascript
-const { cipherImage, iv } = await be8.encryptImage(derivedKey, base64Image);
-```
-
-## async decryptImage(derivedKey, cipherImage, iv)
-Uses the derivedKey, the cipherImage and the iv to decrypt a base64Image.
-
-```javascript
-const base64Image = await be8.decryptImage(derivedKey, cipherImage, iv);
-```
-
-## async encryptImageSimple (accIDSender, accIDReceiver, base64Image)
-
-```javascript
-const base64Image = await be8.encryptImageSimple(accIDSender, accIDReceiver, base64Image);
-```
-
-## async decryptImageSimple (accIDSender, accIDReceiver, cipherImage, iv)
-
-
-```javascript
-const base64Image = await be8.decryptImageSimple(accIDSender, accIDReceiver, cipherImage, iv);
-```
+Explicit old-data readers are `getLegacyDerivedKey(publicJWK, localReference)`,
+`decryptTextSimpleLegacy(sender, receiver, cipherText, iv)` and
+`decryptImageSimpleLegacy(sender, receiver, cipherImage, iv)`. Legacy derivation
+returns a non-extractable decrypt-only AES key. No automatic detection or retry
+exists. These payload helpers do not yet implement the authenticated v2 envelope
+or new nonce contract; see [integration limits](docs/v2-profile.md#envelope-integration-status-and-limits).
 
 ## Scripts
 ### building
@@ -542,6 +543,12 @@ vector, strict native point/usage validation, first-contact quarantine, ignored
 network verification flags, wrong expected fingerprints, TOFU, idempotent
 reimports, bulk rollback, explicit replacements and concurrent compare-and-swap,
 trust persistence/isolation, and old schema migration without false verification.
+`test/v2.mjs` checks RFC 5869 HKDF-SHA-256 vectors, an independent Node/OpenSSL
+full-width P-384/HKDF/AES-GCM vector, independent peer derivation, salt/context/
+direction/purpose separation, strict field encoding, native wrapping usages,
+actual key fingerprints, transferred salt, and old deriveKey-only identity
+retention. Readable legacy ciphertext cannot trigger fallback after a v2
+authentication failure. No derived key export is enabled for equality tests.
 The participant fixtures make separate explicit local decisions for their known
 synthetic peers; no trust record is taken from an exchanged key object.
 Timeouts in the runner and failure tests are failure deadlines, not readiness
@@ -551,8 +558,10 @@ The suite exercises native Chromium WebCrypto/IndexedDB. Other browsers,
 hardware failures, and storage exhaustion beyond native constraint/abort error
 paths were not validated here. Application-level trust decisions remain with the
 caller. Group tests establish pairwise ECDH, not broadcast encryption or group
-membership enforcement. This change does not define or implement the v2 KDF,
-nonce, or envelope profile and is not a security audit.
+membership enforcement. The [v2 KDF and field encoding](docs/v2-profile.md)
+are implemented; the authenticated envelope and new nonce contract remain
+outstanding. The raw AES payload/IV representation remains unchanged. This is
+not a security audit, and no guaranteed secret-memory erasure is claimed.
 
 Run `npm test` for the automated source suite and `npm run build` to regenerate
 both outputs in `dist/`. The suite imports `lib/` directly. No runtime dependency

@@ -1,5 +1,5 @@
 import Be8, { STORES, upgradeBe8Schema, jwkThumbprint } from '../lib/bundle.mjs';
-import { participantHooks, exchangePublicKeys, isAuthenticationFailure } from './participants.mjs';
+import { participantHooks, exchangePublicKeys, createParticipant } from './participants.mjs';
 import { readRecord, requestResult, storedIDs } from './database.mjs';
 
 // P-384 public point computed independently with Node createECDH, scalar 1;
@@ -61,7 +61,8 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         assert.strictEqual(writes, 0, 'Native point validation and format checks finish before opening a write transaction');
         assert.deepEqual(await storedIDs(this.alice.database, 'publicKeys'), ['101'], 'No invalid peer key was stored');
         assert.strictEqual(await this.alice.engine.getPeerTrust(this.bob.id), undefined, 'Invalid imports created no trust record');
-        await assert.rejects(this.alice.engine.getDerivedKey({ ...key, use: 'sig' }, (await this.alice.engine.generatePrivAndPubKey()).keyReference),
+        await assert.rejects(this.alice.engine.createDerivationContext({ ...key, use: 'sig' }, (await this.alice.engine.generatePrivAndPubKey()).keyReference,
+            { contextID: 'usage check', sender: this.alice.id, receiver: this.bob.id, purpose: 'data' }),
             error => error.code === 'INVALID_KEY', 'Primitive derivation also validates public usage');
     });
 
@@ -75,12 +76,13 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         assert.strictEqual((await rawTrust(alice.database, alice.id, bob.id)).status, 'unverified', 'A dedicated namespace/peer trust record exists');
         await assert.rejects(alice.engine.encryptTextSimple(alice.id, bob.id, 'Unverified'), error => error.code === 'UNTRUSTED_PUBLIC_KEY', 'Text encryption refuses an unverified peer');
         await assert.rejects(alice.engine.encryptImageSimple(alice.id, bob.id, ''), error => error.code === 'UNTRUSTED_PUBLIC_KEY', 'Image encryption refuses an unverified peer');
-        const incoming = await bob.engine.encryptText(await bob.derive(alice.publicKey), 'Unverified sender');
-        await assert.rejects(alice.engine.decryptTextSimple(bob.id, alice.id, incoming.cipherText, incoming.iv),
+        const incomingContext = await bob.createContext(alice.publicKey);
+        const incoming = { ...await bob.engine.encryptText(incomingContext.key, 'Unverified sender'), derivation: incomingContext.derivation };
+        await assert.rejects(alice.engine.decryptTextSimple(bob.id, alice.id, incoming.cipherText, incoming.iv, incoming.derivation),
             error => error.code === 'UNTRUSTED_PUBLIC_KEY', 'Convenience decryption also refuses an unverified sender');
         await alice.engine.addPublicKey(bob.id, bob.publicKey, { trust: 'confirmed' });
         assert.strictEqual((await alice.engine.getPeerTrust(bob.id)).status, 'confirmed', 'A separate explicit local decision authorizes the same key');
-        assert.true(await alice.engine.decryptTextSimple(bob.id, alice.id, incoming.cipherText, incoming.iv) === 'Unverified sender', 'Confirmation enables actual recipient decryption');
+        assert.true(await alice.engine.decryptTextSimple(bob.id, alice.id, incoming.cipherText, incoming.iv, incoming.derivation) === 'Unverified sender', 'Confirmation enables actual recipient decryption');
     });
 
     QUnit.test('Wrong expected fingerprints reject first contact and preserve an existing confirmed key', async function (assert) {
@@ -108,7 +110,7 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         await alice.engine.addPublicKey(bob.id, bob.publicKey, { tofu: true });
         assert.strictEqual((await alice.engine.getPeerTrust(bob.id)).status, 'tofu', 'First contact is labeled TOFU rather than independently confirmed');
         const packet = await alice.engine.encryptTextSimple(alice.id, bob.id, 'Explicit TOFU');
-        assert.true(await bob.engine.decryptText(await bob.derive(alice.publicKey), packet.cipherText, packet.iv) === 'Explicit TOFU', 'Explicit TOFU enables interoperability');
+        assert.true(await bob.engine.decryptText(await bob.derive(alice.publicKey, packet.derivation), packet.cipherText, packet.iv) === 'Explicit TOFU', 'Explicit TOFU enables interoperability');
         await alice.engine.addPublicKey(bob.id, bob.publicKey);
         assert.strictEqual((await alice.engine.getPeerTrust(bob.id)).status, 'tofu', 'Unchanged reimport retains the TOFU decision');
         const changed = await settles(alice.engine.addPublicKey(bob.id, eve.publicKey, { tofu: true }));
@@ -138,29 +140,31 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
 
     QUnit.test('Explicit replacement requires both fingerprints and updates key and confirmation atomically', async function (assert) {
         const { alice, bob, eve } = this;
+        const replacement = await createParticipant(bob.id, await this.open());
         const previous = await jwkThumbprint(bob.publicKey);
-        const next = await jwkThumbprint(eve.publicKey);
+        const next = await jwkThumbprint(replacement.publicKey);
         await exchangePublicKeys(alice, bob);
-        const wrongNew = await settles(alice.engine.replacePublicKey(bob.id, eve.publicKey,
+        const wrongNew = await settles(alice.engine.replacePublicKey(bob.id, replacement.publicKey,
             { expectedPreviousFingerprint: previous, confirmedNewFingerprint: previous }));
         assert.true(wrongNew.error?.code === 'FINGERPRINT_MISMATCH', 'The newly confirmed fingerprint must match the candidate');
-        const wrongOld = await settles(alice.engine.replacePublicKey(bob.id, eve.publicKey,
+        const wrongOld = await settles(alice.engine.replacePublicKey(bob.id, replacement.publicKey,
             { expectedPreviousFingerprint: next, confirmedNewFingerprint: next }));
         assert.true(wrongOld.error?.code === 'TRUST_CONFLICT', 'The expected previous fingerprint must match the current peer');
         assert.strictEqual((await alice.engine.getPeerTrust(bob.id)).fingerprint, previous, 'Both rejected replacements retain the original trust');
-        await alice.engine.replacePublicKey(bob.id, { ...eve.publicKey, accID: eve.id, namespace: 'wrong' },
+        await alice.engine.replacePublicKey(bob.id, { ...replacement.publicKey, accID: eve.id, namespace: 'wrong' },
             { expectedPreviousFingerprint: previous, confirmedNewFingerprint: next });
         assert.strictEqual(alice.database.pendingWrites(), 0, 'Replacement resolves only after commit');
         const trust = await alice.engine.getPeerTrust(bob.id);
         assert.true(trust.fingerprint === next && trust.status === 'confirmed', 'New point and explicit confirmation commit together');
         assert.deepEqual(await storedIDs(alice.database, 'publicKeys'), ['101', '102'], 'Embedded account metadata cannot change the selected peer');
         const packet = await alice.engine.encryptTextSimple(alice.id, bob.id, 'Confirmed replacement');
-        assert.true(await eve.engine.decryptText(await eve.derive(alice.publicKey), packet.cipherText, packet.iv) === 'Confirmed replacement', 'Convenience derivation sees the newly committed key');
-        await assert.rejects(bob.engine.decryptText(await bob.derive(alice.publicKey), packet.cipherText, packet.iv), isAuthenticationFailure, 'The previous private key no longer decrypts new packets');
+        assert.true(await replacement.engine.decryptText(await replacement.derive(alice.publicKey, packet.derivation), packet.cipherText, packet.iv) === 'Confirmed replacement', 'Convenience derivation sees the newly committed key');
+        await assert.rejects(bob.derive(alice.publicKey, packet.derivation), error => error.code === 'DERIVATION_KEY_MISMATCH',
+            'The previous private endpoint cannot derive a key under the new fingerprint');
         const stale = await settles(alice.engine.replacePublicKey(bob.id, bob.publicKey,
             { expectedPreviousFingerprint: previous, confirmedNewFingerprint: previous }));
         assert.true(stale.error?.code === 'TRUST_CONFLICT', 'A stale previous fingerprint cannot undo the change');
-        await assert.rejects(alice.engine.replacePublicKey(alice.id, eve.publicKey,
+        await assert.rejects(alice.engine.replacePublicKey(alice.id, replacement.publicKey,
             { expectedPreviousFingerprint: await jwkThumbprint(alice.publicKey), confirmedNewFingerprint: next }),
         error => error.code === 'IDENTITY_CONFLICT', 'The peer replacement API cannot rotate the local private identity');
     });
@@ -245,7 +249,7 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         await bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: publicKey }],
             { decisions: [{ peerID: 'g200:1', expectedFingerprint: await jwkThumbprint(publicKey) }] });
         const packet = await bob.engine.encryptTextSimple(bob.id, 'g200:1', 'Confirmed group');
-        assert.true(await alice.engine.decryptTextSimple(bob.id, 'g200:1', packet.cipherText, packet.iv) === 'Confirmed group', 'Explicit group confirmation enables the owner round trip');
+        assert.true(await alice.engine.decryptTextSimple(bob.id, 'g200:1', packet.cipherText, packet.iv, packet.derivation) === 'Confirmed group', 'Explicit group confirmation enables the owner round trip');
         const changed = await settles(bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: this.eve.publicKey }], { tofu: true }));
         assert.true(changed.error?.code === 'GROUP_CONFLICT', 'Existing group version immutability remains enforced');
         bob.database.acknowledgeAborts();

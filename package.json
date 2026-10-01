@@ -1,6 +1,6 @@
 {
-    "name": "be8-engine",
-    "version": "0.2.3",
+    "name": "be9-engine",
+    "version": "0.3.3",
     "description": "",
     "main": "dist/bundle.mjs",
     "type": "module",

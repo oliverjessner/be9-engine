@@ -1,6 +1,6 @@
 import Be8, { STORES, upgradeBe8Schema } from '../lib/bundle.mjs';
 import { requestResult, transactionComplete, withTransaction } from '../lib/persistence.mjs';
-import { participantHooks, exchangePublicKeys, createParticipant, isAuthenticationFailure } from './participants.mjs';
+import { participantHooks, exchangePublicKeys, createParticipant } from './participants.mjs';
 import { storedIDs, readRecord } from './database.mjs';
 
 // These are failure deadlines, never fixed readiness waits. A hung operation
@@ -192,18 +192,19 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         await left.addPublicKey(this.bob.id, this.bob.publicKey, { trust: 'confirmed' });
         await this.bob.engine.addPublicKey('104', leftKey, { trust: 'confirmed' });
         const packet = await right.encryptTextSimple('104', this.bob.id, 'Independent connection');
-        assert.true(await this.bob.engine.decryptTextSimple('104', this.bob.id, packet.cipherText, packet.iv) === 'Independent connection',
+        assert.true(await this.bob.engine.decryptTextSimple('104', this.bob.id, packet.cipherText, packet.iv, packet.derivation) === 'Independent connection',
             'The other connection sees a committed public-key mutation without stale state');
     });
 
     QUnit.test('Conflicting parallel first-contact imports retain one atomic key and trust record', async function (assert) {
         const database = this.alice.database;
+        const alternativeBob = await createParticipant(this.bob.id, await this.open());
         const secondDB = await this.open(database.name);
         const other = new Be8(this.alice.id, secondDB.connection);
         await other.setup();
         const result = await outcome(Promise.allSettled([
             this.alice.engine.addPublicKey(this.bob.id, this.bob.publicKey, { trust: 'confirmed' }),
-            other.addPublicKey(this.bob.id, this.eve.publicKey, { trust: 'confirmed' }),
+            other.addPublicKey(this.bob.id, alternativeBob.publicKey, { trust: 'confirmed' }),
         ]));
         assert.strictEqual(result.status, 'fulfilled', 'Both concurrent import promises settle');
         assert.strictEqual(result.value.filter(entry => entry.status === 'fulfilled').length, 1, 'Exactly one first-contact import commits');
@@ -212,16 +213,15 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         database.acknowledgeAborts();
         secondDB.acknowledgeAborts();
         const stored = await readRecord(database, 'publicKeys', [this.alice.id, this.bob.id]);
-        const winner = stored.x === this.bob.publicKey.x ? this.bob : this.eve;
-        const loser = winner === this.bob ? this.eve : this.bob;
+        const winner = stored.x === this.bob.publicKey.x ? this.bob : alternativeBob;
+        const loser = winner === this.bob ? alternativeBob : this.bob;
         assert.true(stored.x === winner.publicKey.x, 'The winning committed public key is retained');
         const packet = await this.alice.engine.encryptTextSimple(this.alice.id, this.bob.id, 'Committed trust snapshot');
-        const winnerKey = await winner.derive(this.alice.publicKey);
+        const winnerKey = await winner.derive(this.alice.publicKey, packet.derivation);
         assert.true(await winner.engine.decryptText(winnerKey, packet.cipherText, packet.iv) === 'Committed trust snapshot',
             'Convenience operations use the committed key and matching trust decision');
-        const loserKey = await loser.derive(this.alice.publicKey);
-        await assert.rejects(loser.engine.decryptText(loserKey, packet.cipherText, packet.iv),
-            isAuthenticationFailure, 'The rejected key is never silently selected');
+        await assert.rejects(loser.derive(this.alice.publicKey, packet.derivation),
+            error => error.code === 'DERIVATION_KEY_MISMATCH', 'The rejected public fingerprint is never silently selected');
     });
 
     QUnit.test('All read methods open readonly transactions', async function (assert) {
@@ -282,7 +282,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const bobPub = await bob.getMyPublicKey();
         await outcome(Promise.all([alice.addPublicKey('202', bobPub, { trust: 'confirmed' }), bob.addPublicKey('201', alicePub, { trust: 'confirmed' })]));
         const packet = await alice.encryptTextSimple('201', '202', 'Shared database');
-        assert.true(await bob.decryptTextSimple('201', '202', packet.cipherText, packet.iv) === 'Shared database',
+        assert.true(await bob.decryptTextSimple('201', '202', packet.cipherText, packet.iv, packet.derivation) === 'Shared database',
             'Separate scopes interoperate using public exchange in the same application database');
         assert.deepEqual(await storedIDs(database, 'privateKeys', '201'), ['201'], 'Alice scope contains only Alice private key');
         assert.deepEqual(await storedIDs(database, 'privateKeys', '202'), ['202'], 'Bob scope contains only Bob private key');
@@ -369,7 +369,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         alice.database.acknowledgeAborts();
         const reopened = await createParticipant(alice.id, await this.open(alice.database.name));
         const packet = await bob.engine.encryptTextSimple(bob.id, 'g200:1', 'Retained private group key');
-        assert.true(await reopened.engine.decryptTextSimple(bob.id, 'g200:1', packet.cipherText, packet.iv) === 'Retained private group key',
+        assert.true(await reopened.engine.decryptTextSimple(bob.id, 'g200:1', packet.cipherText, packet.iv, packet.derivation) === 'Retained private group key',
             'The reopened owner retains its private group key even after public reimport');
     });
 

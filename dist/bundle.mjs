@@ -254,7 +254,7 @@ async function withTransaction(connection, stores, mode, operation) {
 }
 
 const ecdh = Object.freeze({ name: 'ECDH', namedCurve: 'P-384' });
-const usages = Object.freeze(['deriveKey']);
+const usages = Object.freeze(['deriveBits']);
 
 // Copy only key fields: embedded caller metadata cannot replace storage IDs.
 function keySnapshot(key, allowPrivate = false) {
@@ -371,7 +371,7 @@ function privateCryptoKey(key) {
         key.algorithm.name !== 'ECDH' ||
         key.algorithm.namedCurve !== 'P-384' ||
         key.usages.length !== 1 ||
-        key.usages[0] !== 'deriveKey'
+        !['deriveBits', 'deriveKey'].includes(key.usages[0])
     ) {
         throw engineError(
             'a non-extractable P-384 ECDH private CryptoKey is required',
@@ -401,7 +401,7 @@ async function generatePair() {
     ];
 }
 
-async function deriveAES(publicJWK, privateKey) {
+async function deriveLegacyAES(publicJWK, privateKey) {
     const pub = await validatePublicKey(publicJWK);
     const priv = privateCryptoKey(privateKey);
     let imported;
@@ -410,13 +410,35 @@ async function deriveAES(publicJWK, privateKey) {
     } catch {
         throw engineError('invalid public ECDH key', 'INVALID_KEY');
     }
-    return crypto.subtle.deriveKey(
-        { name: 'ECDH', public: imported },
-        priv,
-        { name: 'AES-GCM', length: 256 },
-        false,
-        ['encrypt', 'decrypt']
-    );
+    if (priv.usages[0] === 'deriveKey') {
+        return crypto.subtle.deriveKey(
+            { name: 'ECDH', public: imported },
+            priv,
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['decrypt']
+        );
+    }
+    let secret;
+    try {
+        secret = new Uint8Array(
+            await crypto.subtle.deriveBits(
+                { name: 'ECDH', public: imported },
+                priv,
+                384
+            )
+        );
+        // Native legacy ECDH-to-AES selected the first 256 ECDH output bits.
+        return await crypto.subtle.importKey(
+            'raw',
+            secret.subarray(0, 32),
+            { name: 'AES-GCM' },
+            false,
+            ['decrypt']
+        );
+    } finally {
+        secret?.fill(0);
+    }
 }
 
 // Only the explicit persistence migration calls this. No private export occurs.
@@ -436,7 +458,7 @@ async function migratePair(publicJWK, privateJWK) {
         }
         const imported = await crypto.subtle.importKey(
             'jwk',
-            priv,
+            { ...priv, key_ops: [...usages] },
             ecdh,
             false,
             usages
@@ -1252,9 +1274,15 @@ class KeyStore {
         };
         const pub = parse(publicID);
         const priv = parse(privateID);
+        const own = parse(privateID);
         if (priv.store === STORES.publicKeys) priv.store = STORES.privateKeys;
-        const [publicRecord, privateKey, trust] = await this.run(
-            [pub.store, priv.store, ...(requireTrust ? [STORES.trust] : [])],
+        const [publicRecord, privateKey, trust, ownRecord] = await this.run(
+            [
+                pub.store,
+                priv.store,
+                own.store,
+                ...(requireTrust ? [STORES.trust] : []),
+            ],
             'readonly',
             (tx) =>
                 Promise.all([
@@ -1279,6 +1307,7 @@ class KeyStore {
                                   .get([this.namespace, peerID(publicID)])
                           )
                         : undefined,
+                    requestResult(tx.objectStore(own.store).get(own.key)),
                 ])
         );
         const publicKey = publicRecord
@@ -1304,7 +1333,12 @@ class KeyStore {
                 );
             }
         }
-        return [publicKey, privateKey];
+        const ownPublicKey = ownRecord
+            ? own.store === STORES.groupKeys
+                ? publicPart(ownRecord.key)
+                : keySnapshot(ownRecord.key)
+            : undefined;
+        return [publicKey, privateKey, ownPublicKey];
     }
 
     async migratePublicKeyTrust() {
@@ -1708,10 +1742,265 @@ class KeyStore {
     }
 }
 
+const V2_SUITE = 'BE8-P384-HKDF-SHA256-A256GCM';
+const V2_PURPOSES = Object.freeze(['data', 'attachment', 'key-wrap']);
+const fields = [
+    'version',
+    'suite',
+    'contextID',
+    'sender',
+    'receiver',
+    'senderFingerprint',
+    'receiverFingerprint',
+    'purpose',
+    'salt',
+];
+const encoder = new TextEncoder();
+
+function fail(
+    message = 'invalid v2 derivation context',
+    code = 'INVALID_DERIVATION_CONTEXT'
+) {
+    return engineError(message, code);
+}
+
+function scalarString(value, maxBytes = 1024) {
+    if (typeof value !== 'string' || !value.length) throw fail();
+    // Reject lone UTF-16 surrogates rather than silently replacing them in UTF-8.
+    for (const character of value) {
+        const code = character.codePointAt(0);
+        if (code >= 0xd800 && code <= 0xdfff) throw fail();
+    }
+    const bytes = encoder.encode(value);
+    if (bytes.length > maxBytes) throw fail();
+    return bytes;
+}
+
+function encodeBase64url(bytes) {
+    return btoa(String.fromCharCode(...bytes))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+}
+
+function decode32(value) {
+    fingerprintValue(value);
+    const bytes = Uint8Array.from(
+        atob(value.replace(/-/g, '+').replace(/_/g, '/') + '='),
+        (char) => char.charCodeAt(0)
+    );
+    if (bytes.length !== 32) throw fail();
+    return bytes;
+}
+
+function endpoint(value) {
+    scalarString(value, 256);
+    if (
+        !/^(0|[1-9][0-9]*)$/.test(value) &&
+        !/^g[A-Za-z0-9_-]+:[1-9][0-9]*$/.test(value)
+    )
+        throw fail();
+    if (
+        value.startsWith('g') &&
+        !Number.isSafeInteger(Number(value.slice(value.lastIndexOf(':') + 1)))
+    )
+        throw fail();
+    return value;
+}
+
+function derivationSnapshot(value) {
+    if (!value)
+        throw fail(
+            'v2 derivation metadata is required; use the explicit legacy reader for old ciphertexts',
+            'DERIVATION_CONTEXT_REQUIRED'
+        );
+    try {
+        if (
+            typeof value !== 'object' ||
+            Array.isArray(value) ||
+            Object.keys(value).length !== fields.length ||
+            !fields.every((field) => Object.keys(value).includes(field))
+        )
+            throw fail();
+        const snapshot = Object.fromEntries(
+            fields.map((field) => [field, value[field]])
+        );
+        if (
+            snapshot.version !== 2 ||
+            snapshot.suite !== V2_SUITE ||
+            !V2_PURPOSES.includes(snapshot.purpose)
+        )
+            throw fail();
+        scalarString(snapshot.contextID);
+        endpoint(snapshot.sender);
+        endpoint(snapshot.receiver);
+        decode32(snapshot.salt);
+        decode32(snapshot.senderFingerprint);
+        decode32(snapshot.receiverFingerprint);
+        return Object.freeze(snapshot);
+    } catch {
+        throw fail();
+    }
+}
+
+// Fixed domain prefix plus eight ordered, uint32-BE length-prefixed byte strings.
+// No separators, normalization, optional fields or object serialization enter info.
+function encodeV2DerivationInfo(metadata) {
+    const context = derivationSnapshot(metadata);
+    const values = [
+        encoder.encode('2'),
+        encoder.encode(context.suite),
+        scalarString(context.contextID),
+        scalarString(context.sender, 256),
+        scalarString(context.receiver, 256),
+        decode32(context.senderFingerprint),
+        decode32(context.receiverFingerprint),
+        encoder.encode(context.purpose),
+    ];
+    const prefix = encoder.encode('BE8-HKDF-INFO');
+    const info = new Uint8Array(
+        prefix.length +
+            values.reduce((length, value) => length + 4 + value.length, 0)
+    );
+    info.set(prefix);
+    const view = new DataView(info.buffer);
+    let offset = prefix.length;
+    for (const value of values) {
+        view.setUint32(offset, value.length, false);
+        offset += 4;
+        info.set(value, offset);
+        offset += value.length;
+    }
+    return info;
+}
+
+async function createV2Metadata(localID, ownPublicKey, peerPublicKey, options) {
+    if (!options || typeof options !== 'object' || Array.isArray(options))
+        throw fail();
+    // Snapshot all application inputs before crypto yields.
+    const { contextID, sender, receiver, purpose } = options;
+    if (sender !== localID)
+        throw fail('only the sender creates a new derivation context');
+    scalarString(contextID);
+    endpoint(sender);
+    endpoint(receiver);
+    if (!V2_PURPOSES.includes(purpose)) throw fail();
+    const [own, peer] = await Promise.all([
+        preparePublicKey(ownPublicKey),
+        preparePublicKey(peerPublicKey),
+    ]);
+    if (sender === receiver && own.fingerprint !== peer.fingerprint)
+        throw fail();
+    const salt = crypto.getRandomValues(new Uint8Array(32));
+    return derivationSnapshot({
+        version: 2,
+        suite: V2_SUITE,
+        contextID,
+        sender,
+        receiver,
+        senderFingerprint: own.fingerprint,
+        receiverFingerprint: peer.fingerprint,
+        purpose,
+        salt: encodeBase64url(salt),
+    });
+}
+
+// Internal helper also exercised against RFC 5869 public test vectors.
+// It never returns IKM, PRK, raw AES bytes or an extractable derived key.
+async function hkdfAES(secret, salt, info, purpose) {
+    if (!V2_PURPOSES.includes(purpose)) throw fail();
+    let material;
+    try {
+        material = await crypto.subtle.importKey('raw', secret, 'HKDF', false, [
+            'deriveKey',
+        ]);
+    } finally {
+        secret.fill(0);
+    }
+    const usages =
+        purpose === 'key-wrap'
+            ? ['wrapKey', 'unwrapKey']
+            : ['encrypt', 'decrypt'];
+    return crypto.subtle.deriveKey(
+        { name: 'HKDF', hash: 'SHA-256', salt, info },
+        material,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        usages
+    );
+}
+
+async function deriveV2AES(
+    localID,
+    ownPublicKey,
+    peerPublicKey,
+    privateKey,
+    metadata
+) {
+    const context = derivationSnapshot(metadata);
+    const priv = privateCryptoKey(privateKey);
+    if (priv.usages[0] !== 'deriveBits') {
+        throw fail(
+            'stored non-extractable deriveKey-only identity cannot derive v2; it is retained for explicit legacy reading',
+            'V2_KEY_USAGE_UNAVAILABLE'
+        );
+    }
+    if (localID !== context.sender && localID !== context.receiver)
+        throw fail('local endpoint is not a participant in this context');
+    const [own, peer] = await Promise.all([
+        preparePublicKey(ownPublicKey),
+        preparePublicKey(peerPublicKey),
+    ]);
+    const sending = localID === context.sender;
+    const ownExpected = sending
+        ? context.senderFingerprint
+        : context.receiverFingerprint;
+    const peerExpected = sending
+        ? context.receiverFingerprint
+        : context.senderFingerprint;
+    if (own.fingerprint !== ownExpected || peer.fingerprint !== peerExpected) {
+        throw fail(
+            'derivation fingerprints do not match the actual endpoint keys',
+            'DERIVATION_KEY_MISMATCH'
+        );
+    }
+    const imported = await crypto.subtle.importKey(
+        'jwk',
+        peer.key,
+        { name: 'ECDH', namedCurve: 'P-384' },
+        peer.key.ext,
+        []
+    );
+    let secret;
+    try {
+        // P-384's complete fixed-width ECDH x-coordinate, including leading zeros.
+        secret = new Uint8Array(
+            await crypto.subtle.deriveBits(
+                { name: 'ECDH', public: imported },
+                priv,
+                384
+            )
+        );
+        if (secret.length !== 48)
+            throw fail('unexpected P-384 ECDH output length');
+        return await hkdfAES(
+            secret,
+            decode32(context.salt),
+            encodeV2DerivationInfo(context),
+            context.purpose
+        );
+    } finally {
+        // Best effort only: WebCrypto/runtime copies and GC are outside our control.
+        secret?.fill(0);
+    }
+}
+
 class Be8 {
     static upgradeBe8Schema = upgradeBe8Schema;
     static STORES = STORES;
     static jwkThumbprint = jwkThumbprint;
+    static V2_SUITE = V2_SUITE;
+    static encodeV2DerivationInfo = encodeV2DerivationInfo;
 
     #keys;
     #accID;
@@ -1879,36 +2168,163 @@ class Be8 {
         return this.#publicResult(publicKey, this.#accID);
     }
 
-    async getDerivedKey(publicKey, privateKey) {
+    async #localPair(keyReference) {
+        if (!keyReference)
+            throw engineError(
+                'no private key passed to getDerivedKey',
+                'INVALID_PRIVATE_KEY'
+            );
+        const reference = this.#references.get(keyReference);
+        if (!reference) {
+            // Preserve precise private-JWK/extractability errors, but v2 cannot
+            // bind actual local public coordinates from an arbitrary CryptoKey.
+            privateCryptoKey(keyReference);
+            throw engineError(
+                'v2 requires an opaque local key reference',
+                'INVALID_LOCAL_REFERENCE'
+            );
+        }
+        const keys = await this.#keys.endpointKeys(
+            reference.endpoint,
+            reference.endpoint
+        );
+        if (
+            !keys[0] ||
+            keys[0].x !== reference.x ||
+            keys[0].y !== reference.y
+        ) {
+            throw engineError(
+                'local key reference is no longer valid',
+                'KEY_REFERENCE_INVALID'
+            );
+        }
+        return {
+            endpoint: reference.endpoint,
+            publicKey: keys[0],
+            privateKey: keys[1],
+        };
+    }
+
+    async createDerivationContext(publicKey, keyReference, options) {
         if (!publicKey)
             throw engineError(
                 'no public key passed to getDerivedKey',
                 'INVALID_KEY'
             );
+        publicKey = keySnapshot(publicKey);
+        const copied = options && {
+            contextID: options.contextID,
+            sender: options.sender,
+            receiver: options.receiver,
+            purpose: options.purpose,
+        };
+        const local = await this.#localPair(keyReference);
+        const derivation = await createV2Metadata(
+            local.endpoint,
+            local.publicKey,
+            publicKey,
+            copied
+        );
+        const key = await deriveV2AES(
+            local.endpoint,
+            local.publicKey,
+            publicKey,
+            local.privateKey,
+            derivation
+        );
+        return { key, derivation };
+    }
+
+    async getDerivedKey(publicKey, keyReference, metadata) {
+        if (!publicKey)
+            throw engineError(
+                'no public key passed to getDerivedKey',
+                'INVALID_KEY'
+            );
+        publicKey = keySnapshot(publicKey);
+        // Copy transferred metadata synchronously, before storage or crypto yields.
+        const context = metadata ? derivationSnapshot(metadata) : undefined;
+        const local = await this.#localPair(keyReference);
+        return deriveV2AES(
+            local.endpoint,
+            local.publicKey,
+            publicKey,
+            local.privateKey,
+            context
+        );
+    }
+
+    // Explicit, decrypt-only legacy KDF. Never selected after an auth failure.
+    async getLegacyDerivedKey(publicKey, privateKey) {
+        if (!publicKey)
+            throw engineError(
+                'no public key passed to legacy derivation',
+                'INVALID_KEY'
+            );
+        publicKey = keySnapshot(publicKey);
+        if (this.#references.has(privateKey))
+            privateKey = (await this.#localPair(privateKey)).privateKey;
+        return deriveLegacyAES(publicKey, privateKey);
+    }
+
+    async #simpleDerivation(
+        sender,
+        receiver,
+        sending,
+        purpose,
+        metadata,
+        options = {}
+    ) {
+        const localID = sending ? sender : receiver;
+        const peerID = sending ? receiver : sender;
+        const context =
+            !sending && metadata ? derivationSnapshot(metadata) : undefined;
+        const contextID = options.contextID;
+        const [publicKey, privateKey, ownPublic] =
+            await this.#keys.endpointKeys(peerID, localID, true);
+        if (!publicKey)
+            throw engineError(
+                'Missing public key for selected peer',
+                'INVALID_KEY'
+            );
         if (!privateKey)
             throw engineError(
-                'no private key passed to getDerivedKey',
+                'Missing private key for local endpoint',
                 'INVALID_PRIVATE_KEY'
             );
-        const reference = this.#references.get(privateKey);
-        if (reference) {
-            const keys = await this.#keys.endpointKeys(
-                reference.endpoint,
-                reference.endpoint
-            );
+        let derivation;
+        if (sending) {
+            derivation = await createV2Metadata(localID, ownPublic, publicKey, {
+                contextID:
+                    contextID === undefined ? crypto.randomUUID() : contextID,
+                sender,
+                receiver,
+                purpose,
+            });
+        } else {
+            derivation = derivationSnapshot(context);
             if (
-                !keys[0] ||
-                keys[0].x !== reference.x ||
-                keys[0].y !== reference.y
+                derivation.sender !== sender ||
+                derivation.receiver !== receiver ||
+                derivation.purpose !== purpose ||
+                (contextID !== undefined && derivation.contextID !== contextID)
             ) {
                 throw engineError(
-                    'local key reference is no longer valid',
-                    'KEY_REFERENCE_INVALID'
+                    'v2 context does not match this operation',
+                    'INVALID_DERIVATION_CONTEXT'
                 );
             }
-            privateKey = keys[1];
         }
-        return deriveAES(publicKey, privateKey);
+        return {
+            key: await deriveV2AES(
+                localID,
+                ownPublic,
+                publicKey,
+                privateKey,
+                derivation
+            ),
+            derivation,
+        };
     }
 
     async encryptText(derivedKey, text = '') {
@@ -1962,50 +2378,61 @@ class Be8 {
             });
     }
 
-    async encryptTextSimple(accIDSender, accIDReceiver, text) {
-        const [publicKey, privateKey] = await this.#keys.endpointKeys(
-            accIDReceiver,
-            accIDSender,
-            true
+    async encryptTextSimple(sender, receiver, text, options = {}) {
+        const context = await this.#simpleDerivation(
+            sender,
+            receiver,
+            true,
+            'data',
+            undefined,
+            options
         );
-
-        if (!publicKey) {
-            throw new Error(
-                `engine: Missing public key for ${accIDReceiver} at encryptTextSimple`
-            );
-        }
-        if (!privateKey) {
-            throw new Error(
-                `engine: Missing private key for ${accIDSender} at encryptTextSimple`
-            );
-        }
-
-        const derivedKey = await this.getDerivedKey(publicKey, privateKey);
-
-        return await this.encryptText(derivedKey, text);
+        return {
+            ...(await this.encryptText(context.key, text)),
+            derivation: context.derivation,
+        };
     }
 
-    async decryptTextSimple(accIDSender, accIDReceiver, cipherText, iv) {
+    async decryptTextSimple(
+        sender,
+        receiver,
+        cipherText,
+        iv,
+        derivation,
+        options = {}
+    ) {
+        const context = await this.#simpleDerivation(
+            sender,
+            receiver,
+            false,
+            'data',
+            derivation,
+            options
+        );
+        return this.decryptText(context.key, cipherText, iv);
+    }
+
+    async decryptTextSimpleLegacy(sender, receiver, cipherText, iv) {
         const [publicKey, privateKey] = await this.#keys.endpointKeys(
-            accIDSender,
-            accIDReceiver,
+            sender,
+            receiver,
             true
         );
-
-        if (!publicKey) {
-            throw new Error(
-                `engine: Missing public key for ${accIDSender} at decryptTextSimple`
+        if (!publicKey)
+            throw engineError(
+                'Missing public key for selected peer',
+                'INVALID_KEY'
             );
-        }
-        if (!privateKey) {
-            throw new Error(
-                `engine: Missing private key for ${accIDReceiver} at decryptTextSimple`
+        if (!privateKey)
+            throw engineError(
+                'Missing private key for local endpoint',
+                'INVALID_PRIVATE_KEY'
             );
-        }
-
-        const derivedKey = await this.getDerivedKey(publicKey, privateKey);
-
-        return await this.decryptText(derivedKey, cipherText, iv);
+        return this.decryptText(
+            await deriveLegacyAES(publicKey, privateKey),
+            cipherText,
+            iv
+        );
     }
 
     async encryptImage(derivedKey, base64Image) {
@@ -2049,50 +2476,61 @@ class Be8 {
             });
     }
 
-    async encryptImageSimple(accIDSender, accIDReceiver, base64Image) {
-        const [publicKey, privateKey] = await this.#keys.endpointKeys(
-            accIDReceiver,
-            accIDSender,
-            true
+    async encryptImageSimple(sender, receiver, base64Image, options = {}) {
+        const context = await this.#simpleDerivation(
+            sender,
+            receiver,
+            true,
+            'attachment',
+            undefined,
+            options
         );
-
-        if (!publicKey) {
-            throw new Error(
-                `engine: Missing public key for ${accIDSender} at encryptImageSimple`
-            );
-        }
-        if (!privateKey) {
-            throw new Error(
-                `engine: Missing private key for ${accIDReceiver} at encryptImageSimple`
-            );
-        }
-
-        const derivedKey = await this.getDerivedKey(publicKey, privateKey);
-
-        return await this.encryptImage(derivedKey, base64Image);
+        return {
+            ...(await this.encryptImage(context.key, base64Image)),
+            derivation: context.derivation,
+        };
     }
 
-    async decryptImageSimple(accIDSender, accIDReceiver, cipherImage, iv) {
+    async decryptImageSimple(
+        sender,
+        receiver,
+        cipherImage,
+        iv,
+        derivation,
+        options = {}
+    ) {
+        const context = await this.#simpleDerivation(
+            sender,
+            receiver,
+            false,
+            'attachment',
+            derivation,
+            options
+        );
+        return this.decryptImage(context.key, cipherImage, iv);
+    }
+
+    async decryptImageSimpleLegacy(sender, receiver, cipherImage, iv) {
         const [publicKey, privateKey] = await this.#keys.endpointKeys(
-            accIDSender,
-            accIDReceiver,
+            sender,
+            receiver,
             true
         );
-
-        if (!publicKey) {
-            throw new Error(
-                `engine: Missing public key for ${accIDSender} at decryptImageSimple`
+        if (!publicKey)
+            throw engineError(
+                'Missing public key for selected peer',
+                'INVALID_KEY'
             );
-        }
-        if (!privateKey) {
-            throw new Error(
-                `engine: Missing private key for ${accIDReceiver} at decryptImageSimple`
+        if (!privateKey)
+            throw engineError(
+                'Missing private key for local endpoint',
+                'INVALID_PRIVATE_KEY'
             );
-        }
-
-        const derivedKey = await this.getDerivedKey(publicKey, privateKey);
-
-        return await this.decryptImage(derivedKey, cipherImage, iv);
+        return this.decryptImage(
+            await deriveLegacyAES(publicKey, privateKey),
+            cipherImage,
+            iv
+        );
     }
 
     async panic() {
@@ -2100,4 +2538,11 @@ class Be8 {
     }
 }
 
-export { STORES, Be8 as default, jwkThumbprint, upgradeBe8Schema };
+export {
+    STORES,
+    V2_SUITE,
+    Be8 as default,
+    encodeV2DerivationInfo,
+    jwkThumbprint,
+    upgradeBe8Schema,
+};
