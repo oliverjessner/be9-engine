@@ -44,10 +44,13 @@ function engineError(message, code = 'INVALID_STATE') {
 }
 
 function databaseError(error) {
-    const failure = engineError(
-        'IndexedDB operation failed',
-        'PERSISTENCE_ERROR'
-    );
+    const failure =
+        error?.name === 'DataCloneError'
+            ? engineError(
+                  'browser cannot store CryptoKeys; CryptoKey structured clone support is required',
+                  'CRYPTOKEY_STORAGE_UNSUPPORTED'
+              )
+            : engineError('IndexedDB operation failed', 'PERSISTENCE_ERROR');
     const names = [
         'AbortError',
         'ConstraintError',
@@ -163,7 +166,7 @@ function requestResult(request, consume = (value) => value) {
                 resolve(consume(request.result));
             } catch (error) {
                 reject(
-                    error instanceof Error && error.code
+                    error instanceof Error && typeof error.code === 'string'
                         ? error
                         : databaseError(error)
                 );
@@ -238,7 +241,7 @@ async function withTransaction(connection, stores, mode, operation) {
         } catch {
             /* Already complete or aborted. */
         }
-        throw error instanceof Error && error.code
+        throw error instanceof Error && typeof error.code === 'string'
             ? error
             : databaseError(error);
     });
@@ -246,6 +249,187 @@ async function withTransaction(connection, stores, mode, operation) {
     if (work.status === 'rejected') throw work.reason;
     if (commit.status === 'rejected') throw commit.reason;
     return work.value;
+}
+
+const ecdh = Object.freeze({ name: 'ECDH', namedCurve: 'P-384' });
+const usages = Object.freeze(['deriveKey']);
+
+// Copy only key fields: embedded caller metadata cannot replace storage IDs.
+function keySnapshot(key, allowPrivate = false) {
+    try {
+        if (
+            !key ||
+            typeof key !== 'object' ||
+            Array.isArray(key) ||
+            key.kty !== 'EC' ||
+            key.crv !== 'P-384' ||
+            typeof key.x !== 'string' ||
+            !key.x ||
+            typeof key.y !== 'string' ||
+            !key.y ||
+            typeof key.ext !== 'boolean' ||
+            !Array.isArray(key.key_ops) ||
+            !key.key_ops.every((op) => typeof op === 'string') ||
+            (key.d !== undefined &&
+                (!allowPrivate || typeof key.d !== 'string' || !key.d))
+        ) {
+            throw engineError('invalid key data', 'INVALID_KEY');
+        }
+        const snapshot = {
+            kty: key.kty,
+            crv: key.crv,
+            x: key.x,
+            y: key.y,
+            ext: key.ext,
+            key_ops: [...key.key_ops],
+        };
+        if (allowPrivate && key.d !== undefined) snapshot.d = key.d;
+        return snapshot;
+    } catch {
+        throw engineError('invalid key data', 'INVALID_KEY');
+    }
+}
+
+function publicPart(key) {
+    const snapshot = keySnapshot(key, true);
+    return {
+        kty: snapshot.kty,
+        crv: snapshot.crv,
+        x: snapshot.x,
+        y: snapshot.y,
+        ext: true,
+        key_ops: [],
+    };
+}
+
+function privateCryptoKey(key) {
+    if (key?.d !== undefined) {
+        throw engineError(
+            'explicit private JWK migration required',
+            'PRIVATE_KEY_MIGRATION_REQUIRED'
+        );
+    }
+    if (
+        !(key instanceof CryptoKey) ||
+        key.type !== 'private' ||
+        key.extractable ||
+        key.algorithm.name !== 'ECDH' ||
+        key.algorithm.namedCurve !== 'P-384' ||
+        key.usages.length !== 1 ||
+        key.usages[0] !== 'deriveKey'
+    ) {
+        throw engineError(
+            'a non-extractable P-384 ECDH private CryptoKey is required',
+            'INVALID_PRIVATE_KEY'
+        );
+    }
+    return key;
+}
+
+function cloneable(key) {
+    try {
+        privateCryptoKey(structuredClone(key));
+    } catch {
+        throw engineError(
+            'browser cannot store non-extractable CryptoKeys; use a browser with CryptoKey structured clone support',
+            'CRYPTOKEY_STORAGE_UNSUPPORTED'
+        );
+    }
+    return key;
+}
+
+async function generatePair() {
+    const pair = await crypto.subtle.generateKey(ecdh, false, usages);
+    return [
+        await crypto.subtle.exportKey('jwk', pair.publicKey),
+        cloneable(privateCryptoKey(pair.privateKey)),
+    ];
+}
+
+async function deriveAES(publicJWK, privateKey) {
+    const pub = keySnapshot(publicJWK);
+    const priv = privateCryptoKey(privateKey);
+    let imported;
+    try {
+        imported = await crypto.subtle.importKey('jwk', pub, ecdh, true, []);
+    } catch {
+        throw engineError('invalid public ECDH key', 'INVALID_KEY');
+    }
+    return crypto.subtle.deriveKey(
+        { name: 'ECDH', public: imported },
+        priv,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+    );
+}
+
+// Only the explicit persistence migration calls this. No private export occurs.
+async function migratePair(publicJWK, privateJWK) {
+    try {
+        const pub = keySnapshot(publicJWK);
+        const priv = keySnapshot(privateJWK, true);
+        if (
+            !priv.d ||
+            pub.x !== priv.x ||
+            pub.y !== priv.y ||
+            ![priv.x, priv.y, priv.d].every((value) =>
+                /^[A-Za-z0-9_-]{64}$/.test(value)
+            )
+        ) {
+            throw new Error();
+        }
+        const imported = await crypto.subtle.importKey(
+            'jwk',
+            priv,
+            ecdh,
+            false,
+            usages
+        );
+        // Validate the scalar against the exact public point (including y).
+        // A temporary non-extractable signing import verifies the existing pair;
+        // it is never stored, returned, or used by the encryption protocol.
+        const signatureAlgorithm = { name: 'ECDSA', namedCurve: 'P-384' };
+        const signingKey = await crypto.subtle.importKey(
+            'jwk',
+            { ...priv, key_ops: ['sign'] },
+            signatureAlgorithm,
+            false,
+            ['sign']
+        );
+        const verifyingKey = await crypto.subtle.importKey(
+            'jwk',
+            { ...publicPart(pub), key_ops: ['verify'] },
+            signatureAlgorithm,
+            true,
+            ['verify']
+        );
+        const challenge = new TextEncoder().encode(
+            'be8 private-key migration validation'
+        );
+        const parameters = { name: 'ECDSA', hash: 'SHA-384' };
+        const signature = await crypto.subtle.sign(
+            parameters,
+            signingKey,
+            challenge
+        );
+        if (
+            !(await crypto.subtle.verify(
+                parameters,
+                verifyingKey,
+                signature,
+                challenge
+            ))
+        )
+            throw new Error();
+        return [pub, cloneable(privateCryptoKey(imported))];
+    } catch (error) {
+        if (error.code === 'CRYPTOKEY_STORAGE_UNSUPPORTED') throw error;
+        throw engineError(
+            'private JWK validation failed; original records retained',
+            'INVALID_PRIVATE_KEY'
+        );
+    }
 }
 
 function accountID(id) {
@@ -289,49 +473,6 @@ function groupVersion(version) {
     return version;
 }
 
-// Copy only JWK fields. Untrusted embedded metadata can never choose a storage
-// key or override separately supplied account, namespace, group or version data.
-function keySnapshot(key, allowPrivate = false) {
-    try {
-        if (
-            !key ||
-            typeof key !== 'object' ||
-            Array.isArray(key) ||
-            key.kty !== 'EC' ||
-            key.crv !== 'P-384' ||
-            typeof key.x !== 'string' ||
-            !key.x ||
-            typeof key.y !== 'string' ||
-            !key.y ||
-            typeof key.ext !== 'boolean' ||
-            !Array.isArray(key.key_ops) ||
-            !key.key_ops.every((op) => typeof op === 'string') ||
-            (key.d !== undefined &&
-                (!allowPrivate || typeof key.d !== 'string' || !key.d))
-        ) {
-            throw engineError('invalid key data', 'INVALID_KEY');
-        }
-        const snapshot = {
-            kty: key.kty,
-            crv: key.crv,
-            x: key.x,
-            y: key.y,
-            ext: key.ext,
-            key_ops: [...key.key_ops],
-        };
-        if (allowPrivate && key.d !== undefined) snapshot.d = key.d;
-        return snapshot;
-    } catch {
-        throw engineError('invalid key data', 'INVALID_KEY');
-    }
-}
-
-function publicPart(key) {
-    const { d: ignored, ...publicKey } = keySnapshot(key, true);
-    publicKey.key_ops = [];
-    return publicKey;
-}
-
 function samePublic(left, right) {
     return (
         left.kty === right.kty &&
@@ -350,14 +491,23 @@ function identityPair(publicRecord, privateRecord) {
         );
     }
     const publicKey = keySnapshot(publicRecord.key);
-    const privateKey = keySnapshot(privateRecord.key, true);
-    if (!privateKey.d || !samePublic(publicKey, privateKey)) {
+    const privateKey = privateCryptoKey(privateRecord.key);
+    if (!samePublic(publicKey, keySnapshot(privateRecord.publicKey))) {
         throw engineError(
             'inconsistent identity; existing keys are retained',
             'INCOMPLETE_IDENTITY'
         );
     }
     return [publicKey, privateKey];
+}
+
+function groupPair(record) {
+    if (!record) return undefined;
+    if (record.key?.d !== undefined) privateCryptoKey(record.key);
+    return [
+        keySnapshot(record.key),
+        record.privateKey ? privateCryptoKey(record.privateKey) : undefined,
+    ];
 }
 
 class KeyStore {
@@ -426,7 +576,7 @@ class KeyStore {
 
     // Candidate keys have been generated/imported before opening this transaction.
     // Concurrent initializers recheck inside the same multi-store write lock.
-    async storeIdentity(candidate, legacyAllowed = false) {
+    async storeIdentity(candidate) {
         const db = databaseConnection(this.connection);
         const legacy = ['publicKeys', 'privateKeys'].filter((name) =>
             db.objectStoreNames.contains(name)
@@ -449,49 +599,33 @@ class KeyStore {
                                         .objectStore(legacy[index])
                                         .get(this.accID),
                                     (record) => {
-                                        if (record && !legacyAllowed) {
+                                        if (record)
                                             throw engineError(
                                                 'explicit legacy identity migration required',
                                                 'LEGACY_IDENTITY'
                                             );
-                                        }
-                                        if (legacyAllowed) {
-                                            const expected =
-                                                legacy[index] === 'publicKeys'
-                                                    ? candidate[0]
-                                                    : candidate[1];
-                                            if (
-                                                !record ||
-                                                !samePublic(record, expected) ||
-                                                record.d !== expected.d
-                                            ) {
-                                                throw engineError(
-                                                    'legacy identity changed during adoption',
-                                                    'IDENTITY_CONFLICT'
-                                                );
-                                            }
-                                        }
                                         return checkLegacy(index + 1);
                                     }
                                 );
                             }
                             const [publicKey, privateKey] = candidate;
-                            return Promise.all([
-                                requestResult(
-                                    pubStore.add({
-                                        namespace: this.namespace,
-                                        accID: this.accID,
-                                        key: publicKey,
-                                    })
-                                ),
-                                requestResult(
-                                    privStore.add({
-                                        namespace: this.namespace,
-                                        accID: this.accID,
-                                        key: privateKey,
-                                    })
-                                ),
-                            ]).then(() => candidate);
+                            return requestResult(
+                                pubStore.add({
+                                    namespace: this.namespace,
+                                    accID: this.accID,
+                                    key: publicKey,
+                                }),
+                                () =>
+                                    requestResult(
+                                        privStore.add({
+                                            namespace: this.namespace,
+                                            accID: this.accID,
+                                            key: privateKey,
+                                            publicKey,
+                                        }),
+                                        () => candidate
+                                    )
+                            );
                         };
                         return checkLegacy(0);
                     })
@@ -524,7 +658,10 @@ class KeyStore {
                             if (
                                 entry.accID === this.accID &&
                                 own &&
-                                !samePublic(entry.key, own.key)
+                                !samePublic(
+                                    entry.key,
+                                    own.publicKey || publicPart(own.key)
+                                )
                             ) {
                                 throw engineError(
                                     'cannot replace the public half of an existing identity',
@@ -594,7 +731,7 @@ class KeyStore {
                         groupID: record.groupID,
                         version: record.version,
                         groupKey: {
-                            ...keySnapshot(record.key, true),
+                            ...publicPart(record.key),
                             groupID: record.groupID,
                             version: record.version,
                         },
@@ -609,7 +746,7 @@ class KeyStore {
                 tx
                     .objectStore(STORES.groupKeys)
                     .get([this.namespace, groupID(id), groupVersion(version)]),
-                (record) => (record ? keySnapshot(record.key, true) : undefined)
+                (record) => groupPair(record)
             )
         );
     }
@@ -620,7 +757,7 @@ class KeyStore {
         try {
             copied = entries.map(({ version, groupKey }) => ({
                 version: groupVersion(version),
-                key: keySnapshot(groupKey, true),
+                key: keySnapshot(groupKey),
             }));
         } catch {
             throw engineError('invalid group-key entries', 'INVALID_KEY');
@@ -634,26 +771,29 @@ class KeyStore {
                 const { version, key } = copied[index];
                 const storageKey = [this.namespace, group, version];
                 return requestResult(store.get(storageKey), (existing) => {
-                    if (
-                        existing &&
-                        (!samePublic(existing.key, key) ||
-                            (existing.key.d &&
-                                key.d &&
-                                existing.key.d !== key.d))
-                    ) {
+                    if (existing && !samePublic(existing.key, key)) {
                         throw engineError(
                             'group version already has a different key',
                             'GROUP_CONFLICT'
                         );
                     }
                     // A public reimport must never erase a retained private key.
-                    const retained = existing?.key.d ? existing.key : key;
+                    if (existing?.key.d !== undefined)
+                        privateCryptoKey(existing.key);
+                    const retained = existing || { key };
                     return requestResult(
                         store.put({
                             namespace: this.namespace,
                             groupID: group,
                             version,
-                            key: retained,
+                            key: retained.key,
+                            ...(retained.privateKey
+                                ? {
+                                      privateKey: privateCryptoKey(
+                                          retained.privateKey
+                                      ),
+                                  }
+                                : {}),
                         }),
                         () => putNext(index + 1)
                     );
@@ -672,20 +812,21 @@ class KeyStore {
                 store.get([this.namespace, group, v]),
                 (existing) => {
                     if (existing) {
-                        const key = keySnapshot(existing.key, true);
-                        if (!key.d)
+                        const pair = groupPair(existing);
+                        if (!pair[1])
                             throw engineError(
                                 'existing group key has no private half',
                                 'GROUP_CONFLICT'
                             );
-                        return [publicPart(key), key];
+                        return pair;
                     }
                     return requestResult(
                         store.add({
                             namespace: this.namespace,
                             groupID: group,
                             version: v,
-                            key: pair[1],
+                            key: pair[0],
+                            privateKey: pair[1],
                         }),
                         () => pair
                     );
@@ -732,11 +873,263 @@ class KeyStore {
                     : requestResult(
                           tx.objectStore(priv.store).get(priv.key),
                           (record) =>
-                              record?.key.d
-                                  ? keySnapshot(record.key, true)
+                              record
+                                  ? priv.store === STORES.privateKeys
+                                      ? privateCryptoKey(record.key)
+                                      : groupPair(record)[1]
                                   : undefined
                       ),
             ])
+        );
+    }
+
+    async migratePrivateKeys({
+        legacyIdentity = false,
+        legacyGroups = [],
+    } = {}) {
+        if (
+            typeof legacyIdentity !== 'boolean' ||
+            !Array.isArray(legacyGroups)
+        ) {
+            throw engineError('invalid migration options', 'INVALID_KEY');
+        }
+        const selected = legacyGroups.map((entry) => ({
+            groupID: groupID(entry.groupID),
+            version: groupVersion(entry.version),
+            legacyVersion: entry.version,
+        }));
+        if (
+            new Set(
+                selected.map((entry) => entry.groupID + ':' + entry.version)
+            ).size !== selected.length
+        ) {
+            throw engineError(
+                'duplicate legacy group selection',
+                'INVALID_GROUP'
+            );
+        }
+        const db = databaseConnection(this.connection);
+        const legacy = ['publicKeys', 'privateKeys'].filter((name) =>
+            db.objectStoreNames.contains(name)
+        );
+        if (selected.length && !db.objectStoreNames.contains('groupKeys')) {
+            throw engineError(
+                'legacy group store is missing',
+                'INCOMPLETE_IDENTITY'
+            );
+        }
+        const stores = [
+            STORES.publicKeys,
+            STORES.privateKeys,
+            STORES.groupKeys,
+            ...legacy,
+            ...(selected.length ? ['groupKeys'] : []),
+        ];
+        // The same request chain reads the preparation snapshot and rechecks it
+        // inside the write lock. All crypto work happens between transactions.
+        const read = (tx, consume) => {
+            const requests = [
+                () =>
+                    tx
+                        .objectStore(STORES.publicKeys)
+                        .get([this.namespace, this.accID]),
+                () =>
+                    tx
+                        .objectStore(STORES.privateKeys)
+                        .get([this.namespace, this.accID]),
+                () =>
+                    tx
+                        .objectStore(STORES.groupKeys)
+                        .index('namespace')
+                        .getAll(this.namespace),
+                ...legacy.map(
+                    (name) => () => tx.objectStore(name).get(this.accID)
+                ),
+                ...selected.map(
+                    (entry) => () =>
+                        tx
+                            .objectStore('groupKeys')
+                            .get([entry.groupID, entry.legacyVersion])
+                ),
+            ];
+            const records = [];
+            const next = (index) =>
+                index === requests.length
+                    ? consume(records)
+                    : requestResult(requests[index](), (record) => {
+                          records.push(record);
+                          return next(index + 1);
+                      });
+            return next(0);
+        };
+        const snapshot = await this.run(stores, 'readonly', (tx) =>
+            read(tx, (records) => records)
+        );
+        const [pub, priv, groups] = snapshot;
+        const flat = snapshot.slice(3, 3 + legacy.length);
+        let pair;
+        let migratedIdentity = false;
+        if (pub || priv) {
+            if (!pub || !priv)
+                throw engineError(
+                    'incomplete identity; originals retained',
+                    'INCOMPLETE_IDENTITY'
+                );
+            if (priv.key?.d !== undefined) {
+                pair = await migratePair(pub.key, priv.key);
+                migratedIdentity = true;
+            } else pair = identityPair(pub, priv);
+        }
+        if (flat.some(Boolean)) {
+            if (!legacyIdentity)
+                throw engineError(
+                    'explicit legacy identity migration required',
+                    'LEGACY_IDENTITY'
+                );
+            const flatPub = flat[legacy.indexOf('publicKeys')];
+            const flatPriv = flat[legacy.indexOf('privateKeys')];
+            if (!flatPub || !flatPriv)
+                throw engineError(
+                    'incomplete legacy identity; originals retained',
+                    'INCOMPLETE_IDENTITY'
+                );
+            const imported = await migratePair(flatPub, flatPriv);
+            if (pair && !samePublic(pair[0], imported[0])) {
+                throw engineError(
+                    'legacy and scoped identities differ; originals retained',
+                    'IDENTITY_CONFLICT'
+                );
+            }
+            pair = imported;
+            migratedIdentity = true;
+        }
+        if (!pair)
+            throw engineError(
+                'migration requires an existing identity; no keys generated',
+                'INCOMPLETE_IDENTITY'
+            );
+        const replacements = [];
+        for (const record of groups) {
+            groupID(record.groupID);
+            groupVersion(record.version);
+            if (record.key?.d !== undefined) {
+                const imported = await migratePair(
+                    publicPart(record.key),
+                    record.key
+                );
+                replacements.push({
+                    namespace: this.namespace,
+                    groupID: record.groupID,
+                    version: record.version,
+                    key: imported[0],
+                    privateKey: imported[1],
+                });
+            } else groupPair(record);
+        }
+        for (let index = 0; index < selected.length; index++) {
+            const entry = selected[index];
+            const record = snapshot[3 + legacy.length + index];
+            if (!record)
+                throw engineError(
+                    'selected legacy group is missing',
+                    'INCOMPLETE_IDENTITY'
+                );
+            const imported = await migratePair(publicPart(record), record);
+            const existing = groups.find(
+                (group) =>
+                    group.groupID === entry.groupID &&
+                    group.version === entry.version
+            );
+            if (existing && !samePublic(existing.key, imported[0])) {
+                throw engineError(
+                    'legacy group conflicts with scoped version; originals retained',
+                    'GROUP_CONFLICT'
+                );
+            }
+            const replacement = {
+                namespace: this.namespace,
+                groupID: entry.groupID,
+                version: entry.version,
+                key: imported[0],
+                privateKey: imported[1],
+            };
+            const previous = replacements.findIndex(
+                (group) =>
+                    group.groupID === entry.groupID &&
+                    group.version === entry.version
+            );
+            if (previous < 0) replacements.push(replacement);
+            else replacements[previous] = replacement;
+        }
+        // JSON is only an internal conflict comparison, never a persisted backup
+        // or an error value. CryptoKey capabilities are compared by their metadata.
+        const describe = (records) =>
+            JSON.stringify(records, (name, value) =>
+                value instanceof CryptoKey
+                    ? {
+                          type: value.type,
+                          extractable: value.extractable,
+                          algorithm: value.algorithm,
+                          usages: value.usages,
+                      }
+                    : value
+            );
+        const expected = describe(snapshot);
+        if (!migratedIdentity && !replacements.length)
+            return { migratedIdentity: false, migratedGroups: 0 };
+        return this.run(stores, 'readwrite', (tx) =>
+            read(tx, (current) => {
+                if (describe(current) !== expected) {
+                    throw engineError(
+                        'records changed during migration; retry explicitly',
+                        'MIGRATION_CONFLICT'
+                    );
+                }
+                const writes = [];
+                if (migratedIdentity) {
+                    const metadata = {
+                        namespace: this.namespace,
+                        accID: this.accID,
+                    };
+                    writes.push(() =>
+                        tx
+                            .objectStore(STORES.publicKeys)
+                            .put({ ...metadata, key: pair[0] })
+                    );
+                    writes.push(() =>
+                        tx
+                            .objectStore(STORES.privateKeys)
+                            .put({
+                                ...metadata,
+                                key: pair[1],
+                                publicKey: pair[0],
+                            })
+                    );
+                    for (const name of legacy)
+                        writes.push(() =>
+                            tx.objectStore(name).delete(this.accID)
+                        );
+                }
+                for (const record of replacements)
+                    writes.push(() =>
+                        tx.objectStore(STORES.groupKeys).put(record)
+                    );
+                for (const entry of selected) {
+                    writes.push(() =>
+                        tx
+                            .objectStore('groupKeys')
+                            .delete([entry.groupID, entry.legacyVersion])
+                    );
+                }
+                const next = (index) =>
+                    index === writes.length
+                        ? {
+                              migratedIdentity,
+                              migratedGroups: replacements.length,
+                          }
+                        : requestResult(writes[index](), () => next(index + 1));
+                return next(0);
+            })
         );
     }
 
@@ -769,49 +1162,14 @@ class KeyStore {
     }
 }
 
-// Explicit legacy read only: never called after an authentication error.
-async function readLegacyIdentity(connection, accID) {
-    accountID(accID);
-    const records = await withTransaction(
-        connection,
-        ['publicKeys', 'privateKeys'],
-        'readonly',
-        (tx) =>
-            Promise.all(
-                ['publicKeys', 'privateKeys'].map((name) =>
-                    requestResult(tx.objectStore(name).get(accID))
-                )
-            )
-    );
-    const [pub, priv] = records;
-    return identityPair(pub && { key: pub }, priv && { key: priv });
-}
-
-const keyUsages = Object.freeze(['deriveKey', 'deriveBits']);
-const algorithmType = 'ECDH';
-const algorithm = Object.freeze({ name: algorithmType, namedCurve: 'P-384' });
-const format = 'jwk';
-
-async function generatePair() {
-    const { publicKey, privateKey } = await window.crypto.subtle.generateKey(
-        algorithm,
-        true,
-        keyUsages
-    );
-    return Promise.all([
-        window.crypto.subtle.exportKey(format, publicKey),
-        window.crypto.subtle.exportKey(format, privateKey),
-    ]);
-}
-
 class Be8 {
     static upgradeBe8Schema = upgradeBe8Schema;
-    static readLegacyIdentity = readLegacyIdentity;
     static STORES = STORES;
 
     #keys;
     #accID;
     #setupPromise;
+    #references = new WeakMap();
 
     constructor(accID, indexedDB, { namespace = accID } = {}) {
         this.#accID = accountID(accID);
@@ -824,9 +1182,17 @@ class Be8 {
         this.#keys = new KeyStore(indexedDB, accID, namespace);
     }
 
-    setup({ legacyIdentity = false } = {}) {
+    setup(options = {}) {
+        if (Object.keys(options).length) {
+            return Promise.reject(
+                engineError(
+                    'use migratePrivateKeys() for explicit migration',
+                    'PRIVATE_KEY_MIGRATION_REQUIRED'
+                )
+            );
+        }
         if (this.#setupPromise) return this.#setupPromise;
-        const pending = this.#initialize(legacyIdentity);
+        const pending = this.#initialize();
         this.#setupPromise = pending;
         const reset = () => {
             if (this.#setupPromise === pending) this.#setupPromise = undefined;
@@ -835,51 +1201,36 @@ class Be8 {
         return pending;
     }
 
-    async #initialize(legacyIdentity) {
-        await this.#ensureIdentity(legacyIdentity);
+    async #initialize() {
+        await this.#ensureIdentity();
         return this.getCachedKeys();
     }
 
-    async #ensureIdentity(legacyIdentity = false) {
+    async #ensureIdentity() {
         const current = await this.#keys.identity();
         if (current) return current;
-        let pair;
-        let usingLegacy = false;
         if (await this.#keys.legacyPresent()) {
-            if (!legacyIdentity) {
-                throw engineError(
-                    'explicit legacy identity migration required',
-                    'LEGACY_IDENTITY'
-                );
-            }
-            pair = await readLegacyIdentity(this.#keys.connection, this.#accID);
-            usingLegacy = true;
-            if (!pair)
-                throw engineError(
-                    'legacy identity is missing',
-                    'INCOMPLETE_IDENTITY'
-                );
-            // Import validation occurs before opening a write transaction.
-            await Promise.all([
-                window.crypto.subtle.importKey(
-                    format,
-                    pair[0],
-                    algorithm,
-                    true,
-                    []
-                ),
-                window.crypto.subtle.importKey(
-                    format,
-                    pair[1],
-                    algorithm,
-                    true,
-                    keyUsages
-                ),
-            ]);
-        } else {
-            pair = await generatePair();
+            throw engineError(
+                'explicit legacy identity migration required',
+                'LEGACY_IDENTITY'
+            );
         }
-        return this.#keys.storeIdentity(pair, usingLegacy);
+        return this.#keys.storeIdentity(await generatePair());
+    }
+
+    // References carry no key material and are usable only by this instance.
+    #publicResult(publicKey, endpoint) {
+        const keyReference = Object.freeze({});
+        this.#references.set(keyReference, {
+            endpoint,
+            x: publicKey.x,
+            y: publicKey.y,
+        });
+        return { publicKey, keyReference };
+    }
+
+    async migratePrivateKeys(options) {
+        return this.#keys.migratePrivateKeys(options);
     }
 
     getAccID() {
@@ -947,64 +1298,53 @@ class Be8 {
     async generateGroupKeys(version, group) {
         const v = groupVersion(version);
         const id = groupID(group);
-        const current = await this.#keys.groupKey(id, v);
-        if (current) {
-            if (!current.d)
-                throw engineError(
-                    'existing group key has no private half',
-                    'GROUP_CONFLICT'
-                );
-            return [publicPart(current), current];
-        }
-        const pair = await generatePair();
-        return this.#keys.createGroup(id, v, pair);
+        let pair = await this.#keys.groupKey(id, v);
+        if (pair && !pair[1])
+            throw engineError(
+                'existing group key has no private half',
+                'GROUP_CONFLICT'
+            );
+        if (!pair)
+            pair = await this.#keys.createGroup(id, v, await generatePair());
+        return this.#publicResult(pair[0], id + ':' + v);
     }
 
-    // Idempotent: generating again does not silently rotate an existing identity.
+    // Idempotent: never returns a private JWK or a private CryptoKey.
     async generatePrivAndPubKey() {
-        return this.#ensureIdentity();
+        const [publicKey] = await this.#ensureIdentity();
+        return this.#publicResult(publicKey, this.#accID);
     }
 
     async getDerivedKey(publicKey, privateKey) {
-        if (!publicKey) {
-            throw new Error('engine: no public key passed to getDerivedKey');
-        }
-        if (!privateKey) {
-            throw new Error('engine: no private key passed to getDerivedKey');
-        }
-
-        const publicKeyProm = window.crypto.subtle.importKey(
-            format,
-            publicKey,
-            algorithm,
-            true,
-            []
-        );
-        const privateKeyProm = window.crypto.subtle.importKey(
-            format,
-            privateKey,
-            algorithm,
-            true,
-            keyUsages
-        );
-
-        return Promise.all([publicKeyProm, privateKeyProm]).then(function ([
-            publicKey,
-            privateKey,
-        ]) {
-            const algorithm = {
-                name: 'AES-GCM', // Advanced Encryption Standard Galois/Counter Mode
-                length: 256,
-            };
-
-            return window.crypto.subtle.deriveKey(
-                { name: algorithmType, public: publicKey },
-                privateKey,
-                algorithm,
-                true,
-                ['encrypt', 'decrypt']
+        if (!publicKey)
+            throw engineError(
+                'no public key passed to getDerivedKey',
+                'INVALID_KEY'
             );
-        });
+        if (!privateKey)
+            throw engineError(
+                'no private key passed to getDerivedKey',
+                'INVALID_PRIVATE_KEY'
+            );
+        const reference = this.#references.get(privateKey);
+        if (reference) {
+            const keys = await this.#keys.endpointKeys(
+                reference.endpoint,
+                reference.endpoint
+            );
+            if (
+                !keys[0] ||
+                keys[0].x !== reference.x ||
+                keys[0].y !== reference.y
+            ) {
+                throw engineError(
+                    'local key reference is no longer valid',
+                    'KEY_REFERENCE_INVALID'
+                );
+            }
+            privateKey = keys[1];
+        }
+        return deriveAES(publicKey, privateKey);
     }
 
     async encryptText(derivedKey, text = '') {
@@ -1192,4 +1532,4 @@ class Be8 {
     }
 }
 
-export { STORES, Be8 as default, readLegacyIdentity, upgradeBe8Schema };
+export { STORES, Be8 as default, upgradeBe8Schema };

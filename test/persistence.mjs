@@ -186,7 +186,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const rightKey = await right.getMyPublicKey();
         assert.true(leftKey.x === rightKey.x && leftKey.y === rightKey.y, 'Both retain the winner of the atomic initialization');
         const regenerated = await right.generatePrivAndPubKey();
-        assert.true(regenerated[0].x === leftKey.x, 'Explicit generation is idempotent rather than implicit rotation');
+        assert.true(regenerated.publicKey.x === leftKey.x, 'Explicit generation is idempotent rather than implicit rotation');
         assert.deepEqual(await storedIDs(database), ['104'], 'One private identity is committed');
         await left.addPublicKey(this.bob.id, this.bob.publicKey);
         await this.bob.engine.addPublicKey('104', leftKey);
@@ -350,8 +350,8 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
             alice.engine.generateGroupKeys(1, 'g200'), other.generateGroupKeys(1, 'g200'),
         ]));
         assert.strictEqual(result.status, 'fulfilled', 'Both group generators settle');
-        assert.true(result.value[0][0].x === result.value[1][0].x, 'Both receive the committed group identity');
-        const groupPublic = result.value[0][0];
+        assert.true(result.value[0].publicKey.x === result.value[1].publicKey.x, 'Both receive the committed group identity');
+        const groupPublic = result.value[0].publicKey;
         await exchangePublicKeys(alice, bob);
         await bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: groupPublic }]);
         await alice.engine.addGroupKeys('g200', [{ version: 1, groupKey: groupPublic }]);
@@ -393,7 +393,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         assert.true((await readRecord(database, 'appSettings', 'setting')).value, 'Unrelated application data remains');
     });
 
-    QUnit.test('Schema integration retains legacy stores; legacy identity adoption requires an explicit flag', async function (assert) {
+    QUnit.test('Schema integration retains legacy stores; explicit migration atomically replaces the selected identity', async function (assert) {
         const original = await this.open(undefined, { skipEngineSchema: true, upgrade(db) {
             db.createObjectStore('publicKeys', { keyPath: 'accID' });
             db.createObjectStore('privateKeys', { keyPath: 'accID' });
@@ -405,7 +405,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const cryptoPair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-384' }, true, ['deriveKey', 'deriveBits']);
         const legacyPair = await Promise.all([crypto.subtle.exportKey('jwk', cryptoPair.publicKey),
             crypto.subtle.exportKey('jwk', cryptoPair.privateKey)]);
-        // This owner's legacy identity is only copied into its own new scope,
+        // This owner's legacy identity is only migrated into its own new scope,
         // never into another participant's engine.
         const tx = original.transaction(['publicKeys', 'privateKeys', 'application'], 'readwrite');
         tx.objectStore('publicKeys').put({ ...legacyPair[0], accID: '104' });
@@ -419,7 +419,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         rejected(assert, result, 'Default setup refuses to silently create a new legacy identity');
         assert.strictEqual(result.error?.code, 'LEGACY_IDENTITY', 'The explicit migration requirement is reported');
         assert.deepEqual(await storedIDs(database), [], 'No new private identity was generated');
-        const adoption = await outcome(owner.setup({ legacyIdentity: true }));
+        const adoption = await outcome(owner.migratePrivateKeys({ legacyIdentity: true }));
         assert.strictEqual(adoption.status, 'fulfilled', 'Explicit identity adoption succeeds');
         assert.true((await owner.getMyPublicKey()).x === legacyPair[0].x, 'The same identity is retained');
         assert.strictEqual((await storedIDs(database, 'privateKeys')).length, 1, 'One scoped private identity is present');
@@ -427,7 +427,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const oldCounts = await Promise.all(['publicKeys', 'privateKeys'].map(name =>
             requestResult(oldTx.objectStore(name).count())));
         await database.whenIdle();
-        assert.deepEqual(oldCounts, [1, 1], 'Legacy records were never deleted or overwritten');
+        assert.deepEqual(oldCounts, [0, 0], 'Successful migration removes the original private JWK and its public identity record atomically');
         assert.true((await readRecord(database, 'application', 'setting')).value, 'Application records remain unchanged');
     });
 });

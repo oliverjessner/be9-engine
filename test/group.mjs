@@ -7,7 +7,7 @@ const groupID = 'g200';
 
 async function publishGroupEndpoint(owner, peers, version) {
     // Only the public half leaves Alice. Her engine retains the private half.
-    const [publicKey] = await owner.engine.generateGroupKeys(version, groupID);
+    const { publicKey } = await owner.engine.generateGroupKeys(version, groupID);
     for (const peer of peers) {
         await peer.engine.addGroupKeys(groupID, [{
             version, groupKey: structuredClone(publicKey),

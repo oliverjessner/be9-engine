@@ -49,8 +49,8 @@ or replaced. The engine uses these dedicated stores alongside application stores
 | --- | --- | --- |
 | `be8.scopes` | `namespace` | Permanent account/namespace binding |
 | `be8.publicKeys` | `[namespace, accID]` | Public JWK in a separate `key` field |
-| `be8.privateKeys` | `[namespace, accID]` | Local private identity JWK in `key` |
-| `be8.groupKeys` | `[namespace, groupID, version]` | Local public or private group JWK in `key` |
+| `be8.privateKeys` | `[namespace, accID]` | Non-extractable private ECDH `CryptoKey` in `key`, public JWK in `publicKey` |
+| `be8.groupKeys` | `[namespace, groupID, version]` | Public JWK in `key`, optional non-extractable ECDH `CryptoKey` in `privateKey` |
 
 The three key stores have a nonunique `namespace` index. A namespace is bound to
 one account on its first successful mutation. A different account cannot read,
@@ -59,15 +59,17 @@ chosen namespaces, each with its own identity. The application must treat these
 stores as engine-owned records; arbitrary direct edits are not a synchronization
 or authorization API.
 
-Public/private identity writes share one native transaction. Group private keys
-are persisted together with their public coordinates in one record. Cryptographic
+Public/private identity writes share one native transaction. Group private CryptoKeys
+are persisted together with their public JWK in one record using native Structured Clone. Cryptographic
 generation/import happens before the write transaction. All mutation promises
 resolve only after native transaction completion; request success alone cannot
 report a commit. Request errors force rollback even if another event listener
 prevents the default abort. Persistence and storage validation failures are
 `Error` objects with generic messages and stable `code` values; persistence
 failures use `PERSISTENCE_ERROR` and a sanitized
-native category in `name`. Raw request errors, key values, and plaintexts are not
+native category in `name`. CryptoKey clone failures use
+`CRYPTOKEY_STORAGE_UNSUPPORTED` with an explanation of the required browser
+capability. No private-JWK fallback is attempted. Raw request errors, key values, and plaintexts are not
 logged or attached as error causes.
 
 Persistent reads use `readonly`. There are no per-instance key caches: simplified
@@ -82,58 +84,109 @@ the identity under the same write lock, retaining whichever complete pair was
 committed first. Repeated setup/generation retains that pair. Missing one half,
 inconsistent coordinates, and database failures reject instead of replacing the
 identity. There is no implicit identity rotation.
-Parallel calls use the options of the first pending `setup()` call; after a
-failure, the application can retry with an explicit legacy adoption decision.
+`setup()` accepts no migration options. Migration is a separate explicit
+operation; setup never silently imports old private JWKs.
 
-### Legacy identity integration
+### Non-extractable local keys and migration
 
-Old `publicKeys`, `privateKeys`, and `groupKeys` stores are left intact. If an old
-identity exists for this account but no scoped identity exists, default
-`setup()` rejects with `LEGACY_IDENTITY`. It does not silently generate new keys.
+New identity and local group private keys are P-384 ECDH `CryptoKey` objects with
+`extractable: false` and only `['deriveKey']`. Public keys remain exportable JWKs.
+Derived AES-GCM keys also have `extractable: false`, with only
+`['encrypt', 'decrypt']`. No normal engine operation exports private keys.
+The required browser capabilities are native WebCrypto, IndexedDB CryptoKey
+Structured Clone, and `structuredClone()` preserving a non-extractable CryptoKey.
+Missing clone support rejects with `CRYPTOKEY_STORAGE_UNSUPPORTED`; it does not
+store JWKs instead. See [WebCrypto key generation and serialization](https://www.w3.org/TR/2017/REC-WebCryptoAPI-20170126/).
 
-After an explicit application decision, `await be8.setup({ legacyIdentity: true })`
-reads and validates that account's old pair, then copies it atomically into the
-selected namespace. It rechecks the legacy pair under the write lock and rejects
-if it changed. This copies only the local identity, retaining the original
-records. It does not infer ownership of old peer/group caches or migrate any
-ciphertexts. The application must explicitly select trusted peer/group records
-and import them through `addPublicKeys()`/`addGroupKeys()` when needed.
+Existing private JWKs require an explicit application migration decision:
 
-The named `readLegacyIdentity(connection, accID)` export provides an explicit,
-readonly inspection of the old local pair. It returns `[publicJWK, privateJWK]`
-or `null`; incomplete data rejects. None of these paths runs automatically after
-a ciphertext authentication error. This storage upgrade does not change the KDF,
-nonce, cipher, or envelope profile.
+```javascript
+// Convert this namespace's existing identity and private group JWK records.
+// Call before setup when setup reports PRIVATE_KEY_MIGRATION_REQUIRED.
+const { migratedIdentity, migratedGroups } = await be8.migratePrivateKeys();
+await be8.setup();
+```
+
+For an old unscoped `publicKeys`/`privateKeys` identity, default setup reports
+`LEGACY_IDENTITY`. Integrate the engine schema through the application's upgrade
+handler first, then explicitly adopt that account's existing identity:
+
+```javascript
+await be8.migratePrivateKeys({
+    legacyIdentity: true,
+    // Optional, explicit application-owned selection of old local private groups.
+    // Old group ownership cannot be inferred by the engine.
+    // Keep the original IndexedDB version key type (number or canonical string).
+    legacyGroups: [{ groupID: 'g10300', version: '1' }],
+});
+await be8.setup();
+```
+
+Migration validates the existing public/private pair, imports the private JWK
+non-extractably, and verifies that its scalar matches the exact public point.
+A temporary non-extractable ECDSA signing import is used only for that validation;
+it is never stored or returned and does not change the encryption protocol.
+All crypto work finishes before the write transaction. The engine rechecks the
+original records under the write lock, replaces all selected records atomically,
+and resolves only after commit. Concurrent changes reject with
+`MIGRATION_CONFLICT`; retry requires a fresh explicit call. Validation errors,
+storage errors, or transaction aborts retain every original. Missing or incomplete
+identity data rejects; migration never generates replacement keys.
+
+Successful migration replaces scoped private JWKs in place. For the selected old
+unscoped identity, both original public/private records are deleted in the same
+transaction that stores the new identity. Selected old private group records are
+also deleted in that commit. There is no retained plaintext backup or new private
+export API. Unselected old groups, other accounts, application stores, and existing
+ciphertexts are untouched. The application must explicitly choose each old local
+private group it owns; the engine does not migrate unrelated data or infer trust
+for old peer public keys. Old public group records can still be imported through
+`addGroupKeys()`.
+
+This operation preserves public fingerprints and cryptographic identity. It does
+not change the KDF, nonce, cipher, or envelope profile, and it never runs after
+ciphertext authentication failure. Existing browser/application backups outside
+these selected records are not erased by this migration.
+
+**Malicious JavaScript in the same execution context can still misuse these keys**,
+for example by reading CryptoKeys from IndexedDB or calling engine encryption and
+decryption methods. Non-extractable means WebCrypto denies key export; it does not
+mean XSS-safe, hardware-protected, or inaccessible to browser/profile owners.
+It also does not guarantee forensic erasure of prior JWK storage.
 
 ### Caller changes
 
-- `hasGeneratedKeys()` and `hasKey(id)` now return promises: callers must `await`
-  them instead of testing the truthiness of a promise.
-- `addPublicKey()` is asynchronous; `addPublicKey()`, `addPublicKeys()`, and
-  `addGroupKeys()` resolve to `undefined` after commit. They no longer expose
-  mutable internal maps or meaningless arrays of `undefined`.
-- `generatePrivAndPubKey()` is idempotent and consistently returns the existing
-  or newly committed `[publicJWK, privateJWK]`. It cannot silently rotate keys.
-- `generateGroupKeys(version, groupID)` requires both arguments, persists the
-  local group identity, and always returns `[publicJWK, privateJWK]`. Group IDs
-  match `g[A-Za-z0-9_-]+`; versions are positive safe integers (canonical decimal
-  strings are accepted and normalized). A group key at an existing version
-  cannot be replaced by different coordinates/private material. Reimporting its
-  public half retains an already stored private half.
-- Caller key objects are snapshotted and only JWK fields are copied. Embedded
-  `accID`, `namespace`, `groupID`, or `version` cannot override explicit metadata.
-  Public-key insertion rejects private JWKs and rejects replacing the public
-  half of this namespace's own identity with different coordinates.
-- `panic()` explicitly clears only the current namespace's key records in one
-  transaction. It retains the account binding, application stores, other
-  namespaces, and legacy records. It never deletes the application's database.
-- The ESM build adds named `upgradeBe8Schema`, `STORES`, and
-  `readLegacyIdentity` exports. The IIFE remains a callable `be8` constructor;
-  its integration helpers are `be8.upgradeBe8Schema`, `be8.STORES`, and
-  `be8.readLegacyIdentity` (also available on the ESM constructor).
-
-Local identity/group export APIs can return private JWKs to their owner as before.
-Only their public halves belong in participant-to-participant exchanges.
+- `generatePrivAndPubKey()` and `generateGroupKeys(version, groupID)` now return
+  `{ publicKey, keyReference }` after commit, replacing the old private-JWK tuple.
+  Generation remains idempotent. Only `publicKey` may be exchanged with peers.
+- `keyReference` is an opaque frozen object bound to this engine instance and the
+  committed identity/group public coordinates. It contains no key material, cannot
+  be serialized or cloned into a usable reference, and becomes invalid if the
+  selected identity is cleared/replaced. After reopening, call generation again
+  to obtain a fresh reference to the same committed key.
+- `getDerivedKey(publicJWK, keyReference)` derives a non-extractable AES key.
+  It also accepts a native non-extractable P-384 ECDH private CryptoKey with exactly
+  `['deriveKey']` for local caller-owned keys. Private JWKs and extractable private
+  CryptoKeys are rejected; there is no implicit JWK import path.
+- `getMyPublicKey()`, `getCachedKeys()`, and `getCachedGroupKeys()` expose only
+  public JWKs and public metadata. Group getters project the public half of old
+  records as well; they never return a private `d` or stored private CryptoKey.
+- `addPublicKeys()` and `addGroupKeys()` accept only public JWKs, snapshot key
+  fields, and cannot let embedded metadata override explicit storage IDs.
+  Reimporting the public half of a modern local group retains its private key.
+  Existing private-JWK groups must be migrated before mutation or private use.
+- `setup({ legacyIdentity: true })` and the named/static `readLegacyIdentity()`
+  private-JWK export are removed. Use `migratePrivateKeys()` explicitly, then
+  `setup()`. Public async APIs and the simplified text/image call signatures
+  remain available. `hasGeneratedKeys()`/`hasKey()` are promises; await them.
+- Group IDs match `g[A-Za-z0-9_-]+`; versions are positive safe integers, with
+  canonical decimal strings accepted and normalized for new records. A group
+  version cannot be replaced with different public coordinates.
+- `panic()` still explicitly clears only the current namespace's key records
+  atomically, retaining its account binding, application stores, other namespaces,
+  and unselected legacy records. It never deletes the application database.
+- Named ESM/static integration exports are `upgradeBe8Schema` and `STORES`.
+  The IIFE remains a callable `be8` constructor with the same static helpers.
 
 ## hasGeneratedKeys()
 
@@ -173,33 +226,33 @@ await be8.addGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }]);
 ```
 
 ## async generatePrivAndPubKey()
-Returns the existing or newly generated public/private pair after atomic IndexedDB storage. Existing identities are retained.
+Returns the existing or newly committed public JWK and an opaque local key reference. Existing identities are retained.
 
 ```javascript
-const [publicKey, privateKey] = await be8.generatePrivAndPubKey();
+const { publicKey, keyReference } = await be8.generatePrivAndPubKey();
 ```
 
 ## async generateGroupKeys(version, groupID)
 Generates or restores a local group identity in the current namespace after commit.
 
 ```javascript
-const [publicKey, privateKey] = await be8.generateGroupKeys(1, 'g10300');
+const { publicKey, keyReference } = await be8.generateGroupKeys(1, 'g10300');
 ```
 
-## async getDerivedKey(publicKey, privateKey)
-Generates a derived key out of the public and private key. 
+## async getDerivedKey(publicKey, keyReference)
+Derives a non-extractable AES-GCM key from a peer public JWK and a local key reference.
 
 ```javascript
-const [, ownPrivateJWK] = await be8.generatePrivAndPubKey();
-const derivedKey = await be8.getDerivedKey(bobPublicJWK, ownPrivateJWK);
+const { keyReference } = await be8.generatePrivAndPubKey();
+const derivedKey = await be8.getDerivedKey(bobPublicJWK, keyReference);
 ```
 
 ## async encryptText(derivedKey, text = '')
-After creating a [derivedKey](#async-getderivedkeypublickeyjwk-privatekeyjwk) we can start to encrypt text messages. encryptText returns a cipherText and a iv (Initialization vector).
- 
+After creating a [derivedKey](#async-getderivedkeypublickey-keyreference) we can start to encrypt text messages. encryptText returns a cipherText and a iv (Initialization vector).
+
 ```javascript
 const text = 'Hello World';
-const derivedKey = await be8.getDerivedKey(publicKey, privateKey);
+const derivedKey = await be8.getDerivedKey(publicKey, keyReference);
 const { cipherText, iv } = await be8.encryptText(derivedKey, text);
 ```
 
@@ -209,12 +262,12 @@ With the help of the key, the cipherText and an iv, we can decrypt messages.
 ```javascript
 const cipherText = 'ASDASD9324/&§$jn';
 const iv = '213210931249713409';
-const derivedKey = await be8.getDerivedKey(publicKey, privateKey);
+const derivedKey = await be8.getDerivedKey(publicKey, keyReference);
 const text = await be8.decryptText(derivedKey, cipherText, iv);
 ```
 
 ## encryptTextSimple(accIDSender, accIDReceiver, text)
-encryptTextSimple is a compound function of [encryptText](#async-encrypttextderivedkey-text) and [getDerivedKey](#async-getderivedkeypublickey-privatekey). It uses the ids instead of keys. 
+encryptTextSimple is a compound function of [encryptText](#async-encrypttextderivedkey-text) and [getDerivedKey](#async-getderivedkeypublickey-keyreference). It uses the ids instead of keys.
 The derivedKey is generated inside the function.
 
 ```javascript
@@ -225,7 +278,7 @@ const cipherText = await be8.encryptTextSimple(accIDSender, accIDReceiver, text)
 ```
 
 ## async decryptTextSimple(accIDSender, accIDReceiver, cipherText, iv)
-decryptTextSimple is a compound function of [decryptText](#async-decrypttextderivedkey-text) and [getDerivedKey](#async-getderivedkeypublickey-privatekey). It uses the ids instead of keys. 
+decryptTextSimple is a compound function of [decryptText](#async-decrypttextderivedkey-text) and [getDerivedKey](#async-getderivedkeypublickey-keyreference). It uses the ids instead of keys.
 The derivedKey is generated inside the function.
 
 ```javascript
@@ -237,7 +290,7 @@ const text = await bobEngine.decryptTextSimple(accIDSender, accIDReceiver, ciphe
 ```
 
 ## async encryptImage(derivedKey, base64Image)
-Accepts the derivedKey and an image encoded as base64 so it can creates a "cipherImage" and 
+Accepts the derivedKey and an image encoded as base64 so it can creates a "cipherImage" and
 an iv.
 
 ```javascript
@@ -307,7 +360,8 @@ public metadata, and encrypted packets directly in test code, without networking
 Each test creates separate, uniquely named databases for Alice, Bob, and Eve.
 Each participant retains its own private key. Integration tests derive a key
 independently at each endpoint or use the simplified API on the actual recipient.
-Private JWKs and derived AES keys are never exchanged between participants.
+Private CryptoKeys, local references, legacy private JWK fixtures, and derived AES
+keys are never exchanged between participants.
 Readiness and cleanup use native IndexedDB open, request, complete, and abort
 events, rather than fixed delays. Only the test-created databases are deleted.
 
@@ -324,8 +378,13 @@ The revised persistence suite extends the independent-participant tests with
 native transaction aborts after successful requests, real unique-index write
 errors, prevented-default error events, closed connections, pending-request
 abort settlement, synchronous scheduling errors, parallel setup and mutations,
-restart, namespace ownership races, schema upgrade rollback, and legacy identity
-adoption. The previous commit contract assertions remain strict and now pass.
+restart, namespace ownership races, schema upgrade rollback, and explicit legacy
+identity migration. `test/key-protection.mjs` additionally verifies native private
+and AES export refusal, records without `d`, opaque references, reload
+interoperability, fingerprint preservation, old ciphertext readability, scoped
+and selected unscoped group migration, abort after writes/deletions, mismatched
+scalars, missing clone capability, native DataCloneError rollback, and concurrent
+migration conflict handling. The previous commit contract assertions remain strict and now pass.
 Timeouts in the runner and failure tests are failure deadlines, not readiness
 waits. Test output excludes assertion data and raw browser errors.
 

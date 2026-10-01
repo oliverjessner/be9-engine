@@ -23,10 +23,10 @@ QUnit.module('Exceptions / independent participants', hooks => {
         });
     }
 
-    QUnit.test('getDerivedKey rejects either missing JWK', async function (assert) {
+    QUnit.test('getDerivedKey rejects a missing public key or local private reference', async function (assert) {
         await assert.rejects(this.alice.engine.getDerivedKey(), /no public key/, 'Missing public JWK is rejected');
         await assert.rejects(this.alice.engine.getDerivedKey(this.bob.publicKey), /no private key/,
-            'Missing private JWK is rejected');
+            'Missing local private key reference is rejected');
     });
 
     QUnit.test('Text API rejects a missing derived key', async function (assert) {
