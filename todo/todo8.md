@@ -36,3 +36,11 @@ Dokumentieren:
 Wer ein Gruppengeheimnis besitzt, kann es weitergeben.
 Gemeinsame Gruppenschlüssel beweisen keine individuelle Autorenschaft.
 Eine neue Epoche entzieht niemandem bereits bekannte alte Schlüssel.
+
+Status: Implementiert; Profil und Aufruferänderungen in docs/group-epochs.md.
+Native Browser-Prüfung: 127 Tests, 768 Assertions insgesamt; drei isolierte
+Teilnehmer, Key-Pakete, Erwartungen/Manipulation, Epochenwechsel, CAS,
+Replay/Neustart, Exportverweigerung und explizite Legacy-Lesepfade.
+
+Gemeinsamer Abschlusslauf: Quelle, ESM und IIFE jeweils 140 Tests / 859 Assertions;
+Dateiliste und Grenzen in docs/todo6-9.md.

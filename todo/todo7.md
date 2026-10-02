@@ -32,3 +32,10 @@ Duplikate, Out-of-Order innerhalb/außerhalb des Fensters, Parallelität,
 gefälschte hohe Zähler, Neustart und Counter-Overflow.
 
 Keine Zustellung, Empfangsbestätigungen oder Netzwerk-Retries implementieren.
+
+Status: Implementiert; Sende-/Replay-Vertrag in docs/envelope-state.md.
+Native Browser-Prüfung: Duplikate, 128er-Fenster, Parallelität, AAD-Fälschung,
+Neustart, uint64-Überlauf, State-Verlust und reale Commit-Abbrüche.
+
+Gemeinsamer Abschlusslauf: Quelle, ESM und IIFE jeweils 140 Tests / 859 Assertions;
+Dateiliste und Grenzen in docs/todo6-9.md.

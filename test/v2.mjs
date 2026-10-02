@@ -199,21 +199,23 @@ QUnit.module('v2 / P-384 ECDH plus HKDF-SHA-256', hooks => {
     QUnit.test('Convenience APIs transfer metadata, enforce purpose/context and never fall back after authentication failure', async function (assert) {
         const { alice, bob } = this;
         await exchangePublicKeys(alice, bob);
+        await alice.engine.openContext('application context');
+        await alice.engine.openContext('attachment');
         const packet = await alice.engine.encryptTextSimple(alice.id, bob.id, 'Bound context', { contextID: 'application context' });
-        assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, packet.cipherText, packet.iv, packet.derivation,
+        assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, packet,
             { contextID: 'application context' }) === 'Bound context', 'The receiver can check its application-supplied expected context');
-        await assert.rejects(bob.engine.decryptTextSimple(alice.id, bob.id, packet.cipherText, packet.iv, packet.derivation,
-            { contextID: 'other context' }), error => error.code === 'INVALID_DERIVATION_CONTEXT', 'Unexpected application context is refused');
-        await assert.rejects(bob.engine.decryptImageSimple(alice.id, bob.id, packet.cipherText, packet.iv, packet.derivation),
-            error => error.code === 'INVALID_DERIVATION_CONTEXT', 'Text data cannot be interpreted as an attachment context');
+        await assert.rejects(bob.engine.decryptTextSimple(alice.id, bob.id, packet,
+            { contextID: 'other context' }), error => error.code === 'ENVELOPE_EXPECTATION_MISMATCH', 'Unexpected application context is refused');
+        await assert.rejects(bob.engine.decryptImageSimple(alice.id, bob.id, packet),
+            error => error.code === 'ENVELOPE_EXPECTATION_MISMATCH', 'Text data cannot be interpreted as an attachment context');
         await assert.rejects(bob.engine.decryptTextSimple(alice.id, bob.id, packet.cipherText, packet.iv),
-            error => error.code === 'DERIVATION_CONTEXT_REQUIRED', 'Legacy-looking packets are not auto-detected');
-        const altered = { ...packet.derivation, contextID: 'tampered' };
-        await assert.rejects(bob.engine.decryptTextSimple(alice.id, bob.id, packet.cipherText, packet.iv, altered), isAuthenticationFailure,
+            error => error.code === 'INVALID_ENVELOPE', 'Legacy-looking packets are not auto-detected');
+        const altered = { ...packet, header: { ...packet.header, sequence: '2' } };
+        await assert.rejects(bob.engine.decryptTextSimple(alice.id, bob.id, altered), isAuthenticationFailure,
             'Authentication failure under changed metadata is propagated without trying legacy');
         const image = await alice.engine.encryptImageSimple(alice.id, bob.id, '', { contextID: 'attachment' });
-        assert.strictEqual(image.derivation.purpose, 'attachment', 'Image convenience uses the attachment domain');
-        assert.true(await bob.engine.decryptImageSimple(alice.id, bob.id, image.cipherImage, image.iv, image.derivation) === '', 'Existing image content API interoperates under the new KDF');
+        assert.strictEqual(image.header.purpose, 'attachment', 'Image convenience uses the attachment domain');
+        assert.true(await bob.engine.decryptImageSimple(alice.id, bob.id, image) === '', 'Existing image content API interoperates under the new KDF');
     });
 
     QUnit.test('Existing deriveKey-only non-extractable identities survive and remain explicit legacy readers', async function (assert) {

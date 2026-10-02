@@ -1,3 +1,4 @@
+import { createLegacyGroup, legacyToPublic } from './legacy-fixture.mjs';
 import Be8, { STORES, upgradeBe8Schema } from '../lib/bundle.mjs';
 import { requestResult, transactionComplete, withTransaction } from '../lib/persistence.mjs';
 import { participantHooks, exchangePublicKeys, createParticipant } from './participants.mjs';
@@ -192,7 +193,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         await left.addPublicKey(this.bob.id, this.bob.publicKey, { trust: 'confirmed' });
         await this.bob.engine.addPublicKey('104', leftKey, { trust: 'confirmed' });
         const packet = await right.encryptTextSimple('104', this.bob.id, 'Independent connection');
-        assert.true(await this.bob.engine.decryptTextSimple('104', this.bob.id, packet.cipherText, packet.iv, packet.derivation) === 'Independent connection',
+        assert.true(await this.bob.engine.decryptTextSimple('104', this.bob.id, packet) === 'Independent connection',
             'The other connection sees a committed public-key mutation without stale state');
     });
 
@@ -217,10 +218,11 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const loser = winner === this.bob ? alternativeBob : this.bob;
         assert.true(stored.x === winner.publicKey.x, 'The winning committed public key is retained');
         const packet = await this.alice.engine.encryptTextSimple(this.alice.id, this.bob.id, 'Committed trust snapshot');
-        const winnerKey = await winner.derive(this.alice.publicKey, packet.derivation);
-        assert.true(await winner.engine.decryptText(winnerKey, packet.cipherText, packet.iv) === 'Committed trust snapshot',
+        await winner.engine.addPublicKey(this.alice.id, this.alice.publicKey, { trust: 'confirmed' });
+        await loser.engine.addPublicKey(this.alice.id, this.alice.publicKey, { trust: 'confirmed' });
+        assert.true(await winner.engine.decryptTextSimple(this.alice.id, this.bob.id, packet) === 'Committed trust snapshot',
             'Convenience operations use the committed key and matching trust decision');
-        await assert.rejects(loser.derive(this.alice.publicKey, packet.derivation),
+        await assert.rejects(loser.engine.decryptTextSimple(this.alice.id, this.bob.id, packet),
             error => error.code === 'DERIVATION_KEY_MISMATCH', 'The rejected public fingerprint is never silently selected');
     });
 
@@ -229,8 +231,8 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         this.alice.database.observe(tx => modes.push(tx.mode));
         await this.alice.engine.getCachedKeys();
         await this.alice.engine.getMyPublicKey();
-        await this.alice.engine.getCachedGroupKeys();
-        await this.alice.engine.getCachedGroupVersions('g200');
+        await this.alice.engine.getCachedLegacyGroupKeys();
+        await this.alice.engine.getCachedLegacyGroupVersions('g200');
         await this.alice.engine.hasGeneratedKeys();
         await this.alice.engine.hasKey(this.alice.id);
         this.alice.database.observe(undefined);
@@ -249,10 +251,10 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         assert.true(stored.x === this.bob.publicKey.x && stored.y === this.bob.publicKey.y, 'The call snapshots JWK values');
         assert.false(stored.key_ops.includes('untrusted'), 'Nested caller arrays cannot mutate the saved key');
         assert.deepEqual(await storedIDs(this.alice.database, 'publicKeys'), ['101', '102'], 'Separately supplied account ID wins');
-        await this.alice.engine.addGroupKeys('g200', [{ version: 1, groupKey: {
+        await this.alice.engine.addLegacyGroupKeys('g200', [{ version: 1, groupKey: {
             ...this.bob.publicKey, namespace: 'other', groupID: 'gwrong', version: 999,
         } }]);
-        const groups = await this.alice.engine.getCachedGroupKeys();
+        const groups = await this.alice.engine.getCachedLegacyGroupKeys();
         assert.true(groups.length === 1 && groups[0].groupID === 'g200' && groups[0].version === 1,
             'Separately supplied group metadata wins');
     });
@@ -282,7 +284,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const bobPub = await bob.getMyPublicKey();
         await outcome(Promise.all([alice.addPublicKey('202', bobPub, { trust: 'confirmed' }), bob.addPublicKey('201', alicePub, { trust: 'confirmed' })]));
         const packet = await alice.encryptTextSimple('201', '202', 'Shared database');
-        assert.true(await bob.decryptTextSimple('201', '202', packet.cipherText, packet.iv, packet.derivation) === 'Shared database',
+        assert.true(await bob.decryptTextSimple('201', '202', packet) === 'Shared database',
             'Separate scopes interoperate using public exchange in the same application database');
         assert.deepEqual(await storedIDs(database, 'privateKeys', '201'), ['201'], 'Alice scope contains only Alice private key');
         assert.deepEqual(await storedIDs(database, 'privateKeys', '202'), ['202'], 'Bob scope contains only Bob private key');
@@ -295,7 +297,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         }
         database.acknowledgeAborts();
         await alice.panic();
-        assert.false(await alice.hasGeneratedKeys(), 'Explicit panic clears only Alice scope');
+        await assert.rejects(alice.hasGeneratedKeys(), error => error.code === 'ENGINE_LOCKED', 'Panic locks the cleared Alice scope');
         assert.true(await bob.hasGeneratedKeys(), 'Bob retains his identity');
         assert.true((await bob.getMyPublicKey()).x === bobPub.x, 'Bob public identity is unchanged');
         assert.deepEqual(await storedIDs(database), ['202'], 'Only Alice private key was removed');
@@ -355,21 +357,21 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const other = new Be8(alice.id, secondDB.connection);
         await other.setup();
         const result = await outcome(Promise.all([
-            alice.engine.generateGroupKeys(1, 'g200'), other.generateGroupKeys(1, 'g200'),
+            createLegacyGroup(alice.engine, alice.database, 1, 'g200'), createLegacyGroup(other, secondDB, 1, 'g200'),
         ]));
         assert.strictEqual(result.status, 'fulfilled', 'Both group generators settle');
         assert.true(result.value[0].publicKey.x === result.value[1].publicKey.x, 'Both receive the committed group identity');
         const groupPublic = result.value[0].publicKey;
         await exchangePublicKeys(alice, bob);
-        await bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: groupPublic }],
+        await bob.engine.addLegacyGroupKeys('g200', [{ version: 1, groupKey: groupPublic }],
             { decisions: [{ peerID: 'g200:1', trust: 'confirmed' }] });
-        await alice.engine.addGroupKeys('g200', [{ version: 1, groupKey: groupPublic }]);
-        rejected(assert, await outcome(alice.engine.addGroupKeys('g200', [{ version: 1, groupKey: bob.publicKey }])),
+        await alice.engine.addLegacyGroupKeys('g200', [{ version: 1, groupKey: groupPublic }]);
+        rejected(assert, await outcome(alice.engine.addLegacyGroupKeys('g200', [{ version: 1, groupKey: bob.publicKey }])),
             'A different key cannot overwrite the same group version');
         alice.database.acknowledgeAborts();
         const reopened = await createParticipant(alice.id, await this.open(alice.database.name));
-        const packet = await bob.engine.encryptTextSimple(bob.id, 'g200:1', 'Retained private group key');
-        assert.true(await reopened.engine.decryptTextSimple(bob.id, 'g200:1', packet.cipherText, packet.iv, packet.derivation) === 'Retained private group key',
+        const packet = await legacyToPublic(bob, groupPublic, 'Retained private group key');
+        assert.true(await reopened.engine.decryptTextSimpleLegacy(bob.id, 'g200:1', packet.cipherText, packet.iv) === 'Retained private group key',
             'The reopened owner retains its private group key even after public reimport');
     });
 
@@ -380,7 +382,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const engine = new Be8('104', database.connection);
         await engine.setup();
         await engine.addPublicKey(this.bob.id, this.bob.publicKey);
-        await engine.generateGroupKeys(1, 'g200');
+        await createLegacyGroup(engine, database, 1, 'g200');
         const tx = database.transaction('appSettings', 'readwrite');
         tx.objectStore('appSettings').put({ id: 'setting', value: true });
         await database.whenIdle();
@@ -394,11 +396,12 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         rejected(assert, await outcome(engine.panic()), 'An abort during deletion rejects panic');
         database.observe(undefined);
         assert.strictEqual(database.acknowledgeAborts(), 1, 'The deletion transaction terminated');
-        assert.true(await engine.hasGeneratedKeys(), 'Both identity halves survived rollback');
-        assert.true(await engine.hasKey('g200:1'), 'The group key survived rollback');
-        assert.strictEqual((await engine.getCachedKeys()).length, 2, 'Peer public keys survived rollback');
+        await assert.rejects(engine.hasGeneratedKeys(), error => error.code === 'ENGINE_LOCKED', 'Failed panic leaves the initiating engine locked');
+        assert.deepEqual(await storedIDs(database, 'privateKeys', '104'), ['104'], 'The private identity survived rollback');
+        assert.deepEqual(await storedIDs(database, 'groupKeys', '104'), ['g200'], 'The legacy group survived rollback');
+        assert.strictEqual((await storedIDs(database, 'publicKeys', '104')).length, 2, 'Peer public keys survived rollback');
         await engine.panic();
-        assert.false(await engine.hasGeneratedKeys(), 'Successful panic clears the current scope');
+        assert.deepEqual(await storedIDs(database, 'privateKeys', '104'), [], 'Successful retry clears the current scope');
         assert.true((await readRecord(database, 'appSettings', 'setting')).value, 'Unrelated application data remains');
     });
 

@@ -9,21 +9,30 @@ const assets = new Map([
     ['/', ['test/index.html', 'text/html']],
     ['/vendor/qunit.js', ['node_modules/qunit/qunit/qunit.js', 'text/javascript']],
     ['/vendor/qunit.css', ['node_modules/qunit/qunit/qunit.css', 'text/css']],
-    ...['suite', 'database', 'participants', 'basics', 'text', 'image', 'group', 'exceptions', 'aes', 'persistence', 'key-protection', 'trust', 'v2', 'legacy-fixture', 'encoding']
+    ...['suite', 'database', 'participants', 'basics', 'text', 'image', 'group', 'exceptions', 'aes', 'persistence', 'key-protection', 'trust', 'v2', 'legacy-fixture', 'encoding', 'envelope', 'replay', 'panic', 'panic-worker']
         .map(name => ['/test/' + name + '.mjs', ['test/' + name + '.mjs', 'text/javascript']]),
-    ...['bundle', 'util', 'persistence', 'key-store', 'crypto-keys', 'trust', 'v2', 'encoding', 'limits', 'aes', 'usage'].map(name => ['/lib/' + name + '.mjs', ['lib/' + name + '.mjs', 'text/javascript']]),
+    ...['bundle', 'util', 'persistence', 'key-store', 'crypto-keys', 'trust', 'v2', 'encoding', 'limits', 'aes', 'usage', 'group-profile', 'groups', 'envelope', 'replay'].map(name => ['/lib/' + name + '.mjs', ['lib/' + name + '.mjs', 'text/javascript']]),
 ]);
 
-export async function createTestServer(port = 0) {
+const helpers = ['upgradeBe8Schema', 'STORES', 'jwkThumbprint', 'V2_SUITE', 'GROUP_SUITE', 'encodeV2DerivationInfo', 'encodeBase64url', 'decodeBase64url', 'V2_LIMITS', 'REPLAY_WINDOW', 'encodeEnvelopeAAD'];
+export async function createTestServer(port = 0, { bundle = 'source' } = {}) {
+    if (!['source', 'esm', 'iife'].includes(bundle)) throw new Error('Unknown test bundle');
+    const selected = new Map(assets);
+    if (bundle !== 'source') selected.set('/lib/bundle.mjs', [bundle === 'esm' ? 'dist/bundle.mjs' : 'dist/bundle.min.js', 'text/javascript']);
     const server = createServer(async (request, response) => {
         const pathname = new URL(request.url, 'http://127.0.0.1').pathname;
-        const asset = assets.get(pathname);
+        const asset = selected.get(pathname);
         if (request.method !== 'GET' || !asset) {
             response.writeHead(404).end();
             return;
         }
         try {
-            const body = await readFile(resolve(root, asset[0]));
+            let body = await readFile(resolve(root, asset[0]));
+            if (bundle === 'iife' && pathname === '/lib/bundle.mjs') {
+                // Evaluate the generated IIFE unchanged, then expose its callable
+                // constructor/statics to the ESM tests (also in module workers).
+                body = body.toString() + '\nconst Be8 = be8; export default Be8;\n' + helpers.map(name => 'export const ' + name + ' = Be8.' + name + ';').join('\n');
+            }
             response.writeHead(200, { 'Content-Type': asset[1], 'Cache-Control': 'no-store' }).end(body);
         } catch {
             response.writeHead(500).end('Test asset unavailable');

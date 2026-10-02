@@ -2,7 +2,7 @@ import Be8, { STORES } from '../lib/bundle.mjs';
 import { participantHooks, exchangePublicKeys } from './participants.mjs';
 import { readRecord, requestResult, storedIDs } from './database.mjs';
 import { withTransaction, requestResult as nativeResult } from '../lib/persistence.mjs';
-import { encryptLegacyFixture } from './legacy-fixture.mjs';
+import { createLegacyGroup, legacyToPublic, encryptLegacyFixture } from './legacy-fixture.mjs';
 
 const algorithm = { name: 'ECDH', namedCurve: 'P-384' };
 
@@ -75,7 +75,7 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
     QUnit.test('Committed identity and group keys deny private exports; getters and generation expose only public data', async function (assert) {
         const { alice, bob } = this;
         const generated = await alice.engine.generatePrivAndPubKey();
-        const group = await alice.engine.generateGroupKeys(1, 'g200');
+        const group = await createLegacyGroup(alice.engine, alice.database, 1, 'g200');
         const rows = await records(alice.database, [STORES.privateKeys, STORES.groupKeys, STORES.publicKeys]);
         const privateKey = rows[0][0].key;
         const groupPrivate = rows[1][0].privateKey;
@@ -96,18 +96,22 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
             error => error instanceof DOMException && error.name === 'InvalidAccessError', 'Derived AES export is denied');
         assert.true(noPrivateJWK(rows), 'New database records contain no private d field');
         const getters = [await alice.engine.getMyPublicKey(), await alice.engine.getCachedKeys(),
-            await alice.engine.getCachedGroupKeys(), generated, group];
+            await alice.engine.getCachedLegacyGroupKeys(), generated, group];
         assert.true(noPrivateJWK(getters), 'No public getter or generation result contains private JWK material');
         assert.deepEqual(Object.keys(generated).sort(), ['keyReference', 'publicKey'], 'Generation has a documented public result');
         assert.deepEqual(Object.keys(generated.keyReference), [], 'The local reference contains no enumerable key material');
         const receiver = await bob.engine.generatePrivAndPubKey();
-        const groupContext = await alice.engine.createDerivationContext(bob.publicKey, group.keyReference,
-            { contextID: 'private group test', sender: 'g200:1', receiver: bob.id, purpose: 'data' });
-        const groupAES = groupContext.key;
-        const receiverAES = await bob.engine.getDerivedKey(group.publicKey, receiver.keyReference, groupContext.derivation);
-        const packet = await alice.engine.encryptText(groupAES, 'Local group reference');
-        assert.true(await bob.engine.decryptText(receiverAES, packet.cipherText, packet.iv) === 'Local group reference',
-            'A local group reference derives interoperably without exposing private material');
+        await assert.rejects(alice.engine.createDerivationContext(bob.publicKey, group.keyReference,
+            { contextID: 'private group test', sender: 'g200:1', receiver: bob.id, purpose: 'data' }),
+            error => error.code === 'LEGACY_GROUP_API', 'Retained ECDH group references cannot create v2 contexts');
+        const groupAES = await alice.engine.getLegacyDerivedKey(bob.publicKey, group.keyReference);
+        const receiverAES = await bob.engine.getLegacyDerivedKey(group.publicKey, receiver.keyReference);
+        // Production legacy keys are decrypt-only. The fixture encrypts using the
+        // sender's local private key, with only the receiver public key as input.
+        const packet = await legacyToPublic(bob, group.publicKey, 'Local group reference');
+        assert.true(await alice.engine.decryptTextLegacy(groupAES, packet.cipherText, packet.iv) === 'Local group reference',
+            'A retained local group reference decrypts the explicit legacy profile');
+        assert.false(receiverAES.extractable, 'Explicit legacy derived keys remain non-extractable');
         assert.false(Object.hasOwn(getters[2][0].groupKey, 'privateKey'), 'The group getter does not expose the stored private CryptoKey');
         assert.strictEqual(Be8.readLegacyIdentity, undefined, 'The old private-JWK inspection API is removed');
     });
@@ -127,12 +131,12 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         await reopened.setup();
         const after = await reopened.generatePrivAndPubKey();
         assert.true(await fingerprint(before.publicKey) === await fingerprint(after.publicKey), 'Reload preserves the fingerprint');
-        assert.true(await reopened.decryptTextSimple(bob.id, alice.id, packet.cipherText, packet.iv, packet.derivation) === 'Before reload',
+        assert.true(await reopened.decryptTextSimple(bob.id, alice.id, packet) === 'Before reload',
             'An already encrypted packet decrypts after reload');
         const { key: derived, derivation } = await reopened.createDerivationContext(bob.publicKey, after.keyReference,
             { contextID: 'reloaded reply', sender: alice.id, receiver: bob.id, purpose: 'data' });
         const reply = await reopened.encryptText(derived, 'After reload');
-        assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, reply.cipherText, reply.iv, derivation) === 'After reload',
+        assert.true(await bob.engine.decryptTextUnframedLegacy(alice.id, bob.id, reply.cipherText, reply.iv, derivation) === 'After reload',
             'A fresh local reference encrypts interoperably after reload');
         const stored = await readRecord(database, 'privateKeys', alice.id);
         await assert.rejects(crypto.subtle.exportKey('jwk', stored),
@@ -143,7 +147,7 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         const fixture = await scopedFixture(this);
         const { engine, database, identity, group } = fixture;
         await this.bob.engine.addPublicKey('104', identity[0], { trust: 'confirmed' });
-        await this.bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: group[0] }],
+        await this.bob.engine.addLegacyGroupKeys('g200', [{ version: 1, groupKey: group[0] }],
             { decisions: [{ peerID: 'g200:1', trust: 'confirmed' }] });
         await engine.addPublicKey(this.bob.id, this.bob.publicKey, { trust: 'confirmed' });
         const packet = await legacyPacket(this.bob, identity[0], 'Before migration');
@@ -152,12 +156,12 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         assert.true(blocked.error instanceof Error && blocked.error.code === 'PRIVATE_KEY_MIGRATION_REQUIRED',
             'Default setup requires an explicit migration, without generating a replacement');
         database.acknowledgeAborts();
-        assert.true(noPrivateJWK(await engine.getCachedGroupKeys()), 'Even old-format group getters project only the public half');
+        assert.true(noPrivateJWK(await engine.getCachedLegacyGroupKeys()), 'Even old-format group getters project only the public half');
         const result = await settles(engine.migratePrivateKeys());
         assert.true(!result.error && result.value.migratedIdentity && result.value.migratedGroups === 1, 'Identity and group migration commit together');
         assert.strictEqual(database.pendingWrites(), 0, 'Migration success waits for commit');
         assert.true(await fingerprint(await engine.getMyPublicKey()) === await fingerprint(identity[0]), 'Identity fingerprint is unchanged');
-        const groups = await engine.getCachedGroupKeys();
+        const groups = await engine.getCachedLegacyGroupKeys();
         assert.true(await fingerprint(groups[0].groupKey) === await fingerprint(group[0]), 'Group fingerprint is unchanged');
         const rows = await records(database, [STORES.privateKeys, STORES.groupKeys]);
         assert.true(noPrivateJWK(rows), 'All selected original private JWKs were replaced, with no hidden backup');
@@ -168,10 +172,10 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         assert.true(await reopened.decryptTextSimpleLegacy(this.bob.id, '104', packet.cipherText, packet.iv) === 'Before migration', 'Old identity ciphertext decrypts after migration and reload');
         const declaredV2 = await this.bob.createContext(identity[0], { receiver: '104' });
         await assert.rejects(reopened.decryptTextSimple(this.bob.id, '104', packet.cipherText, packet.iv, declaredV2.derivation),
-            error => error.code === 'INVALID_IV', 'The v2 reader rejects a legacy IV before crypto; it does not auto-detect or retry legacy');
+            error => error.code === 'INVALID_ENVELOPE', 'The v2 reader rejects a legacy IV before crypto; it does not auto-detect or retry legacy');
         assert.true(await reopened.decryptTextSimpleLegacy(this.bob.id, 'g200:1', groupPacket.cipherText, groupPacket.iv) === 'Old group', 'Old group ciphertext decrypts after migration and reload');
         const reply = await reopened.encryptTextSimple('104', this.bob.id, 'Migrated reply');
-        assert.true(await this.bob.engine.decryptTextSimple('104', this.bob.id, reply.cipherText, reply.iv, reply.derivation) === 'Migrated reply', 'Migrated owner encrypts in the opposite direction');
+        assert.true(await this.bob.engine.decryptTextSimple('104', this.bob.id, reply) === 'Migrated reply', 'Migrated owner encrypts in the opposite direction');
         const repeated = await reopened.migratePrivateKeys();
         assert.true(!repeated.migratedIdentity && repeated.migratedGroups === 0, 'Repeat migration does not rotate keys');
     });
@@ -248,14 +252,14 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         const pair = await legacyPair();
         await assert.rejects(this.alice.engine.getDerivedKey(this.bob.publicKey, pair[1]),
             error => error.code === 'PRIVATE_KEY_MIGRATION_REQUIRED', 'Low-level derivation cannot silently import a private JWK');
-        await assert.rejects(this.alice.engine.addGroupKeys('g200', [{ version: 1, groupKey: pair[1] }]),
+        await assert.rejects(this.alice.engine.addLegacyGroupKeys('g200', [{ version: 1, groupKey: pair[1] }]),
             error => error.code === 'INVALID_KEY', 'The ordinary group insertion API accepts only public keys');
         await assert.rejects(this.alice.engine.addPublicKey(this.bob.id, pair[1]),
             error => error.code === 'INVALID_KEY', 'Public insertion cannot accept private components');
         const exported = await crypto.subtle.importKey('jwk', pair[1], algorithm, true, ['deriveKey']);
         await assert.rejects(this.alice.engine.getDerivedKey(this.bob.publicKey, exported),
             error => error.code === 'INVALID_PRIVATE_KEY', 'Extractable private CryptoKeys cannot bypass the default');
-        assert.deepEqual(await this.alice.engine.getCachedGroupVersions('g200'), [], 'Rejected private insertion creates no group record');
+        assert.deepEqual(await this.alice.engine.getCachedLegacyGroupVersions('g200'), [], 'Rejected private insertion creates no group record');
     });
 
     QUnit.test('Explicit flat migration including selected private groups rolls back deletions on abort', async function (assert) {
@@ -363,9 +367,10 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         const { engine } = this.alice;
         const before = await engine.generatePrivAndPubKey();
         await engine.panic();
-        await engine.setup();
+        await assert.rejects(engine.setup(), error => error.code === 'ENGINE_LOCKED', 'Setup cannot silently replace a cleared identity');
+        await engine.reinitialize();
         await assert.rejects(engine.getDerivedKey(this.bob.publicKey, before.keyReference),
-            error => error.code === 'KEY_REFERENCE_INVALID', 'The old capability is invalid after explicit clearing and new setup');
+            error => error.code === 'INVALID_PRIVATE_KEY', 'The old capability is invalid after explicit reinitialization');
     });
 
 });

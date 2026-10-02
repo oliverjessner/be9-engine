@@ -75,3 +75,8 @@ export function changedIV(iv) {
 export function isAuthenticationFailure(error) {
     return error instanceof DOMException && error.name === 'OperationError';
 }
+
+export function packetMetadata(packet) {
+    const { version, suite, contextID, sender, receiver, senderFingerprint, receiverFingerprint, purpose, salt } = packet.header;
+    return { version, suite, contextID, sender, receiver, senderFingerprint, receiverFingerprint, purpose, salt };
+}

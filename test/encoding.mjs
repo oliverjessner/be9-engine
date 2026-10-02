@@ -1,6 +1,6 @@
 import Be8, { STORES, V2_LIMITS, encodeBase64url, decodeBase64url, jwkThumbprint } from '../lib/bundle.mjs';
 import { derivationUsageID } from '../lib/usage.mjs';
-import { participantHooks, exchangePublicKeys } from './participants.mjs';
+import { participantHooks, exchangePublicKeys, packetMetadata } from './participants.mjs';
 import { readRecord } from './database.mjs';
 import { encryptLegacyFixture } from './legacy-fixture.mjs';
 
@@ -58,26 +58,28 @@ QUnit.module('v2 / binary encoding, nonces and persisted usage', hooks => {
         await exchangePublicKeys(alice, bob);
         for (const text of ['', '\u0000\uffff👩🏽‍💻日本語', '\ufeffBOM stays text', 'é e\u0301']) {
             const packet = await alice.engine.encryptTextSimple(alice.id, bob.id, text);
-            assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, packet.cipherText, packet.iv, packet.derivation) === text,
+            assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, packet) === text,
                 'Unicode text round trips without normalization or BOM loss');
         }
         const raw = sample(2 * 1024 * 1024 + 1);
         const unpadded = encodeBase64url(raw).replace(/-/g, '+').replace(/_/g, '/');
         const image = 'data:image/png;base64,' + unpadded + '='.repeat((4 - unpadded.length % 4) % 4);
         const packet = await alice.engine.encryptImageSimple(alice.id, bob.id, image);
-        assert.true(await bob.engine.decryptImageSimple(alice.id, bob.id, packet.cipherImage, packet.iv, packet.derivation) === image,
+        assert.true(await bob.engine.decryptImageSimple(alice.id, bob.id, packet) === image,
             'A multi-megabyte image preserves the existing string API without argument/stack overflow');
-        assert.strictEqual(packet.derivation.purpose, 'attachment', 'Large image remains in the attachment domain');
+        assert.strictEqual(packet.header.purpose, 'attachment', 'Large image remains in the attachment domain');
     });
 
     QUnit.test('Malformed and noncanonical Base64url is rejected before AES or storage', async function (assert) {
         const key = await nativeKey();
         const iv = encodeBase64url(new Uint8Array(12));
+        const context = await this.alice.createContext(this.bob.publicKey);
+        const header = { ...context.derivation, iv, sequence: '1', group: null };
         let transactions = 0;
         this.bob.database.observe(() => transactions++);
         for (const encoded of ['A', 'AA=', 'AA==', 'AB', 'AAB', 'A+B/', 'a b', 'a\nb', '\u00ff', '====', '_w=', 'data:']) {
             assert.throws(() => decodeBase64url(encoded), code('INVALID_ENCODING'), 'Invalid alphabet, padding, length or unused bits reject');
-            await assert.rejects(this.bob.engine.decryptTextSimple('101', '102', encoded, iv, {}), code('INVALID_ENCODING'),
+            await assert.rejects(this.bob.engine.decryptTextSimple('101', '102', { header, ciphertext: encoded }), code('INVALID_ENCODING'),
                 'Malformed ciphertext rejects before ECDH metadata or database reads');
         }
         assert.strictEqual(transactions, 0, 'No expensive convenience key lookup started');
@@ -97,6 +99,8 @@ QUnit.module('v2 / binary encoding, nonces and persisted usage', hooks => {
     });
 
     QUnit.test('Oversized and invalid inputs reject before native key derivation and reservation', async function (assert) {
+        const context = await this.alice.createContext(this.bob.publicKey);
+        const header = { ...context.derivation, iv: encodeBase64url(new Uint8Array(12)), sequence: '1', group: null };
         let transactions = 0;
         this.alice.database.observe(() => transactions++);
         for (const text of ['x'.repeat(V2_LIMITS.plaintextBytes + 1), '€'.repeat(Math.floor(V2_LIMITS.plaintextBytes / 3) + 1)]) {
@@ -104,7 +108,7 @@ QUnit.module('v2 / binary encoding, nonces and persisted usage', hooks => {
         }
         await assert.rejects(this.alice.engine.encryptImageSimple('101', '102', '\ud800'), code('INVALID_TEXT'), 'Lone surrogates are not silently replaced');
         const oversized = 'A'.repeat(Math.ceil((V2_LIMITS.plaintextBytes + 16) * 8 / 6) + 1);
-        await assert.rejects(this.alice.engine.decryptTextSimple('102', '101', oversized, encodeBase64url(new Uint8Array(12)), {}),
+        await assert.rejects(this.alice.engine.decryptTextSimple('102', '101', { header, ciphertext: oversized }),
             code('INPUT_TOO_LARGE'), 'Wire size rejects before Base64 decoding or KDF');
         for (const options of [{ iv: new Uint8Array(12) }, { random: () => new Uint8Array(12) }, { keyId: 'new-alias' }]) {
             await assert.rejects(this.alice.engine.encryptTextSimple('101', '102', 'small', options), code('INVALID_OPTIONS'), 'Convenience encryption cannot supply an IV, random source or key alias');
@@ -177,11 +181,11 @@ QUnit.module('v2 / binary encoding, nonces and persisted usage', hooks => {
         const { alice, bob } = this;
         await exchangePublicKeys(alice, bob);
         const packet = await alice.engine.encryptTextSimple(alice.id, bob.id, 'budgeted');
-        const id = await derivationUsageID(packet.derivation);
+        const id = await derivationUsageID(packetMetadata(packet));
         assert.strictEqual((await readRecord(alice.database, 'keyUsage', id)).encryptions, 1, 'The secure convenience path commits a real per-key reservation');
-        assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, packet.cipherText, packet.iv, packet.derivation) === 'budgeted', 'Independent recipient still interoperates');
+        assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, packet) === 'budgeted', 'Independent recipient still interoperates');
         assert.strictEqual(await readRecord(bob.database, 'keyUsage', id), undefined, 'Reading a ciphertext does not reserve encryption capacity');
-        const key = await alice.derive(bob.publicKey, packet.derivation);
+        const key = await alice.derive(bob.publicKey, packetMetadata(packet));
         await assert.rejects(alice.engine.encryptText(key, '\ud800'), code('INVALID_TEXT'), 'Bad text is refused before a reservation');
         assert.strictEqual((await readRecord(alice.database, 'keyUsage', id)).encryptions, 1, 'Validation errors do not consume capacity');
     });

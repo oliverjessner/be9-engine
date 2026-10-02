@@ -17,8 +17,13 @@ const STORES = Object.freeze({
     publicKeys: 'be8.publicKeys',
     privateKeys: 'be8.privateKeys',
     groupKeys: 'be8.groupKeys',
+    groupEpochs: 'be8.groupEpochs',
+    activeEpochs: 'be8.activeEpochs',
     trust: 'be8.trust',
     keyUsage: 'be8.keyUsage',
+    contexts: 'be8.contexts',
+    sendState: 'be8.sendState',
+    receiveState: 'be8.receiveState',
 });
 
 function engineError(message, code = 'INVALID_STATE') {
@@ -89,8 +94,13 @@ function upgradeBe8Schema(db, transaction) {
         [STORES.publicKeys, ['namespace', 'accID']],
         [STORES.privateKeys, ['namespace', 'accID']],
         [STORES.groupKeys, ['namespace', 'groupID', 'version']],
+        [STORES.groupEpochs, ['namespace', 'groupID', 'epoch']],
+        [STORES.activeEpochs, ['namespace', 'groupID']],
         [STORES.trust, ['namespace', 'peerID']],
         [STORES.keyUsage, 'derivationID'],
+        [STORES.contexts, ['namespace', 'contextID']],
+        [STORES.sendState, ['namespace', 'contextID', 'streamID']],
+        [STORES.receiveState, ['namespace', 'contextID', 'streamID']],
     ];
     try {
         for (const [name, keyPath] of definitions) {
@@ -709,6 +719,8 @@ function nextTrust(current, fingerprint, decision, firstContact) {
     return 'unverified';
 }
 
+/* global WeakRef */
+
 function accountID(id) {
     if (typeof id !== 'string' || !/^(0|[1-9][0-9]*)$/.test(id)) {
         throw engineError(
@@ -831,7 +843,87 @@ function groupPair(record) {
     ];
 }
 
+// Weak registrations coordinate live instances in this JS realm; persisted
+// generations are authoritative across connections, reloads and other realms.
+const liveScopes = new Map();
+function scopeState(record) {
+    const status =
+        record && Object.hasOwn(record, 'status') ? record.status : 'active';
+    const generation =
+        record && Object.hasOwn(record, 'generation') ? record.generation : 0;
+    if (
+        !['active', 'invalidated'].includes(status) ||
+        !Number.isSafeInteger(generation) ||
+        generation < 0
+    ) {
+        throw engineError(
+            'invalid namespace lifecycle state',
+            'INVALID_LIFECYCLE'
+        );
+    }
+    return { status, generation };
+}
 class KeyStore {
+    #generation;
+    #blocked = false;
+    #transactions = new Set();
+    #databaseName;
+    #registered = false;
+    onLock = () => {};
+    assertActive() {
+        if (this.#blocked)
+            throw engineError(
+                'local namespace is invalidated; explicit reinitialize() required',
+                'ENGINE_LOCKED'
+            );
+    }
+    lock() {
+        this.#blocked = true;
+        this.onLock();
+        for (const tx of this.#transactions) {
+            try {
+                tx.abort();
+            } catch {
+                /* Terminal transaction. */
+            }
+        }
+    }
+    #register(tx) {
+        this.#databaseName = tx.db.name;
+        if (this.#registered || typeof WeakRef !== 'function') return;
+        if (!liveScopes.has(tx.db.name)) liveScopes.set(tx.db.name, new Map());
+        const scopes = liveScopes.get(tx.db.name);
+        if (!scopes.has(this.namespace)) scopes.set(this.namespace, new Set());
+        scopes.get(this.namespace).add(new WeakRef(this));
+        this.#registered = true;
+    }
+    #lockPeers() {
+        const registered = liveScopes
+            .get(this.#databaseName)
+            ?.get(this.namespace);
+        for (const reference of registered || []) {
+            const keys = reference.deref();
+            if (!keys) registered.delete(reference);
+            else if (
+                keys.accID === this.accID &&
+                (this.#generation === undefined ||
+                    keys.#generation === undefined ||
+                    keys.#generation === this.#generation)
+            )
+                keys.lock();
+        }
+    }
+    #track(tx) {
+        this.#register(tx);
+        this.#transactions.add(tx);
+        const release = () => this.#transactions.delete(tx);
+        tx.addEventListener('complete', release, { once: true });
+        tx.addEventListener('abort', release, { once: true });
+    }
+    checkLifecycle() {
+        return this.run([], 'readonly', () => undefined);
+    }
+
     constructor(connection, accID, namespace = accID) {
         this.connection = connection;
         this.accID = accountID(accID);
@@ -850,23 +942,59 @@ class KeyStore {
     #scope(tx, write, work) {
         const scopes = tx.objectStore(STORES.scopes);
         return requestResult(scopes.get(this.namespace), (record) => {
+            this.assertActive();
             this.#checkOwner(record);
-            if (!record && write)
-                scopes.add({ namespace: this.namespace, accID: this.accID });
+            const state = scopeState(record);
+            if (!record && this.#generation !== undefined)
+                throw engineError(
+                    'namespace lifecycle record is missing; no automatic reset is allowed',
+                    'INVALID_LIFECYCLE'
+                );
+            if (
+                state.status !== 'active' ||
+                (this.#generation !== undefined &&
+                    state.generation !== this.#generation)
+            ) {
+                this.lock();
+                throw engineError(
+                    'namespace generation has been invalidated',
+                    'ENGINE_LOCKED'
+                );
+            }
+            if (record) this.#generation ??= state.generation;
+            if (!record && write) {
+                scopes.add({
+                    namespace: this.namespace,
+                    accID: this.accID,
+                    status: 'active',
+                    generation: 0,
+                });
+                tx.addEventListener(
+                    'complete',
+                    () => {
+                        this.#generation ??= 0;
+                    },
+                    { once: true }
+                );
+            }
             return work(tx);
         });
     }
 
     run(stores, mode, work) {
+        this.assertActive();
         return withTransaction(
             this.connection,
             [STORES.scopes, ...new Set(stores)],
             mode,
-            (tx) => this.#scope(tx, mode === 'readwrite', work)
+            (tx) => {
+                this.#track(tx);
+                return this.#scope(tx, mode === 'readwrite', work);
+            }
         );
     }
 
-    async reserveUsage(derivationID, byteLength) {
+    async reserveUsage(derivationID, byteLength, aadLength = 0) {
         fingerprintValue(derivationID);
         if (
             !databaseConnection(this.connection).objectStoreNames.contains(
@@ -888,7 +1016,14 @@ class KeyStore {
                 'INPUT_TOO_LARGE'
             );
         }
-        const blocks = Math.ceil(byteLength / 16) + 1; // Ciphertext GHASH blocks plus length block; no AAD yet.
+        if (
+            !Number.isSafeInteger(aadLength) ||
+            aadLength < 0 ||
+            aadLength > 4096
+        )
+            throw engineError('invalid AAD size', 'INVALID_ENVELOPE');
+        const blocks =
+            Math.ceil(byteLength / 16) + Math.ceil(aadLength / 16) + 1;
         return this.run([STORES.keyUsage], 'readwrite', (tx) => {
             const store = tx.objectStore(STORES.keyUsage);
             return requestResult(store.get(derivationID), (current) => {
@@ -1399,38 +1534,6 @@ class KeyStore {
         });
     }
 
-    async createGroup(id, version, pair) {
-        const group = groupID(id);
-        const v = groupVersion(version);
-        return this.run([STORES.groupKeys], 'readwrite', (tx) => {
-            const store = tx.objectStore(STORES.groupKeys);
-            return requestResult(
-                store.get([this.namespace, group, v]),
-                (existing) => {
-                    if (existing) {
-                        const pair = groupPair(existing);
-                        if (!pair[1])
-                            throw engineError(
-                                'existing group key has no private half',
-                                'GROUP_CONFLICT'
-                            );
-                        return pair;
-                    }
-                    return requestResult(
-                        store.add({
-                            namespace: this.namespace,
-                            groupID: group,
-                            version: v,
-                            key: pair[0],
-                            privateKey: pair[1],
-                        }),
-                        () => pair
-                    );
-                }
-            );
-        });
-    }
-
     async endpointKeys(publicID, privateID, requireTrust = false) {
         const parse = (id) => {
             if (typeof id === 'string' && id.startsWith('g')) {
@@ -1889,23 +1992,46 @@ class KeyStore {
         );
     }
 
-    async clear() {
-        await this.run(
-            [
-                STORES.publicKeys,
-                STORES.privateKeys,
-                STORES.groupKeys,
-                STORES.trust,
-            ],
+    async invalidate() {
+        // A previously validated owner can immediately invalidate other live
+        // instances. An unbound/wrong owner must first pass the native scope check.
+        if (this.#generation !== undefined) this.#lockPeers();
+        const db = databaseConnection(this.connection);
+        const owned = Object.values(STORES).filter(
+            (name) =>
+                name !== STORES.scopes &&
+                name !== STORES.keyUsage &&
+                db.objectStoreNames.contains(name)
+        );
+        return withTransaction(
+            this.connection,
+            [STORES.scopes, ...owned],
             'readwrite',
-            (tx) =>
-                Promise.all(
-                    [
-                        STORES.publicKeys,
-                        STORES.privateKeys,
-                        STORES.groupKeys,
-                        STORES.trust,
-                    ].map((name) => {
+            (tx) => {
+                this.#register(tx);
+                const scopes = tx.objectStore(STORES.scopes);
+                return requestResult(scopes.get(this.namespace), (record) => {
+                    this.#checkOwner(record);
+                    const state = scopeState(record);
+                    if (state.status === 'invalidated') {
+                        this.#lockPeers();
+                        return;
+                    }
+                    if (
+                        this.#generation !== undefined &&
+                        state.generation !== this.#generation
+                    )
+                        throw engineError(
+                            'stale instance cannot delete a new namespace generation',
+                            'ENGINE_LOCKED'
+                        );
+                    if (state.generation === Number.MAX_SAFE_INTEGER)
+                        throw engineError(
+                            'namespace generation exhausted',
+                            'GENERATION_EXHAUSTED'
+                        );
+                    this.#lockPeers();
+                    const removals = owned.map((name) => {
                         const store = tx.objectStore(name);
                         return requestResult(
                             store.index('namespace').getAllKeys(this.namespace),
@@ -1916,17 +2042,106 @@ class KeyStore {
                                     )
                                 )
                         );
-                    })
-                )
+                    });
+                    const tombstone = requestResult(
+                        scopes.put({
+                            namespace: this.namespace,
+                            accID: this.accID,
+                            status: 'invalidated',
+                            generation: state.generation + 1,
+                        })
+                    );
+                    return Promise.all([...removals, tombstone]).then(
+                        () => undefined
+                    );
+                });
+            }
         );
-        // The namespace/account binding is retained; unrelated accounts and
-        // application stores, including legacy records, are never cleared.
+        // Legacy unscoped/application stores and shared per-actual-key usage
+        // reservations remain: deletion must neither claim ownership nor refund.
+    }
+    async reinitializationState() {
+        return withTransaction(
+            this.connection,
+            [STORES.scopes],
+            'readonly',
+            (tx) => {
+                this.#register(tx);
+                return requestResult(
+                    tx.objectStore(STORES.scopes).get(this.namespace),
+                    (record) => {
+                        this.#checkOwner(record);
+                        const state = scopeState(record);
+                        if (state.status !== 'invalidated')
+                            throw engineError(
+                                'commit panic() before explicit reinitialization',
+                                'REINITIALIZATION_REQUIRED'
+                            );
+                        if (state.generation === Number.MAX_SAFE_INTEGER)
+                            throw engineError(
+                                'namespace generation exhausted',
+                                'GENERATION_EXHAUSTED'
+                            );
+                        return state.generation;
+                    }
+                );
+            }
+        );
+    }
+    async reinitialize(candidate, expectedGeneration, valid) {
+        return withTransaction(
+            this.connection,
+            [STORES.scopes, STORES.publicKeys, STORES.privateKeys],
+            'readwrite',
+            (tx) => {
+                this.#track(tx);
+                const scopes = tx.objectStore(STORES.scopes);
+                return requestResult(scopes.get(this.namespace), (record) => {
+                    this.#checkOwner(record);
+                    const state = scopeState(record);
+                    if (
+                        !valid() ||
+                        state.status !== 'invalidated' ||
+                        state.generation !== expectedGeneration
+                    )
+                        throw engineError(
+                            'reinitialization was invalidated or lost its generation',
+                            'ENGINE_LOCKED'
+                        );
+                    const [publicKey, privateKey] = candidate;
+                    tx.objectStore(STORES.publicKeys).add({
+                        namespace: this.namespace,
+                        accID: this.accID,
+                        key: publicKey,
+                    });
+                    tx.objectStore(STORES.privateKeys).add({
+                        namespace: this.namespace,
+                        accID: this.accID,
+                        key: privateKey,
+                        publicKey,
+                    });
+                    return requestResult(
+                        scopes.put({
+                            namespace: this.namespace,
+                            accID: this.accID,
+                            status: 'active',
+                            generation: state.generation + 1,
+                        }),
+                        () => state.generation + 1
+                    );
+                });
+            }
+        );
+    }
+    resume(generation) {
+        this.#generation = generation;
+        this.#blocked = false;
     }
 }
 
 const V2_SUITE = 'BE8-P384-HKDF-SHA256-A256GCM';
 const V2_PURPOSES = Object.freeze(['data', 'attachment', 'key-wrap']);
-const fields = [
+const fields$1 = [
     'version',
     'suite',
     'contextID',
@@ -1947,7 +2162,8 @@ function fail(
 }
 
 function scalarString(value, maxBytes = 1024) {
-    if (typeof value !== 'string' || !value.length) throw fail();
+    if (typeof value !== 'string' || !value.length || value.length > maxBytes)
+        throw fail();
     // Reject lone UTF-16 surrogates rather than silently replacing them in UTF-8.
     for (const character of value) {
         const code = character.codePointAt(0);
@@ -1990,12 +2206,12 @@ function derivationSnapshot(value) {
         if (
             typeof value !== 'object' ||
             Array.isArray(value) ||
-            Object.keys(value).length !== fields.length ||
-            !fields.every((field) => Object.keys(value).includes(field))
+            Object.keys(value).length !== fields$1.length ||
+            !fields$1.every((field) => Object.keys(value).includes(field))
         )
             throw fail();
         const snapshot = Object.fromEntries(
-            fields.map((field) => [field, value[field]])
+            fields$1.map((field) => [field, value[field]])
         );
         if (
             snapshot.version !== 2 ||
@@ -2029,7 +2245,11 @@ function encodeV2DerivationInfo(metadata) {
         decode32(context.receiverFingerprint),
         encoder.encode(context.purpose),
     ];
-    const prefix = encoder.encode('BE8-HKDF-INFO');
+    return encodeFields('BE8-HKDF-INFO', values);
+}
+
+function encodeFields(domain, values) {
+    const prefix = encoder.encode(domain);
     const info = new Uint8Array(
         prefix.length +
             values.reduce((length, value) => length + 4 + value.length, 0)
@@ -2255,12 +2475,1156 @@ function decryptPayload(key, payload) {
 // or storage namespace can make the same HKDF key get a fresh local budget.
 async function derivationUsageID(derivation) {
     const info = encodeV2DerivationInfo(derivation);
+    return usageIdentity(derivation.salt, info);
+}
+
+async function usageIdentity(salt, info) {
     const prefix = new TextEncoder().encode('BE8-GCM-USAGE');
     const bytes = new Uint8Array(prefix.length + 32 + info.length);
     bytes.set(prefix);
-    bytes.set(decode32(derivation.salt), prefix.length);
+    bytes.set(decode32(salt), prefix.length);
     bytes.set(info, prefix.length + 32);
     return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
+}
+
+/* global BigInt */
+const GROUP_SUITE = 'BE8-GROUP-HKDF-SHA256-A256GCM';
+const fields = [
+    'version',
+    'suite',
+    'contextID',
+    'sender',
+    'receiver',
+    'senderFingerprint',
+    'receiverFingerprint',
+    'purpose',
+    'salt',
+];
+function groupDerivationSnapshot(value) {
+    const result = Object.fromEntries(
+        fields.map((field) => [field, value[field]])
+    );
+    if (
+        result.version !== 2 ||
+        result.suite !== GROUP_SUITE ||
+        !['data', 'attachment'].includes(result.purpose) ||
+        typeof result.sender !== 'string' ||
+        !/^(0|[1-9][0-9]*)$/.test(result.sender) ||
+        typeof result.receiver !== 'string' ||
+        result.receiver.length > 128 ||
+        !/^g[A-Za-z0-9_-]+$/.test(result.receiver)
+    ) {
+        throw engineError('invalid group derivation', 'INVALID_ENVELOPE');
+    }
+    scalarString(result.contextID);
+    scalarString(result.sender, 256);
+    decode32(result.senderFingerprint);
+    decode32(result.receiverFingerprint);
+    decode32(result.salt);
+    return Object.freeze(result);
+}
+function encodeGroupInfo(header) {
+    const h = groupDerivationSnapshot(header);
+    const g = header.group;
+    if (
+        !g ||
+        g.groupID !== h.receiver ||
+        g.generation !== h.receiverFingerprint
+    )
+        throw engineError('group binding mismatch', 'INVALID_ENVELOPE');
+    const epoch = new Uint8Array(8);
+    new DataView(epoch.buffer).setBigUint64(0, BigInt(g.epoch), false);
+    return encodeFields('BE8-GROUP-HKDF-INFO', [
+        scalarString('2'),
+        scalarString(h.suite),
+        scalarString(h.contextID),
+        scalarString(h.sender, 256),
+        scalarString(h.receiver),
+        decode32(h.senderFingerprint),
+        decode32(h.receiverFingerprint),
+        scalarString(h.purpose),
+        scalarString(g.groupID),
+        epoch,
+        decode32(g.generation),
+    ]);
+}
+async function groupGeneration(bytes) {
+    return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
+}
+async function importGroupSecret(bytes) {
+    try {
+        const key = await crypto.subtle.importKey('raw', bytes, 'HKDF', false, [
+            'deriveKey',
+        ]);
+        if (typeof structuredClone !== 'function') throw new Error();
+        const clone = structuredClone(key);
+        requireGroupSecret(clone);
+        return key;
+    } catch {
+        throw engineError(
+            'browser must support non-extractable CryptoKey structured clone',
+            'CRYPTOKEY_STORAGE_UNSUPPORTED'
+        );
+    }
+}
+function requireGroupSecret(key) {
+    if (
+        !(key instanceof CryptoKey) ||
+        key.algorithm.name !== 'HKDF' ||
+        key.type !== 'secret' ||
+        key.extractable ||
+        key.usages.length !== 1 ||
+        key.usages[0] !== 'deriveKey'
+    )
+        throw engineError(
+            'invalid persisted group secret',
+            'INVALID_GROUP_KEY'
+        );
+    return key;
+}
+async function deriveGroupAES(key, header) {
+    return crypto.subtle.deriveKey(
+        {
+            name: 'HKDF',
+            hash: 'SHA-256',
+            salt: decode32(header.salt),
+            info: encodeGroupInfo(header),
+        },
+        requireGroupSecret(key),
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+    );
+}
+
+/* global BigInt */
+
+const MAX_SEQUENCE = (1n << 64n) - 1n;
+const text = (value) => new TextEncoder().encode(value);
+const metadataFields = [
+    'version',
+    'suite',
+    'contextID',
+    'sender',
+    'receiver',
+    'senderFingerprint',
+    'receiverFingerprint',
+    'purpose',
+    'salt',
+];
+const headerFields = [...metadataFields, 'iv', 'sequence', 'group'];
+function invalidEnvelope() {
+    return engineError(
+        'invalid or unsupported v2 envelope',
+        'INVALID_ENVELOPE'
+    );
+}
+function exactObject(value, fields) {
+    try {
+        if (
+            !value ||
+            typeof value !== 'object' ||
+            Array.isArray(value) ||
+            Reflect.ownKeys(value).length !== fields.length ||
+            !fields.every((field) => Object.hasOwn(value, field))
+        )
+            throw invalidEnvelope();
+        const snapshot = {};
+        for (const field of fields) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, field);
+            if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value'))
+                throw invalidEnvelope();
+            snapshot[field] = descriptor.value;
+        }
+        return snapshot;
+    } catch {
+        throw invalidEnvelope();
+    }
+}
+function sequenceValue(value) {
+    if (
+        typeof value !== 'string' ||
+        value.length > 20 ||
+        !/^(0|[1-9][0-9]*)$/.test(value)
+    )
+        throw invalidEnvelope();
+    const number = BigInt(value);
+    if (number > MAX_SEQUENCE) throw invalidEnvelope();
+    return number;
+}
+function uint64(value) {
+    const bytes = new Uint8Array(8);
+    new DataView(bytes.buffer).setBigUint64(0, sequenceValue(value), false);
+    return bytes;
+}
+function groupSnapshot(value) {
+    if (value === null) return null;
+    value = exactObject(value, ['groupID', 'epoch', 'generation']);
+    if (
+        typeof value.groupID !== 'string' ||
+        value.groupID.length > 128 ||
+        !/^g[A-Za-z0-9_-]+$/.test(value.groupID) ||
+        sequenceValue(value.epoch) === 0n
+    )
+        throw invalidEnvelope();
+    decode32(value.generation);
+    return Object.freeze({
+        groupID: value.groupID,
+        epoch: value.epoch,
+        generation: value.generation,
+    });
+}
+function headerMetadata(header) {
+    const value = Object.fromEntries(
+        metadataFields.map((field) => [field, header[field]])
+    );
+    return header.suite === GROUP_SUITE
+        ? groupDerivationSnapshot(value)
+        : derivationSnapshot(value);
+}
+function headerSnapshot(value) {
+    try {
+        value = exactObject(value, headerFields);
+        const metadata = headerMetadata(value);
+        const iv = decodeBase64url(value.iv, 12);
+        if (iv.length !== 12 || sequenceValue(value.sequence) === 0n)
+            throw invalidEnvelope();
+        const group = groupSnapshot(value.group);
+        if (metadata.suite === GROUP_SUITE) {
+            if (
+                !group ||
+                group.groupID !== metadata.receiver ||
+                group.generation !== metadata.receiverFingerprint
+            )
+                throw invalidEnvelope();
+        } else {
+            if (
+                !/^(0|[1-9][0-9]*)$/.test(metadata.sender) ||
+                !/^(0|[1-9][0-9]*)$/.test(metadata.receiver) ||
+                (group !== null) !== (metadata.purpose === 'key-wrap')
+            )
+                throw invalidEnvelope();
+        }
+        return Object.freeze({
+            ...metadata,
+            iv: value.iv,
+            sequence: value.sequence,
+            group,
+        });
+    } catch {
+        throw invalidEnvelope();
+    }
+}
+function envelopeSnapshot(value) {
+    value = exactObject(value, ['header', 'ciphertext']);
+    const header = headerSnapshot(value.header);
+    if (typeof value.ciphertext !== 'string') throw invalidEnvelope();
+    const payload = payloadSnapshot(value.ciphertext, header.iv);
+    return { header, payload, ciphertext: value.ciphertext };
+}
+function encodeEnvelopeAAD(value) {
+    const h = headerSnapshot(value);
+    const g = h.group;
+    const aad = encodeFields('BE8-ENVELOPE-AAD', [
+        h.suite === GROUP_SUITE
+            ? encodeGroupInfo(h)
+            : encodeV2DerivationInfo(headerMetadata(h)),
+        decode32(h.salt),
+        decodeBase64url(h.iv, 12),
+        uint64(h.sequence),
+        text(g ? 'group' : ''),
+        text(g?.groupID || ''),
+        g ? uint64(g.epoch) : new Uint8Array(),
+        g ? decode32(g.generation) : new Uint8Array(),
+    ]);
+    if (aad.length > 4096) throw invalidEnvelope();
+    return aad;
+}
+function checkExpected(header, expected, localID) {
+    if (!expected || typeof expected !== 'object')
+        throw engineError(
+            'independent envelope expectations are required',
+            'ENVELOPE_EXPECTATION_REQUIRED'
+        );
+    scalarString(expected.contextID);
+    if (
+        expected.sender !== header.sender ||
+        expected.receiver !== header.receiver ||
+        expected.contextID !== header.contextID ||
+        expected.purpose !== header.purpose ||
+        header.receiver !== localID
+    ) {
+        throw engineError(
+            'envelope does not match the expected endpoints, context or purpose',
+            'ENVELOPE_EXPECTATION_MISMATCH'
+        );
+    }
+}
+
+// One byte-based authenticated operation. Wrapping is internal; no public
+// group-secret decoder or private-key export is introduced.
+async function sealBytes(key, header, bytes) {
+    const additionalData = encodeEnvelopeAAD(header);
+    const algorithm = {
+        name: 'AES-GCM',
+        iv: decodeBase64url(header.iv, 12),
+        tagLength: 128,
+        additionalData,
+    };
+    if (header.purpose === 'key-wrap') {
+        if (bytes.length !== 32 || !header.group) throw invalidEnvelope();
+        const temporary = await crypto.subtle.importKey(
+            'raw',
+            bytes,
+            'AES-GCM',
+            true,
+            ['encrypt', 'decrypt']
+        );
+        return encodeBase64url(
+            await crypto.subtle.wrapKey('raw', temporary, key, algorithm)
+        );
+    }
+    return encodeBase64url(await crypto.subtle.encrypt(algorithm, key, bytes));
+}
+async function openBytes(key, snapshot) {
+    const h = snapshot.header;
+    const algorithm = {
+        name: 'AES-GCM',
+        iv: snapshot.payload.iv,
+        tagLength: 128,
+        additionalData: encodeEnvelopeAAD(h),
+    };
+    if (h.purpose === 'key-wrap') {
+        if (snapshot.payload.bytes.length !== 48 || !h.group)
+            throw invalidEnvelope();
+        const temporary = await crypto.subtle.unwrapKey(
+            'raw',
+            snapshot.payload.bytes,
+            key,
+            algorithm,
+            'AES-GCM',
+            true,
+            ['encrypt', 'decrypt']
+        );
+        return new Uint8Array(await crypto.subtle.exportKey('raw', temporary));
+    }
+    return new Uint8Array(
+        await crypto.subtle.decrypt(algorithm, key, snapshot.payload.bytes)
+    );
+}
+
+class Envelopes {
+    constructor(keys, localID, replay) {
+        this.keys = keys;
+        this.localID = localID;
+        this.replay = replay;
+    }
+    async seal(
+        sender,
+        receiver,
+        value,
+        { contextID, purpose, group = null } = {}
+    ) {
+        if (typeof receiver === 'string' && receiver.startsWith('g'))
+            throw engineError(
+                'ECDH group endpoints are legacy-only',
+                'LEGACY_GROUP_API'
+            );
+        if (sender !== this.localID)
+            throw engineError(
+                'Missing private key for local sender account',
+                'INVALID_PRIVATE_KEY'
+            );
+        const bytes = bytesSnapshot(value, V2_LIMITS.plaintextBytes);
+        scalarString(contextID);
+        const [peer, privateKey, own] = await this.keys.endpointKeys(
+            receiver,
+            sender,
+            true
+        );
+        if (!peer)
+            throw engineError(
+                'Missing public key for selected peer',
+                'INVALID_KEY'
+            );
+        if (!privateKey)
+            throw engineError(
+                'Missing private key for local endpoint',
+                'INVALID_PRIVATE_KEY'
+            );
+        const metadata = await createV2Metadata(sender, own, peer, {
+            contextID,
+            sender,
+            receiver,
+            purpose,
+        });
+        const key = await deriveV2AES(sender, own, peer, privateKey, metadata);
+        const sequence = await this.replay.reserve({ ...metadata, group });
+        const template = headerSnapshot({
+            ...metadata,
+            iv: encodeBase64url(new Uint8Array(12)),
+            sequence,
+            group,
+        });
+        await this.keys.reserveUsage(
+            await derivationUsageID(metadata),
+            bytes.length,
+            encodeEnvelopeAAD(template).length
+        );
+        const header = headerSnapshot({
+            ...template,
+            iv: encodeBase64url(crypto.getRandomValues(new Uint8Array(12))),
+        });
+        return { header, ciphertext: await sealBytes(key, header, bytes) };
+    }
+    async open(value, expected) {
+        const snapshot = envelopeSnapshot(value);
+        expected = expected && {
+            sender: expected.sender,
+            receiver: expected.receiver,
+            contextID: expected.contextID,
+            purpose: expected.purpose,
+        };
+        if (snapshot.header.suite === GROUP_SUITE) throw invalidEnvelope();
+        checkExpected(snapshot.header, expected, this.localID);
+        const [peer, privateKey, own] = await this.keys.endpointKeys(
+            snapshot.header.sender,
+            expected.receiver,
+            true
+        );
+        if (!peer)
+            throw engineError(
+                'Missing public key for selected peer',
+                'INVALID_KEY'
+            );
+        if (!privateKey)
+            throw engineError(
+                'Missing private key for local endpoint',
+                'INVALID_PRIVATE_KEY'
+            );
+        const key = await deriveV2AES(
+            expected.receiver,
+            own,
+            peer,
+            privateKey,
+            headerMetadata(snapshot.header)
+        );
+        return {
+            header: snapshot.header,
+            bytes: await openBytes(key, snapshot),
+        };
+    }
+}
+
+function groupOptions(options, purpose = false) {
+    if (
+        !options ||
+        typeof options !== 'object' ||
+        Array.isArray(options) ||
+        Reflect.ownKeys(options).some(
+            (field) =>
+                !['contextID', ...(purpose ? ['purpose'] : [])].includes(field)
+        )
+    ) {
+        throw engineError(
+            'group options allow only contextID and an explicit envelope purpose',
+            'INVALID_OPTIONS'
+        );
+    }
+    return {
+        contextID: options.contextID,
+        ...(purpose ? { purpose: options.purpose } : {}),
+    };
+}
+function epochID(id, epoch) {
+    groupID(id);
+    if (id.length > 128 || sequenceValue(epoch) === 0n)
+        throw engineError('invalid group epoch', 'INVALID_GROUP');
+    return { groupID: id, epoch };
+}
+function metadata(record) {
+    if (!record)
+        throw engineError(
+            'group epoch is not available locally',
+            'GROUP_EPOCH_MISSING'
+        );
+    const group = groupSnapshot({
+        groupID: record.groupID,
+        epoch: record.epoch,
+        generation: record.generation,
+    });
+    accountID(record.issuer);
+    return Object.freeze({ ...group, issuer: record.issuer });
+}
+function equal(left, right) {
+    return ['groupID', 'epoch', 'generation', 'issuer'].every(
+        (field) => left[field] === right[field]
+    );
+}
+class Groups {
+    constructor(keys, envelopes, replay, localID) {
+        Object.assign(this, { keys, envelopes, replay, localID });
+    }
+    async record(id, epoch) {
+        const selected = epochID(id, epoch);
+        return this.keys.run([STORES.groupEpochs], 'readonly', (tx) =>
+            requestResult(
+                tx
+                    .objectStore(STORES.groupEpochs)
+                    .get([
+                        this.keys.namespace,
+                        selected.groupID,
+                        selected.epoch,
+                    ]),
+                (record) => {
+                    metadata(record);
+                    requireGroupSecret(record.key);
+                    return record;
+                }
+            )
+        );
+    }
+    async store(record) {
+        metadata(record);
+        requireGroupSecret(record.key);
+        return this.keys.run([STORES.groupEpochs], 'readwrite', (tx) => {
+            const store = tx.objectStore(STORES.groupEpochs);
+            return requestResult(
+                store.get([this.keys.namespace, record.groupID, record.epoch]),
+                (current) => {
+                    if (current) {
+                        if (!equal(metadata(current), metadata(record)))
+                            throw engineError(
+                                'immutable group epoch already has another generation or issuer',
+                                'GROUP_EPOCH_CONFLICT'
+                            );
+                        requireGroupSecret(current.key);
+                        return metadata(current);
+                    }
+                    return requestResult(
+                        store.add({
+                            ...record,
+                            namespace: this.keys.namespace,
+                        }),
+                        () => metadata(record)
+                    );
+                }
+            );
+        });
+    }
+    async create(id, epoch, recipients, options) {
+        const selected = epochID(id, epoch);
+        options = groupOptions(options);
+        const contextID = options.contextID;
+        scalarString(contextID);
+        if (!Array.isArray(recipients) || recipients.length > 256)
+            throw engineError(
+                'explicit recipient array of at most 256 accounts required',
+                'INVALID_ACCOUNT'
+            );
+        recipients = recipients.map(accountID);
+        if (
+            new Set(recipients).size !== recipients.length ||
+            recipients.includes(this.localID)
+        )
+            throw engineError(
+                'duplicate or local recipient',
+                'INVALID_ACCOUNT'
+            );
+        const bytes = crypto.getRandomValues(new Uint8Array(32));
+        try {
+            const generation = await groupGeneration(bytes);
+            const key = await importGroupSecret(bytes);
+            const group = { ...selected, generation };
+            const packages = [];
+            // No membership records. Each recipient supplies only a trusted public key.
+            for (const receiver of recipients) {
+                packages.push({
+                    recipient: receiver,
+                    envelope: await this.envelopes.seal(
+                        this.localID,
+                        receiver,
+                        bytes,
+                        { contextID, purpose: 'key-wrap', group }
+                    ),
+                });
+            }
+            const result = await this.store({
+                ...group,
+                issuer: this.localID,
+                key,
+            });
+            return { epoch: result, packages };
+        } finally {
+            bytes.fill(0);
+        }
+    }
+    async import(value, expected) {
+        const packet = envelopeSnapshot(value);
+        const group = groupSnapshot(
+            expected && {
+                groupID: expected.groupID,
+                epoch: expected.epoch,
+                generation: expected.generation,
+            }
+        );
+        const copied = expected && {
+            sender: expected.sender,
+            receiver: expected.receiver,
+            contextID: expected.contextID,
+            purpose: 'key-wrap',
+        };
+        if (
+            !packet.header.group ||
+            !equal(
+                { ...packet.header.group, issuer: packet.header.sender },
+                { ...group, issuer: copied?.sender }
+            )
+        ) {
+            throw engineError(
+                'key package does not match expected issuer, group, epoch and generation',
+                'ENVELOPE_EXPECTATION_MISMATCH'
+            );
+        }
+        const opened = await this.envelopes.open(
+            { header: packet.header, ciphertext: packet.ciphertext },
+            copied
+        );
+        try {
+            if ((await groupGeneration(opened.bytes)) !== group.generation)
+                throw engineError(
+                    'group generation digest mismatch',
+                    'INVALID_GROUP_KEY'
+                );
+            const key = await importGroupSecret(opened.bytes);
+            return await this.store({ ...group, issuer: copied.sender, key });
+        } finally {
+            opened.bytes.fill(0);
+        }
+    }
+    async activate(id, epoch, { expectedCurrentEpoch } = {}) {
+        epochID(id, epoch);
+        if (expectedCurrentEpoch !== null) epochID(id, expectedCurrentEpoch);
+        return this.keys.run(
+            [STORES.groupEpochs, STORES.activeEpochs],
+            'readwrite',
+            (tx) => {
+                const active = tx.objectStore(STORES.activeEpochs);
+                return requestResult(
+                    tx
+                        .objectStore(STORES.groupEpochs)
+                        .get([this.keys.namespace, id, epoch]),
+                    (record) => {
+                        metadata(record);
+                        requireGroupSecret(record.key);
+                        return requestResult(
+                            active.get([this.keys.namespace, id]),
+                            (current) => {
+                                if (
+                                    (current?.epoch ?? null) !==
+                                    expectedCurrentEpoch
+                                )
+                                    throw engineError(
+                                        'active epoch changed concurrently',
+                                        'GROUP_EPOCH_CONFLICT'
+                                    );
+                                if (
+                                    current &&
+                                    sequenceValue(epoch) <
+                                        sequenceValue(current.epoch)
+                                )
+                                    throw engineError(
+                                        'old epochs are archive-only',
+                                        'GROUP_EPOCH_DOWNGRADE'
+                                    );
+                                return requestResult(
+                                    active.put({
+                                        namespace: this.keys.namespace,
+                                        groupID: id,
+                                        epoch,
+                                    }),
+                                    () => metadata(record)
+                                );
+                            }
+                        );
+                    }
+                );
+            }
+        );
+    }
+    async epochs(id) {
+        if (id !== undefined) groupID(id);
+        return this.keys.run([STORES.groupEpochs], 'readonly', (tx) =>
+            requestResult(
+                tx
+                    .objectStore(STORES.groupEpochs)
+                    .index('namespace')
+                    .getAll(this.keys.namespace),
+                (rows) =>
+                    rows
+                        .filter((row) => id === undefined || row.groupID === id)
+                        .map(metadata)
+            )
+        );
+    }
+    async active(id) {
+        groupID(id);
+        return this.keys.run(
+            [STORES.groupEpochs, STORES.activeEpochs],
+            'readonly',
+            (tx) =>
+                requestResult(
+                    tx
+                        .objectStore(STORES.activeEpochs)
+                        .get([this.keys.namespace, id]),
+                    (active) =>
+                        active
+                            ? requestResult(
+                                  tx
+                                      .objectStore(STORES.groupEpochs)
+                                      .get([
+                                          this.keys.namespace,
+                                          id,
+                                          active.epoch,
+                                      ]),
+                                  metadata
+                              )
+                            : undefined
+                )
+        );
+    }
+    async stream(expected) {
+        expected = expected && {
+            groupID: expected.groupID,
+            epoch: expected.epoch,
+            generation: expected.generation,
+            sender: expected.sender,
+            contextID: expected.contextID,
+            purpose: expected.purpose,
+        };
+        const group = groupSnapshot({
+            groupID: expected?.groupID,
+            epoch: expected?.epoch,
+            generation: expected?.generation,
+        });
+        accountID(expected?.sender);
+        scalarString(expected?.contextID);
+        if (!['data', 'attachment'].includes(expected?.purpose))
+            throw engineError('invalid group purpose', 'INVALID_PURPOSE');
+        const record = await this.record(group.groupID, group.epoch);
+        if (record.generation !== group.generation)
+            throw engineError(
+                'expected group generation differs from local epoch',
+                'GROUP_EPOCH_CONFLICT'
+            );
+        const [publicKey] = await this.keys.endpointKeys(
+            expected.sender,
+            this.localID,
+            true
+        );
+        if (!publicKey)
+            throw engineError(
+                'expected sender key is unavailable',
+                'INVALID_KEY'
+            );
+        return {
+            record,
+            header: {
+                version: 2,
+                suite: GROUP_SUITE,
+                contextID: expected.contextID,
+                sender: expected.sender,
+                receiver: group.groupID,
+                senderFingerprint: await jwkThumbprint(publicKey),
+                receiverFingerprint: group.generation,
+                purpose: expected.purpose,
+                group,
+            },
+        };
+    }
+    async openReceive(expected) {
+        const { header } = await this.stream(expected);
+        await this.replay.openContext(header.contextID);
+        await this.replay.initialize(header, 'receive');
+    }
+    async seal(id, value, options) {
+        const bytes = bytesSnapshot(value, V2_LIMITS.plaintextBytes);
+        options = groupOptions(options, true);
+        const contextID = options.contextID;
+        scalarString(contextID);
+        const active = await this.active(id);
+        if (!active)
+            throw engineError(
+                'explicitly activate a group epoch first',
+                'GROUP_EPOCH_NOT_ACTIVE'
+            );
+        const { record, header: base } = await this.stream({
+            ...active,
+            sender: this.localID,
+            contextID,
+            purpose: options?.purpose,
+        });
+        const metadata = {
+            ...base,
+            salt: encodeBase64url(crypto.getRandomValues(new Uint8Array(32))),
+        };
+        const key = await deriveGroupAES(record.key, metadata);
+        const sequence = await this.replay.reserve(metadata);
+        const template = headerSnapshot({
+            ...metadata,
+            sequence,
+            iv: encodeBase64url(new Uint8Array(12)),
+        });
+        await this.keys.reserveUsage(
+            await usageIdentity(template.salt, encodeGroupInfo(template)),
+            bytes.length,
+            encodeEnvelopeAAD(template).length
+        );
+        const header = headerSnapshot({
+            ...template,
+            iv: encodeBase64url(crypto.getRandomValues(new Uint8Array(12))),
+        });
+        return { header, ciphertext: await sealBytes(key, header, bytes) };
+    }
+    async open(value, expected) {
+        const packet = envelopeSnapshot(value);
+        // Copy expectations before storage or crypto yields.
+        expected = expected && {
+            sender: expected.sender,
+            contextID: expected.contextID,
+            purpose: expected.purpose,
+            groupID: expected.groupID,
+            epoch: expected.epoch,
+            generation: expected.generation,
+        };
+        const h = packet.header;
+        if (
+            h.suite !== GROUP_SUITE ||
+            !h.group ||
+            h.sender !== expected?.sender ||
+            h.contextID !== expected?.contextID ||
+            h.purpose !== expected?.purpose ||
+            h.group.groupID !== expected?.groupID ||
+            h.group.epoch !== expected?.epoch ||
+            h.group.generation !== expected?.generation
+        ) {
+            throw engineError(
+                'group envelope differs from independent expectations',
+                'ENVELOPE_EXPECTATION_MISMATCH'
+            );
+        }
+        const { record, header } = await this.stream(expected);
+        if (
+            header.senderFingerprint !== h.senderFingerprint ||
+            header.receiverFingerprint !== h.receiverFingerprint
+        )
+            throw engineError(
+                'group key generation or sender fingerprint mismatch',
+                'DERIVATION_KEY_MISMATCH'
+            );
+        const key = await deriveGroupAES(record.key, h);
+        return { header: h, bytes: await openBytes(key, packet) };
+    }
+}
+
+/* global BigInt */
+
+const REPLAY_WINDOW = 128;
+const MASK = (1n << 128n) - 1n;
+const emptyBitmap = '0'.repeat(32);
+async function streamIdentity(header) {
+    const g = header.group;
+    const fields = [
+        header.suite,
+        header.contextID,
+        header.sender,
+        header.receiver,
+        header.senderFingerprint,
+        header.receiverFingerprint,
+        header.purpose,
+        g?.groupID || '',
+        g?.epoch || '',
+        g?.generation || '',
+    ];
+    const bytes = encodeFields(
+        'BE8-REPLAY-STREAM',
+        fields.map((value) => new TextEncoder().encode(value))
+    );
+    return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
+}
+function contextRecord(record) {
+    if (!record)
+        throw engineError(
+            'explicitly open the local context first',
+            'CONTEXT_NOT_OPEN'
+        );
+    if (record.status === 'closed')
+        throw engineError(
+            'context is permanently closed; use a fresh context ID',
+            'CONTEXT_CLOSED'
+        );
+    if (
+        record.status !== 'open' ||
+        !Array.isArray(record.streams) ||
+        record.streams.length > 1024 ||
+        !record.streams.every(
+            (entry) =>
+                entry &&
+                typeof entry.streamID === 'string' &&
+                /^[A-Za-z0-9_-]{43}$/.test(entry.streamID) &&
+                ['send', 'receive'].includes(entry.direction)
+        )
+    )
+        throw engineError('invalid context state', 'STATE_LOST');
+    return record;
+}
+class Replay {
+    constructor(keys) {
+        this.keys = keys;
+    }
+    async openContext(contextID) {
+        scalarString(contextID);
+        return this.keys.run([STORES.contexts], 'readwrite', (tx) => {
+            const store = tx.objectStore(STORES.contexts);
+            return requestResult(
+                store.get([this.keys.namespace, contextID]),
+                (current) => {
+                    if (current) {
+                        contextRecord(current);
+                        return { contextID, status: 'open' };
+                    }
+                    return requestResult(
+                        store.add({
+                            namespace: this.keys.namespace,
+                            contextID,
+                            status: 'open',
+                            streams: [],
+                        }),
+                        () => ({ contextID, status: 'open' })
+                    );
+                }
+            );
+        });
+    }
+    async closeContext(contextID) {
+        scalarString(contextID);
+        return this.keys.run([STORES.contexts], 'readwrite', (tx) => {
+            const store = tx.objectStore(STORES.contexts);
+            return requestResult(
+                store.get([this.keys.namespace, contextID]),
+                (record) => {
+                    if (!record)
+                        throw engineError(
+                            'context is not open',
+                            'CONTEXT_NOT_OPEN'
+                        );
+                    if (record.status === 'closed') return;
+                    contextRecord(record);
+                    return requestResult(
+                        store.put({ ...record, status: 'closed' })
+                    );
+                }
+            );
+        });
+    }
+    async initialize(header, direction) {
+        const streamID = await streamIdentity(header);
+        const name =
+            direction === 'send' ? STORES.sendState : STORES.receiveState;
+        return this.keys.run([STORES.contexts, name], 'readwrite', (tx) => {
+            const contexts = tx.objectStore(STORES.contexts);
+            const states = tx.objectStore(name);
+            return requestResult(
+                contexts.get([this.keys.namespace, header.contextID]),
+                (value) => {
+                    const context = contextRecord(value);
+                    const known = context.streams.some(
+                        (entry) =>
+                            entry.streamID === streamID &&
+                            entry.direction === direction
+                    );
+                    return requestResult(
+                        states.get([
+                            this.keys.namespace,
+                            header.contextID,
+                            streamID,
+                        ]),
+                        (state) => {
+                            if (known) {
+                                if (!state)
+                                    throw engineError(
+                                        'registered stream state is missing; no reset is allowed',
+                                        'STATE_LOST'
+                                    );
+                                return streamID;
+                            }
+                            if (state || context.streams.length >= 1024)
+                                throw engineError(
+                                    'inconsistent or exhausted context state',
+                                    'STATE_LOST'
+                                );
+                            const base = {
+                                namespace: this.keys.namespace,
+                                contextID: header.contextID,
+                                streamID,
+                            };
+                            states.add(
+                                direction === 'send'
+                                    ? { ...base, last: '0' }
+                                    : {
+                                          ...base,
+                                          highest: '0',
+                                          bitmap: emptyBitmap,
+                                      }
+                            );
+                            return requestResult(
+                                contexts.put({
+                                    ...context,
+                                    streams: [
+                                        ...context.streams,
+                                        { streamID, direction },
+                                    ],
+                                }),
+                                () => streamID
+                            );
+                        }
+                    );
+                }
+            );
+        });
+    }
+    async reserve(header) {
+        const streamID = await this.initialize(header, 'send');
+        return this.keys.run(
+            [STORES.contexts, STORES.sendState],
+            'readwrite',
+            (tx) =>
+                requestResult(
+                    tx
+                        .objectStore(STORES.contexts)
+                        .get([this.keys.namespace, header.contextID]),
+                    (context) => {
+                        contextRecord(context);
+                        const store = tx.objectStore(STORES.sendState);
+                        return requestResult(
+                            store.get([
+                                this.keys.namespace,
+                                header.contextID,
+                                streamID,
+                            ]),
+                            (record) => {
+                                if (!record)
+                                    throw engineError(
+                                        'send counter is missing',
+                                        'STATE_LOST'
+                                    );
+                                const last = sequenceValue(record.last);
+                                if (last === MAX_SEQUENCE)
+                                    throw engineError(
+                                        'uint64 send counter exhausted',
+                                        'COUNTER_EXHAUSTED'
+                                    );
+                                const sequence = String(last + 1n);
+                                return requestResult(
+                                    store.put({ ...record, last: sequence }),
+                                    () => sequence
+                                );
+                            }
+                        );
+                    }
+                )
+        );
+    }
+    async accept(header) {
+        const streamID = await streamIdentity(header);
+        return this.keys.run(
+            [STORES.contexts, STORES.receiveState],
+            'readwrite',
+            (tx) =>
+                requestResult(
+                    tx
+                        .objectStore(STORES.contexts)
+                        .get([this.keys.namespace, header.contextID]),
+                    (value) => {
+                        const context = contextRecord(value);
+                        if (
+                            !context.streams.some(
+                                (entry) =>
+                                    entry.streamID === streamID &&
+                                    entry.direction === 'receive'
+                            )
+                        )
+                            throw engineError(
+                                'explicitly initialize expected receive stream first',
+                                'STREAM_NOT_OPEN'
+                            );
+                        const store = tx.objectStore(STORES.receiveState);
+                        return requestResult(
+                            store.get([
+                                this.keys.namespace,
+                                header.contextID,
+                                streamID,
+                            ]),
+                            (record) => {
+                                if (
+                                    !record ||
+                                    typeof record.bitmap !== 'string' ||
+                                    !/^[0-9a-f]{32}$/.test(record.bitmap)
+                                )
+                                    throw engineError(
+                                        'receive state is missing or invalid',
+                                        'STATE_LOST'
+                                    );
+                                let highest = sequenceValue(record.highest);
+                                let bitmap = BigInt('0x' + record.bitmap);
+                                if (
+                                    (highest < 128n &&
+                                        bitmap >> highest !== 0n) ||
+                                    (highest > 0n && !(bitmap & 1n))
+                                )
+                                    throw engineError(
+                                        'invalid receive window',
+                                        'STATE_LOST'
+                                    );
+                                const sequence = sequenceValue(header.sequence);
+                                if (sequence > highest) {
+                                    const distance = sequence - highest;
+                                    bitmap =
+                                        distance >= 128n
+                                            ? 1n
+                                            : ((bitmap << distance) | 1n) &
+                                              MASK;
+                                    highest = sequence;
+                                } else {
+                                    const distance = highest - sequence;
+                                    if (distance >= 128n)
+                                        throw engineError(
+                                            'sequence is outside the replay window',
+                                            'REPLAY_TOO_OLD'
+                                        );
+                                    const bit = 1n << distance;
+                                    if (bitmap & bit)
+                                        throw engineError(
+                                            'sequence was already accepted',
+                                            'REPLAY_DUPLICATE'
+                                        );
+                                    bitmap |= bit;
+                                }
+                                return requestResult(
+                                    store.put({
+                                        ...record,
+                                        highest: String(highest),
+                                        bitmap: bitmap
+                                            .toString(16)
+                                            .padStart(32, '0'),
+                                    })
+                                );
+                            }
+                        );
+                    }
+                )
+        );
+    }
 }
 
 class Be8 {
@@ -2268,16 +3632,68 @@ class Be8 {
     static STORES = STORES;
     static jwkThumbprint = jwkThumbprint;
     static V2_SUITE = V2_SUITE;
+    static GROUP_SUITE = GROUP_SUITE;
     static encodeV2DerivationInfo = encodeV2DerivationInfo;
     static encodeBase64url = encodeBase64url;
     static decodeBase64url = decodeBase64url;
     static V2_LIMITS = V2_LIMITS;
+    static encodeEnvelopeAAD = encodeEnvelopeAAD;
+    static REPLAY_WINDOW = REPLAY_WINDOW;
 
     #keys;
+    #envelopes;
+    #replay;
+    #groups;
     #accID;
     #setupPromise;
     #references = new WeakMap();
     #derivedKeys = new WeakMap();
+    #generation = {};
+    #guarded = new WeakMap();
+    #panicPromise;
+    #reinitializePromise;
+
+    #invalidateLocal() {
+        this.#generation = {};
+        this.#references = new WeakMap();
+        this.#derivedKeys = new WeakMap();
+        this.#guarded = new WeakMap();
+        this.#setupPromise = undefined;
+    }
+    #guard(method, args) {
+        const generation = this.#generation;
+        let original;
+        try {
+            this.#keys.assertActive();
+            original = method.apply(this, args);
+        } catch (error) {
+            return Promise.reject(error);
+        }
+        if (this.#guarded.has(original)) return this.#guarded.get(original);
+        const guarded = Promise.resolve(original).then(async (result) => {
+            try {
+                this.#keys.assertActive();
+                if (generation !== this.#generation)
+                    throw engineError(
+                        'operation generation invalidated',
+                        'ENGINE_LOCKED'
+                    );
+                await this.#keys.checkLifecycle();
+                this.#keys.assertActive();
+                if (generation !== this.#generation)
+                    throw engineError(
+                        'operation generation invalidated',
+                        'ENGINE_LOCKED'
+                    );
+                return result;
+            } catch (error) {
+                if (result instanceof Uint8Array) result.fill(0);
+                throw error;
+            }
+        });
+        this.#guarded.set(original, guarded);
+        return guarded;
+    }
 
     constructor(accID, indexedDB, { namespace = accID } = {}) {
         this.#accID = accountID(accID);
@@ -2288,6 +3704,29 @@ class Be8 {
                 'DATABASE_NOT_READY'
             );
         this.#keys = new KeyStore(indexedDB, accID, namespace);
+        this.#replay = new Replay(this.#keys);
+        this.#envelopes = new Envelopes(this.#keys, this.#accID, this.#replay);
+        this.#groups = new Groups(
+            this.#keys,
+            this.#envelopes,
+            this.#replay,
+            this.#accID
+        );
+        this.#keys.onLock = () => this.#invalidateLocal();
+        // Guard every public async operation, including raw AES/archive/getters.
+        // Invoke synchronously so each method snapshots caller inputs before yields.
+        for (const name of Object.getOwnPropertyNames(Be8.prototype)) {
+            if (
+                ['constructor', 'getAccID', 'panic', 'reinitialize'].includes(
+                    name
+                )
+            )
+                continue;
+            const method = Be8.prototype[name];
+            Object.defineProperty(this, name, {
+                value: (...args) => this.#guard(method, args),
+            });
+        }
     }
 
     setup(options = {}) {
@@ -2328,6 +3767,7 @@ class Be8 {
 
     // References carry no key material and are usable only by this instance.
     #publicResult(publicKey, endpoint) {
+        this.#keys.assertActive();
         const keyReference = Object.freeze({});
         this.#references.set(keyReference, {
             endpoint,
@@ -2354,12 +3794,11 @@ class Be8 {
     async hasKey(id) {
         const type = getTypeOfKey(id);
         if (type === 'channel') return false;
-        if (type === 'group') {
-            const [group, version, extra] = id.split(':');
-            if (extra !== undefined)
-                throw engineError('invalid group identifier', 'INVALID_GROUP');
-            return !!(await this.#keys.groupKey(group, version));
-        }
+        if (type === 'group')
+            throw engineError(
+                'use hasLegacyGroupKey() for retained ECDH group records',
+                'LEGACY_GROUP_API'
+            );
         accountID(id);
         return id === this.#accID && !!(await this.#keys.identity());
     }
@@ -2391,7 +3830,14 @@ class Be8 {
         return this.#keys.replacePublicKey(id, publicKey, confirmation);
     }
 
-    async addGroupKeys(group, groupKeys, options = {}) {
+    async addGroupKeys() {
+        throw engineError(
+            'use symmetric group epochs or explicitly addLegacyGroupKeys for retained ECDH data',
+            'LEGACY_GROUP_API'
+        );
+    }
+
+    async addLegacyGroupKeys(group, groupKeys, options = {}) {
         if (!Array.isArray(groupKeys) || !groupKeys.length) {
             throw engineError(
                 'group keys must be a nonempty array',
@@ -2407,31 +3853,108 @@ class Be8 {
     async getCachedKeys() {
         return this.#keys.publicKeys();
     }
-    async getCachedGroupKeys() {
+    async getCachedLegacyGroupKeys() {
         return this.#keys.groupKeys();
     }
 
-    async getCachedGroupVersions(group) {
+    async getCachedLegacyGroupVersions(group) {
         groupID(group);
-        const keys = await this.getCachedGroupKeys();
+        const keys = await this.getCachedLegacyGroupKeys();
         return keys
             .filter((key) => key.groupID === group)
             .map((key) => key.version)
             .sort((a, b) => b - a);
     }
 
-    async generateGroupKeys(version, group) {
-        const v = groupVersion(version);
-        const id = groupID(group);
-        let pair = await this.#keys.groupKey(id, v);
-        if (pair && !pair[1])
+    async generateGroupKeys() {
+        throw engineError(
+            'new groups require createGroupEpoch()',
+            'LEGACY_GROUP_API'
+        );
+    }
+
+    async hasLegacyGroupKey(group, version) {
+        return !!(await this.#keys.groupKey(group, version));
+    }
+
+    async getLegacyGroupKeyReference(group, version) {
+        const id = groupID(group),
+            v = groupVersion(version);
+        const pair = await this.#keys.groupKey(id, v);
+        if (!pair || !pair[1])
             throw engineError(
-                'existing group key has no private half',
-                'GROUP_CONFLICT'
+                'retained legacy private group key is missing',
+                'INVALID_PRIVATE_KEY'
             );
-        if (!pair)
-            pair = await this.#keys.createGroup(id, v, await generatePair());
         return this.#publicResult(pair[0], id + ':' + v);
+    }
+
+    async createGroupEpoch(group, epoch, recipients, options) {
+        return this.#groups.create(group, epoch, recipients, options);
+    }
+    async importGroupEpoch(envelope, expected) {
+        return this.#groups.import(envelope, expected);
+    }
+    async activateGroupEpoch(group, epoch, options) {
+        return this.#groups.activate(group, epoch, options);
+    }
+    async getGroupEpochs(group) {
+        return this.#groups.epochs(group);
+    }
+    async getActiveGroupEpoch(group) {
+        return this.#groups.active(group);
+    }
+    async encryptGroupEnvelope(group, bytes, options) {
+        return this.#groups.seal(group, bytes, options);
+    }
+    async decryptGroupEnvelope(envelope, expected) {
+        return (await this.#groups.open(envelope, expected)).bytes;
+    }
+    async encryptGroupText(group, text, options) {
+        return this.#groups.seal(group, encodeText(text), {
+            ...groupOptions(options),
+            purpose: 'data',
+        });
+    }
+    async encryptGroupImage(group, image, options) {
+        return this.#groups.seal(group, encodeText(image), {
+            ...groupOptions(options),
+            purpose: 'attachment',
+        });
+    }
+    async decryptGroupText(envelope, expected) {
+        if (expected?.purpose !== 'data')
+            throw engineError('text purpose required', 'INVALID_PURPOSE');
+        return decodeText((await this.#groups.open(envelope, expected)).bytes);
+    }
+    async decryptGroupImage(envelope, expected) {
+        if (expected?.purpose !== 'attachment')
+            throw engineError('attachment purpose required', 'INVALID_PURPOSE');
+        return decodeText((await this.#groups.open(envelope, expected)).bytes);
+    }
+    async openReceiveGroupContext(expected) {
+        return this.#groups.openReceive(expected);
+    }
+    async receiveGroupEnvelope(envelope, expected) {
+        const result = await this.#groups.open(envelope, expected);
+        await this.#replay.accept(result.header);
+        return result.bytes;
+    }
+    async receiveGroupText(envelope, expected) {
+        if (expected?.purpose !== 'data')
+            throw engineError('text purpose required', 'INVALID_PURPOSE');
+        const result = await this.#groups.open(envelope, expected);
+        const text = decodeText(result.bytes);
+        await this.#replay.accept(result.header);
+        return text;
+    }
+    async receiveGroupImage(envelope, expected) {
+        if (expected?.purpose !== 'attachment')
+            throw engineError('attachment purpose required', 'INVALID_PURPOSE');
+        const result = await this.#groups.open(envelope, expected);
+        const text = decodeText(result.bytes);
+        await this.#replay.accept(result.header);
+        return text;
     }
 
     // Idempotent: never returns a private JWK or a private CryptoKey.
@@ -2440,7 +3963,7 @@ class Be8 {
         return this.#publicResult(publicKey, this.#accID);
     }
 
-    async #localPair(keyReference) {
+    async #localPair(keyReference, legacy = false) {
         if (!keyReference)
             throw engineError(
                 'no private key passed to getDerivedKey',
@@ -2456,6 +3979,11 @@ class Be8 {
                 'INVALID_LOCAL_REFERENCE'
             );
         }
+        if (reference.endpoint.startsWith('g') && !legacy)
+            throw engineError(
+                'ECDH group references are legacy-only',
+                'LEGACY_GROUP_API'
+            );
         const keys = await this.#keys.endpointKeys(
             reference.endpoint,
             reference.endpoint
@@ -2490,6 +4018,16 @@ class Be8 {
             receiver: options.receiver,
             purpose: options.purpose,
         };
+        if (
+            (typeof copied?.sender === 'string' &&
+                copied.sender.startsWith('g')) ||
+            (typeof copied?.receiver === 'string' &&
+                copied.receiver.startsWith('g'))
+        )
+            throw engineError(
+                'ECDH group endpoints are legacy-only',
+                'LEGACY_GROUP_API'
+            );
         const local = await this.#localPair(keyReference);
         const derivation = await createV2Metadata(
             local.endpoint,
@@ -2517,6 +4055,14 @@ class Be8 {
         publicKey = keySnapshot(publicKey);
         // Copy transferred metadata synchronously, before storage or crypto yields.
         const context = metadata ? derivationSnapshot(metadata) : undefined;
+        if (
+            context?.sender.startsWith('g') ||
+            context?.receiver.startsWith('g')
+        )
+            throw engineError(
+                'ECDH group contexts require an explicit legacy reader',
+                'LEGACY_GROUP_API'
+            );
         const local = await this.#localPair(keyReference);
         const key = await deriveV2AES(
             local.endpoint,
@@ -2538,89 +4084,30 @@ class Be8 {
             );
         publicKey = keySnapshot(publicKey);
         if (this.#references.has(privateKey))
-            privateKey = (await this.#localPair(privateKey)).privateKey;
+            privateKey = (await this.#localPair(privateKey, true)).privateKey;
+        await this.#keys.checkLifecycle();
         return deriveLegacyAES(publicKey, privateKey);
     }
 
-    async #simpleDerivation(
-        sender,
-        receiver,
-        sending,
-        purpose,
-        metadata,
-        options = {}
-    ) {
-        const localID = sending ? sender : receiver;
-        const peerID = sending ? receiver : sender;
-        const context =
-            !sending && metadata ? derivationSnapshot(metadata) : undefined;
-        if (
-            !options ||
-            typeof options !== 'object' ||
-            Array.isArray(options) ||
-            Reflect.ownKeys(options).some((field) => field !== 'contextID')
-        ) {
-            throw engineError(
-                'convenience options allow only contextID, never a custom IV or key alias',
-                'INVALID_OPTIONS'
-            );
-        }
-        const contextID = options.contextID;
-        const [publicKey, privateKey, ownPublic] =
-            await this.#keys.endpointKeys(peerID, localID, true);
-        if (!publicKey)
-            throw engineError(
-                'Missing public key for selected peer',
-                'INVALID_KEY'
-            );
-        if (!privateKey)
-            throw engineError(
-                'Missing private key for local endpoint',
-                'INVALID_PRIVATE_KEY'
-            );
-        let derivation;
-        if (sending) {
-            derivation = await createV2Metadata(localID, ownPublic, publicKey, {
-                contextID:
-                    contextID === undefined ? crypto.randomUUID() : contextID,
-                sender,
-                receiver,
-                purpose,
-            });
-        } else {
-            derivation = derivationSnapshot(context);
-            if (
-                derivation.sender !== sender ||
-                derivation.receiver !== receiver ||
-                derivation.purpose !== purpose ||
-                (contextID !== undefined && derivation.contextID !== contextID)
-            ) {
-                throw engineError(
-                    'v2 context does not match this operation',
-                    'INVALID_DERIVATION_CONTEXT'
-                );
-            }
-        }
-        const key = await deriveV2AES(
-            localID,
-            ownPublic,
-            publicKey,
-            privateKey,
-            derivation
-        );
-        await this.#trackDerivedKey(key, localID, derivation);
-        return { key, derivation };
-    }
-
     async #trackDerivedKey(key, localID, derivation) {
+        const generation = this.#generation;
+        const derivationID = await derivationUsageID(derivation);
+        await this.#keys.checkLifecycle();
+        this.#keys.assertActive();
+        if (generation !== this.#generation)
+            throw engineError(
+                'derived key generation invalidated',
+                'ENGINE_LOCKED'
+            );
         this.#derivedKeys.set(key, {
-            derivationID: await derivationUsageID(derivation),
+            derivationID,
             sending: localID === derivation.sender,
         });
     }
 
     async #encryptBytes(key, bytes) {
         requireAES(key, 'encrypt');
+        await this.#keys.checkLifecycle();
         const registered = this.#derivedKeys.get(key);
         if (registered) {
             if (!registered.sending)
@@ -2649,6 +4136,7 @@ class Be8 {
     async decryptBytes(key, ciphertext, iv) {
         requireAES(key, 'decrypt');
         const payload = payloadSnapshot(ciphertext, iv);
+        await this.#keys.checkLifecycle();
         return new Uint8Array(await decryptPayload(key, payload));
     }
 
@@ -2660,6 +4148,7 @@ class Be8 {
     async decryptText(key, ciphertext, iv) {
         requireAES(key, 'decrypt');
         const payload = payloadSnapshot(ciphertext, iv);
+        await this.#keys.checkLifecycle();
         return decodeText(await decryptPayload(key, payload));
     }
 
@@ -2673,23 +4162,233 @@ class Be8 {
         return this.decryptText(key, cipherImage, iv);
     }
 
-    async encryptTextSimple(sender, receiver, text = '', options = {}) {
-        const bytes = encodeText(text);
-        const context = await this.#simpleDerivation(
-            sender,
-            receiver,
-            true,
-            'data',
-            undefined,
-            options
-        );
-        return {
-            ...(await this.#encryptBytes(context.key, bytes)),
-            derivation: context.derivation,
-        };
+    #simpleOptions(options = {}) {
+        if (
+            !options ||
+            typeof options !== 'object' ||
+            Array.isArray(options) ||
+            Reflect.ownKeys(options).some((field) => field !== 'contextID')
+        )
+            throw engineError(
+                'only contextID is an allowed convenience option',
+                'INVALID_OPTIONS'
+            );
+        return { contextID: options.contextID };
     }
 
-    async decryptTextSimple(
+    async openContext(contextID) {
+        return this.#replay.openContext(contextID);
+    }
+    async closeContext(contextID) {
+        return this.#replay.closeContext(contextID);
+    }
+    async openReceiveContext(expected) {
+        if (
+            !expected ||
+            expected.receiver !== this.#accID ||
+            !['data', 'attachment'].includes(expected.purpose)
+        )
+            throw engineError(
+                'independent receive expectations required',
+                'ENVELOPE_EXPECTATION_REQUIRED'
+            );
+        expected = {
+            sender: expected.sender,
+            receiver: expected.receiver,
+            contextID: expected.contextID,
+            purpose: expected.purpose,
+        };
+        const [peer, privateKey, own] = await this.#keys.endpointKeys(
+            expected.sender,
+            expected.receiver,
+            true
+        );
+        if (!peer || !privateKey)
+            throw engineError(
+                'receive endpoint keys are missing',
+                'INVALID_KEY'
+            );
+        const metadata = {
+            version: 2,
+            suite: V2_SUITE,
+            ...expected,
+            senderFingerprint: await jwkThumbprint(peer),
+            receiverFingerprint: await jwkThumbprint(own),
+            group: null,
+        };
+        await this.#replay.openContext(expected.contextID);
+        await this.#replay.initialize(metadata, 'receive');
+    }
+    async receiveEnvelope(envelope, expected) {
+        if (!expected || !['data', 'attachment'].includes(expected.purpose))
+            throw engineError(
+                'data receive expectations required',
+                'ENVELOPE_EXPECTATION_REQUIRED'
+            );
+        const opened = await this.#envelopes.open(envelope, expected);
+        await this.#replay.accept(opened.header);
+        return opened.bytes;
+    }
+    async receiveText(envelope, expected) {
+        if (expected?.purpose !== 'data')
+            throw engineError('text purpose expected', 'INVALID_PURPOSE');
+        const opened = await this.#envelopes.open(envelope, expected);
+        const result = decodeText(opened.bytes);
+        await this.#replay.accept(opened.header);
+        return result;
+    }
+    async receiveImage(envelope, expected) {
+        if (expected?.purpose !== 'attachment')
+            throw engineError('attachment purpose expected', 'INVALID_PURPOSE');
+        const opened = await this.#envelopes.open(envelope, expected);
+        const result = decodeText(opened.bytes);
+        await this.#replay.accept(opened.header);
+        return result;
+    }
+
+    async encryptEnvelope(sender, receiver, bytes, options) {
+        if (
+            options &&
+            (typeof options !== 'object' ||
+                Array.isArray(options) ||
+                Reflect.ownKeys(options).some(
+                    (field) => !['contextID', 'purpose'].includes(field)
+                ))
+        )
+            throw engineError(
+                'envelope options allow only contextID and purpose',
+                'INVALID_OPTIONS'
+            );
+        if (!options || !['data', 'attachment'].includes(options.purpose))
+            throw engineError('invalid envelope purpose', 'INVALID_PURPOSE');
+        return this.#envelopes.seal(sender, receiver, bytes, {
+            contextID: options.contextID,
+            purpose: options.purpose,
+        });
+    }
+
+    async decryptEnvelope(envelope, expected) {
+        if (!expected || !['data', 'attachment'].includes(expected.purpose))
+            throw engineError(
+                'independent data envelope expectations required',
+                'ENVELOPE_EXPECTATION_REQUIRED'
+            );
+        return (await this.#envelopes.open(envelope, expected)).bytes;
+    }
+
+    async encryptTextSimple(sender, receiver, text = '', options = {}) {
+        const bytes = encodeText(text);
+        const supplied = this.#simpleOptions(options).contextID;
+        const contextID = supplied ?? crypto.randomUUID();
+        if (supplied === undefined) await this.openContext(contextID);
+        return this.encryptEnvelope(sender, receiver, bytes, {
+            contextID,
+            purpose: 'data',
+        });
+    }
+
+    async decryptTextSimple(sender, receiver, envelope, options = {}) {
+        const copied = envelopeSnapshot(envelope);
+        const contextID =
+            this.#simpleOptions(options).contextID ?? copied.header.contextID;
+        return decodeText(
+            await this.decryptEnvelope(
+                { header: copied.header, ciphertext: copied.ciphertext },
+                { sender, receiver, contextID, purpose: 'data' }
+            )
+        );
+    }
+
+    async encryptImageSimple(sender, receiver, image, options = {}) {
+        const bytes = encodeText(image);
+        const supplied = this.#simpleOptions(options).contextID;
+        const contextID = supplied ?? crypto.randomUUID();
+        if (supplied === undefined) await this.openContext(contextID);
+        return this.encryptEnvelope(sender, receiver, bytes, {
+            contextID,
+            purpose: 'attachment',
+        });
+    }
+
+    async decryptImageSimple(sender, receiver, envelope, options = {}) {
+        const copied = envelopeSnapshot(envelope);
+        const contextID =
+            this.#simpleOptions(options).contextID ?? copied.header.contextID;
+        return decodeText(
+            await this.decryptEnvelope(
+                { header: copied.header, ciphertext: copied.ciphertext },
+                { sender, receiver, contextID, purpose: 'attachment' }
+            )
+        );
+    }
+
+    // Explicit read path for retained pre-envelope HKDF packets. No fallback;
+    // historical UUID encoding is selected by a separate local option.
+    async #unframedLegacy(
+        sender,
+        receiver,
+        ciphertext,
+        iv,
+        derivation,
+        purpose,
+        options = {}
+    ) {
+        if (
+            !options ||
+            typeof options !== 'object' ||
+            Array.isArray(options) ||
+            Reflect.ownKeys(options).some(
+                (field) => !['contextID', 'legacyUUID'].includes(field)
+            ) ||
+            (options.legacyUUID !== undefined &&
+                typeof options.legacyUUID !== 'boolean')
+        )
+            throw engineError(
+                'invalid explicit legacy read options',
+                'INVALID_OPTIONS'
+            );
+        const contextID = options.contextID;
+        const payload = payloadSnapshot(
+            ciphertext,
+            iv,
+            options.legacyUUID === true
+        );
+        const metadata = derivationSnapshot(derivation);
+        if (
+            metadata.sender !== sender ||
+            metadata.receiver !== receiver ||
+            metadata.purpose !== purpose ||
+            (contextID !== undefined && metadata.contextID !== contextID)
+        )
+            throw engineError(
+                'legacy HKDF context mismatch',
+                'INVALID_DERIVATION_CONTEXT'
+            );
+        const [peer, privateKey, own] = await this.#keys.endpointKeys(
+            sender,
+            receiver,
+            true
+        );
+        if (!peer)
+            throw engineError(
+                'Missing public key for selected peer',
+                'INVALID_KEY'
+            );
+        if (!privateKey)
+            throw engineError(
+                'Missing private key for local endpoint',
+                'INVALID_PRIVATE_KEY'
+            );
+        const key = await deriveV2AES(
+            receiver,
+            own,
+            peer,
+            privateKey,
+            metadata
+        );
+        return decodeText(await decryptPayload(key, payload));
+    }
+    async decryptTextUnframedLegacy(
         sender,
         receiver,
         ciphertext,
@@ -2697,59 +4396,39 @@ class Be8 {
         derivation,
         options = {}
     ) {
-        const payload = payloadSnapshot(ciphertext, iv);
-        const context = await this.#simpleDerivation(
+        return this.#unframedLegacy(
             sender,
             receiver,
-            false,
-            'data',
+            ciphertext,
+            iv,
             derivation,
+            'data',
             options
         );
-        return decodeText(await decryptPayload(context.key, payload));
     }
-
-    async encryptImageSimple(sender, receiver, base64Image, options = {}) {
-        const bytes = encodeText(base64Image);
-        const context = await this.#simpleDerivation(
-            sender,
-            receiver,
-            true,
-            'attachment',
-            undefined,
-            options
-        );
-        const packet = await this.#encryptBytes(context.key, bytes);
-        return {
-            cipherImage: packet.cipherText,
-            iv: packet.iv,
-            derivation: context.derivation,
-        };
-    }
-
-    async decryptImageSimple(
+    async decryptImageUnframedLegacy(
         sender,
         receiver,
-        cipherImage,
+        ciphertext,
         iv,
         derivation,
         options = {}
     ) {
-        const payload = payloadSnapshot(cipherImage, iv);
-        const context = await this.#simpleDerivation(
+        return this.#unframedLegacy(
             sender,
             receiver,
-            false,
-            'attachment',
+            ciphertext,
+            iv,
             derivation,
+            'attachment',
             options
         );
-        return decodeText(await decryptPayload(context.key, payload));
     }
 
     async decryptTextLegacy(key, ciphertext, iv) {
         requireAES(key, 'decrypt');
         const payload = payloadSnapshot(ciphertext, iv, true);
+        await this.#keys.checkLifecycle();
         return decodeText(await decryptPayload(key, payload));
     }
 
@@ -2786,18 +4465,63 @@ class Be8 {
         return this.#legacySimple(sender, receiver, cipherImage, iv);
     }
 
-    async panic() {
-        await this.#keys.clear();
+    panic() {
+        // Synchronous lock even if opening/deleting the database subsequently fails.
+        this.#keys.lock();
+        if (this.#panicPromise) return this.#panicPromise;
+        const pending = this.#keys.invalidate();
+        this.#panicPromise = pending;
+        pending.catch(() => {
+            if (this.#panicPromise === pending) this.#panicPromise = undefined;
+        });
+        return pending;
+    }
+    reinitialize() {
+        if (this.#reinitializePromise) return this.#reinitializePromise;
+        const pending = this.#reinitialize();
+        this.#reinitializePromise = pending;
+        const reset = () => {
+            if (this.#reinitializePromise === pending)
+                this.#reinitializePromise = undefined;
+        };
+        pending.then(reset, reset);
+        return pending;
+    }
+    async #reinitialize() {
+        this.#keys.lock();
+        const generation = this.#generation;
+        if (this.#panicPromise) await this.#panicPromise;
+        const previous = await this.#keys.reinitializationState();
+        const candidate = await generatePair();
+        const next = await this.#keys.reinitialize(
+            candidate,
+            previous,
+            () => generation === this.#generation
+        );
+        if (generation !== this.#generation)
+            throw engineError('reinitialization invalidated', 'ENGINE_LOCKED');
+        this.#keys.resume(next);
+        this.#panicPromise = undefined;
+        try {
+            await this.#keys.checkLifecycle();
+            return await this.getCachedKeys();
+        } catch (error) {
+            this.#keys.lock();
+            throw error;
+        }
     }
 }
 
 export {
+    GROUP_SUITE,
+    REPLAY_WINDOW,
     STORES,
     V2_LIMITS,
     V2_SUITE,
     decodeBase64url,
     Be8 as default,
     encodeBase64url,
+    encodeEnvelopeAAD,
     encodeV2DerivationInfo,
     jwkThumbprint,
     upgradeBe8Schema,

@@ -40,10 +40,10 @@ QUnit.module('Basics / isolated persistence', hooks => {
         assert.true(await reopened.engine.hasGeneratedKeys(), 'setup restores both keys');
         assert.true(JSON.stringify(reopened.publicKey) === JSON.stringify(publicBefore), 'The persisted public key is unchanged');
         assert.deepEqual(await storedIDs(reopened.database), [bob.id], 'Only the recipient private key is restored');
-        assert.true(await reopened.engine.decryptTextSimple(alice.id, bob.id, packet.cipherText, packet.iv, packet.derivation) === 'Before reopening',
+        assert.true(await reopened.engine.decryptTextSimple(alice.id, bob.id, packet) === 'Before reopening',
             'A restored receiver decrypts a packet encrypted before close');
         const response = await reopened.engine.encryptTextSimple(bob.id, alice.id, 'After reopening');
-        assert.true(await alice.engine.decryptTextSimple(bob.id, alice.id, response.cipherText, response.iv, response.derivation) === 'After reopening',
+        assert.true(await alice.engine.decryptTextSimple(bob.id, alice.id, response) === 'After reopening',
             'The restored receiver also encrypts a response');
     });
 

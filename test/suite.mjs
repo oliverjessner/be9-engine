@@ -32,4 +32,7 @@ await import('./key-protection.mjs');
 await import('./trust.mjs');
 await import('./v2.mjs');
 await import('./encoding.mjs');
+await import('./envelope.mjs');
+await import('./replay.mjs');
+await import('./panic.mjs');
 QUnit.start();

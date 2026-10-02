@@ -5,7 +5,10 @@ let server;
 let browser;
 let phase = 'server startup';
 try {
-    server = await createTestServer();
+    const args = process.argv.slice(2);
+    if (args.length && (args.length !== 2 || args[0] !== '--bundle' || !['source', 'esm', 'iife'].includes(args[1]))) throw new Error('Invalid test runner options');
+    const bundle = args[1] || 'source';
+    server = await createTestServer(0, { bundle });
     phase = 'browser launch (install with npx playwright install chromium)';
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext();
@@ -51,6 +54,7 @@ try {
             ' (' + test.passed + '/' + test.total + ' assertions)');
     }
     const failedTests = result.tests.filter(test => test.failed).length;
+    console.log('Bundle: ' + bundle);
     console.log('Tests: ' + result.tests.length + ', failed: ' + failedTests +
         '; assertions: ' + result.assertions.passed + '/' + result.assertions.total +
         '; browser errors: ' + browserErrors + '; resource failures: ' + resourceFailures);

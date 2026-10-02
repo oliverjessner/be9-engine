@@ -1,11 +1,11 @@
 # Be8 v2 cryptographic profile
 
-This specifies the implemented KDF and its public metadata for protocol version
+This specifies the implemented pairwise KDF and its public metadata for protocol version
 `2`, suite `BE8-P384-HKDF-SHA256-A256GCM`. It is one v2 profile, not a menu of
-automatically detected algorithms. Unsupported versions/suites reject. The
-nonce, binary encoding and encryption budget are specified below. The
-authenticated v2 envelope is still to be specified and implemented; these
-helpers do not claim to implement that envelope.
+automatically detected algorithms. Unsupported versions/suites reject. The nonce, binary encoding and encryption budget are specified below.
+The [authenticated envelope and replay state](envelope-state.md), separate
+[symmetric group suite](group-epochs.md) and [lifecycle](lifecycle.md) complete
+this profile. Raw AES helpers remain explicitly low-level operations.
 
 ## Cryptographic derivation
 
@@ -58,14 +58,15 @@ EC JWK; optional fields and account metadata do not enter it. Engine derivation
 recomputes both fingerprints from the actual local and peer public keys and
 rejects mismatches with `DERIVATION_KEY_MISMATCH`.
 
-Endpoints are canonical nonnegative decimal account IDs (`0` or a digit `1`–`9`
-followed by digits), or `g[A-Za-z0-9_-]+:<version>` with a canonical positive safe
-integer version. They are application-supplied identifiers, not server accounts
-or identity verification. For local group keys the local endpoint is the exact
-group/version in the opaque key reference. Sender and receiver keep their
-original order on both sides: Bob receiving Alice's packet does not swap them.
-The local reference must belong to the declared sender or receiver. A self
-endpoint may only use the same public fingerprint on both sides.
+Modern pairwise endpoints are canonical nonnegative decimal account IDs (`0` or
+`1`–`9` followed by digits), at most 256 UTF-8 bytes. They are application-supplied
+identifiers, not server accounts or identity verification. Sender and receiver
+retain their original order: Bob receiving Alice's packet does not swap them.
+Local references must belong to the declared participant. A self endpoint uses
+the same fingerprint on both sides. Earlier HKDF metadata with
+`g[A-Za-z0-9_-]+:<positive safe integer version>` is retained only for explicit
+unframed legacy reading/encoding; modern derivation APIs reject those endpoints.
+New groups use structured symmetric epochs, not ECDH group endpoints.
 
 Context strings undergo no Unicode normalization. Lone UTF-16 surrogates reject
 rather than being replaced during UTF-8 encoding. Separators, NUL, and other
@@ -101,9 +102,10 @@ pair, salt, context and purpose. Purposes separate keys independently of directi
 | --- | --- | --- |
 | `data` | `encrypt`, `decrypt` | Text |
 | `attachment` | `encrypt`, `decrypt` | Existing base64 image API |
-| `key-wrap` | `wrapKey`, `unwrapKey` | None; use native WebCrypto with the derived key |
+| `key-wrap` | `wrapKey`, `unwrapKey` | Internal recipient-specific group key packages |
 
-The wrapping purpose does not add a private-key export or wrapping subsystem.
+The wrapping purpose transfers fresh symmetric group material internally; it
+does not export engine private keys or expose a public group-secret decoder.
 The engine's private keys remain non-extractable.
 
 ## APIs and caller changes
@@ -143,24 +145,28 @@ public/private keys and peer public/trust state from one committed snapshot:
 
 ```javascript
 // Both peers have separately imported and locally confirmed the other's key.
+await alice.openContext('application-context');
 const packet = await alice.encryptTextSimple('1', '2', 'Hello', {
     contextID: 'application-context',
 });
 const text = await bob.decryptTextSimple(
-    '1', '2', packet.cipherText, packet.iv, packet.derivation,
+    '1', '2', packet,
     { contextID: 'application-context' },
 );
 ```
 
-Text encryption now returns `{ cipherText, iv, derivation }`; image encryption
-returns `{ cipherImage, iv, derivation }`. Decryption requires `derivation` as its
-fifth argument. The optional final `{ contextID }` argument checks the receiver's
-application-supplied expected context. Encryption without a context ID chooses
-`crypto.randomUUID()` for the public context ID. It always creates a new random
-salt. Images use purpose `attachment`, text uses `data`; convenience decryption
-checks IDs, purpose, and any expected context before native decryption.
+Text/image convenience encryption returns `{ header, ciphertext }`. Decryption
+now takes that envelope as its third argument; `{ contextID }` remains the optional
+fourth argument for an independently expected application context. Specify it
+when the application expects a particular context. Omission accepts any context,
+while endpoints, purpose and actual fingerprints remain independently checked.
+Sending with a supplied context requires prior `openContext`; omitted context
+creates a fresh UUID and explicitly opens that new context. Each packet creates
+a fresh salt. Text and image purposes remain distinct. Archive decryptors are
+repeatable; stateful receive APIs additionally commit replay acceptance before
+output. See the envelope contract for exact schema, AAD, sequence and errors.
 
-Missing metadata rejects with `DERIVATION_CONTEXT_REQUIRED`; invalid version,
+Primitive derivation without metadata rejects with `DERIVATION_CONTEXT_REQUIRED`; invalid version,
 suite, fields, IDs, purpose, or context rejects with `INVALID_DERIVATION_CONTEXT`.
 An AES authentication failure propagates without another derivation attempt.
 There is no automatic algorithm detection or fallback.
@@ -203,12 +209,15 @@ they do not infer format from them. Legacy reads also enforce the bounded
 ciphertext size below; oversized original packets are retained but refused.
 No legacy writer is provided.
 
-Packets created during the earlier HKDF implementation with UUID IVs retain
-their HKDF key selection: explicitly derive using their original v2 metadata,
-then call `decryptTextLegacy()` or `decryptImageLegacy()` for the old wire format.
-Do not select the old direct-ECDH KDF for those packets. This is an explicit
-application decision; neither authentication failure nor format validation
-triggers a second algorithm or decoder.
+Previous HKDF ciphertext/IV/derivation tuples are explicitly read with
+`decryptTextUnframedLegacy(sender, receiver, ciphertext, iv, derivation, options)`
+or its image equivalent. Default encoding is the prior 12-byte-IV/Base64url
+format. Set the separate local option `{ legacyUUID: true }` to read earlier
+HKDF UUID/padded-Base64 packets. This reader also retains old HKDF ECDH group
+endpoints; modern writers cannot use them. Expected endpoint/purpose/context,
+actual fingerprints and stored trust are checked. No private key or AES key is
+exported. Do not select the direct-ECDH KDF for HKDF packets. Format choice is an
+explicit application decision; neither failure nor validation triggers fallback.
 
 ## Nonces, binary encoding and input limits
 
@@ -277,9 +286,9 @@ absolute collision freedom. The 16 MiB message cap is far below GCM's
 conservative engineering choice to limit aggregate GHASH input, not a claim of
 full 256-bit authentication security. Full 128-bit tags are always required.
 
-Each operation reserves `ceil(plaintextBytes / 16) + 1` GHASH blocks: ciphertext
-blocks plus the mandatory length block. Current helpers have no AAD; a future
-AAD envelope must include its additional blocks in the accounting. Reservations
+Each operation reserves `ceil(plaintextBytes / 16) + ceil(AADBytes / 16) + 1`
+GHASH blocks: ciphertext, authenticated header and the mandatory length block.
+Raw AES helpers have zero AAD; envelope helpers account for the complete header. Reservations
 are counted even if a subsequent GCM operation fails; they are never refunded.
 Validation failures occurring before a reservation consume nothing. These
 counters account for encryption; reading ciphertext does not consume encryption
@@ -296,7 +305,7 @@ namespace does not reset the budget.
 
 The actual derivation identity is canonical Base64url SHA-256 of this byte
 sequence: ASCII `BE8-GCM-USAGE` (13 bytes), the 32 raw salt bytes, then the complete
-`encodeV2DerivationInfo()` result. Fingerprints have already been verified against
+`encodeV2DerivationInfo()` result (or `BE8-GROUP-HKDF-INFO` bytes for the group suite). Fingerprints have already been verified against
 the actual keys before registration. Identity thus includes all key-selecting
 HKDF inputs and purposes; its equality relies on the hash/KDF's collision
 resistance. There is no independently selectable `keyId`. Changing a genuine KDF
@@ -332,19 +341,21 @@ key wrapping/unwrapping remains a low-level operation: use purpose `key-wrap`,
 96-bit nonces and `tagLength: 128`, with caller-owned limits. No counter guarantee
 is claimed for direct native operations or copied databases.
 
-## Envelope integration status and limits
+## Envelope integration and limits
 
-Persist and transfer the entire public `derivation` object alongside the encrypted
-payload and IV. It provides the exact salt and KDF metadata needed for the later
-authenticated v2 envelope. This change does not serialize such an envelope or
-authenticate an envelope header as AES-GCM AAD. Changing a KDF field changes the
-key and causes native authentication failure, but that does not implement header
-canonicalization, envelope validation, or replay state.
+Convenience methods serialize the exact authenticated envelope documented in
+[envelope-state.md](envelope-state.md); header schema, deterministic AAD and
+independent expectations are required. Stream counters and bounded replay windows
+persist separately from ciphertext. There is no automatic profile detection.
+Raw byte/text/image AES helpers return their unchanged raw payload shape and do
+not authenticate arbitrary application headers or update replay state.
 
-The new binary/Base64url representation and nonce rules above apply to all new
-engine payloads. No automatic envelope/profile detection is provided. The
-authenticated envelope, header/AAD canonicalization and replay state remain
-outside these helpers.
+The application integrates additional stores through its own upgrade handler.
+Storage rollback/loss undermines counters and replay/lifecycle state; do not
+resume old contexts after loss. A committed receive is not exactly-once execution
+of downstream application actions. [Group holders](group-epochs.md) can share
+secrets and forge claimed authorship; a new epoch does not revoke old knowledge.
+[Panic](lifecycle.md) is logical local invalidation/deletion, not physical erasure.
 
 Malicious JavaScript in the same execution context can still misuse stored
 CryptoKeys or invoke engine operations. Non-extractable does not mean XSS-safe
@@ -368,3 +379,11 @@ Base64url/IV/tag/size validation, input snapshots, and persistent count/block
 exhaustion across re-derivation, reload, concurrent connections and namespace
 aliases. Native transaction abort and unique-index write errors verify rollback;
 schema upgrade and explicit legacy-format reads are also covered.
+
+Envelope tests additionally alter every header field, independently mismatch
+expectations, and compare deterministic AAD with an independent Python vector.
+Replay tests cover windows, direction, commits, concurrency, uint64 overflow,
+restart and state loss. Group/panic suites exercise native encrypted handoff,
+immutable independent epochs, explicit activation, exclusion, archive/replay,
+non-extractability, invalidation during operations, rollback, restart and a second
+JS realm. No unimplemented capability is simulated through cryptographic mocks.

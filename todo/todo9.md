@@ -35,3 +35,12 @@ Backups oder Löschung bereits kopierter Schlüssel behaupten.
 
 Keine scheinbare "cryptographic erasure" durch einen Wrapping-Key
 einbauen, dessen Kopien im selben unkontrollierten Speicher verbleiben.
+
+Status: Implementiert; Lifecycle, Aufruferänderungen und Grenzen in docs/lifecycle.md.
+Native Browser-Tests prüfen unmittelbare Sperre, laufende Ver-/Entschlüsselung,
+Initialisierung/Neuinitialisierung, idempotente Wiederholung, Abbruch/Rollback,
+weitere Verbindung und Worker-Ausführungsumgebung, Neustart sowie Namespace-
+und Anwendungsdaten-Isolation. Keine physische Löschgarantie.
+
+Gemeinsamer Abschlusslauf: Quelle, ESM und IIFE jeweils 140 Tests / 859 Assertions;
+Dateiliste und Grenzen in docs/todo6-9.md.

@@ -47,14 +47,19 @@ or replaced. The engine uses these dedicated stores alongside application stores
 
 | Store | Primary key | Contents |
 | --- | --- | --- |
-| `be8.scopes` | `namespace` | Permanent account/namespace binding |
+| `be8.scopes` | `namespace` | Permanent account/namespace binding, lifecycle status and generation |
 | `be8.publicKeys` | `[namespace, accID]` | Public JWK in a separate `key` field |
 | `be8.privateKeys` | `[namespace, accID]` | Non-extractable private ECDH `CryptoKey` in `key`, public JWK in `publicKey` |
-| `be8.groupKeys` | `[namespace, groupID, version]` | Public JWK in `key`, optional non-extractable ECDH `CryptoKey` in `privateKey` |
+| `be8.groupKeys` | `[namespace, groupID, version]` | Retained legacy public JWK in `key`, optional non-extractable ECDH `CryptoKey` in `privateKey` |
 | `be8.trust` | `[namespace, peerID]` | SHA-256 thumbprint and local `unverified`, `confirmed`, or `tofu` status |
+| `be8.groupEpochs` | `[namespace, groupID, epoch]` | Non-extractable symmetric HKDF key and public generation/issuer metadata |
+| `be8.activeEpochs` | `[namespace, groupID]` | Explicit active epoch selection |
+| `be8.contexts` | `[namespace, contextID]` | Open/closed state and bounded stream registry |
+| `be8.sendState` | `[namespace, contextID, streamID]` | Committed uint64 send counter |
+| `be8.receiveState` | `[namespace, contextID, streamID]` | Highest uint64 sequence and 128-bit replay bitmap |
 | `be8.keyUsage` | `derivationID` | Database-wide encryption/GHASH counters keyed by validated actual derivation |
 
-The three key stores and the trust store have a nonunique `namespace` index. The
+All namespace-scoped stores other than `be8.scopes` have a nonunique `namespace` index. The
 usage store is global to this database and has no namespace index. A namespace is bound to
 one account on its first successful mutation. A different account cannot read,
 write, initialize, or clear it. The same account can use multiple explicitly
@@ -62,8 +67,8 @@ chosen namespaces, each with its own identity. The application must treat these
 stores as engine-owned records; arbitrary direct edits are not a synchronization
 or authorization API.
 
-Public/private identity writes share one native transaction. Group private CryptoKeys
-are persisted together with their public JWK in one record using native Structured Clone. Cryptographic
+Public/private identity writes share one native transaction. Retained legacy group private CryptoKeys
+are persisted together with their public JWK; new symmetric epochs occupy separate records. Both use native Structured Clone. Cryptographic
 generation/import happens before the write transaction. All mutation promises
 resolve only after native transaction completion; request success alone cannot
 report a commit. Request errors force rollback even if another event listener
@@ -177,10 +182,10 @@ validation, fingerprint, replacement, or native write failure rejects the entire
 batch. Public records and trust records commit together. Decisions cannot override
 separately supplied account or namespace metadata.
 
-Remote public group endpoints use the same policy, with `peerID: 'g10300:1'`:
+Retained legacy public ECDH group endpoints use the same policy, with `peerID: 'g10300:1'`:
 
 ```javascript
-await be8.addGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }], {
+await be8.addLegacyGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }], {
     decisions: [{ peerID: 'g10300:1', expectedFingerprint: independentlyConfirmedGroupFingerprint }],
 });
 ```
@@ -289,7 +294,7 @@ export API. Unselected old groups, other accounts, application stores, and exist
 ciphertexts are untouched. The application must explicitly choose each old local
 private group it owns; the engine does not migrate unrelated data or infer trust
 for old peer public keys. Old public group records can still be imported through
-`addGroupKeys()`.
+`addLegacyGroupKeys()`.
 
 This operation preserves public fingerprints and cryptographic identity. It
 imports private keys with only `deriveBits`, enabling the v2 KDF and the explicit
@@ -305,72 +310,66 @@ It also does not guarantee forensic erasure of prior JWK storage.
 
 ### Caller changes
 
-- `generatePrivAndPubKey()` and `generateGroupKeys(version, groupID)` now return
-  `{ publicKey, keyReference }` after commit, replacing the old private-JWK tuple.
-  Generation remains idempotent. Only `publicKey` may be exchanged with peers.
-- `keyReference` is an opaque frozen object bound to this engine instance and the
-  committed identity/group public coordinates. It contains no key material, cannot
-  be serialized or cloned into a usable reference, and becomes invalid if the
-  selected identity is cleared/replaced. After reopening, call generation again
-  to obtain a fresh reference to the same committed key.
-- `createDerivationContext(publicJWK, keyReference, { contextID, sender, receiver,
-  purpose })` creates a fresh public salt and returns `{ key, derivation }`.
-  `getDerivedKey(publicJWK, keyReference, derivation)` derives the non-extractable
-  v2 AES key using that metadata and the actual stored local public fingerprint.
-  It requires an opaque local reference. See the [v2 profile](docs/v2-profile.md)
-  for exact field encoding, purposes, examples and errors.
-- Simplified encryption returns `derivation` alongside ciphertext and IV.
-  Simplified decryption requires that metadata as its fifth argument. The
-  optional final `{ contextID }` argument supplies/checks application context.
-  Other convenience options, including custom IVs/random sources/key aliases,
-  reject with `INVALID_OPTIONS`.
-- New IVs are 12 random bytes and all new encrypted wire values are canonical
-  unpadded Base64url. All AES-GCM operations explicitly use a 128-bit tag. Modern
-  readers reject UUID IVs and padded standard Base64; use explicit legacy readers
-  for retained old packets. Text/image APIs share the byte codec and a 16 MiB
-  plaintext limit. Raw helpers require non-extractable AES-256-GCM keys.
-  Added `encryptBytes()` / `decryptBytes()` and named/static
-  `encodeBase64url()`, `decodeBase64url()`, `V2_LIMITS`.
-- Registered v2 keys have a persistent per-actual-key budget: 65,536 encryptions
-  and 2^24 GHASH blocks. Reservations commit before encryption. The application
-  must increment its database version and integrate `be8.keyUsage` through
-  `upgradeBe8Schema()`; missing integration reports `SCHEMA_UPGRADE_REQUIRED`.
-  Re-derivation, reload and namespace aliases cannot reset the counter. Incoming
-  directional keys cannot encrypt through the engine; create a reverse context.
-  Raw caller-owned/cloned keys and native WebCrypto require caller accounting.
-- Old ciphertext must use `getLegacyDerivedKey()`, `decryptTextSimpleLegacy()`
-  or `decryptImageSimpleLegacy()` explicitly. No missing metadata or authentication
-  failure triggers fallback. Existing non-extractable `deriveKey`-only identities
-  are retained for legacy reads; v2 reports `V2_KEY_USAGE_UNAVAILABLE` rather than
-  generating a new identity. Private JWKs and extractable private CryptoKeys
-  remain rejected outside explicit migration.
-- `getMyPublicKey()`, `getCachedKeys()`, and `getCachedGroupKeys()` expose only
-  public JWKs and public metadata. Group getters project the public half of old
-  records as well; they never return a private `d` or stored private CryptoKey.
-- `addPublicKeys()` and `addGroupKeys()` accept only public JWKs, snapshot key
-  fields, and cannot let embedded metadata override explicit storage IDs.
-  Reimporting the public half of a modern local group retains its private key.
-  Existing private-JWK groups must be migrated before mutation or private use.
-- `setup({ legacyIdentity: true })` and the named/static `readLegacyIdentity()`
-  private-JWK export are removed. Use `migratePrivateKeys()` explicitly, then
-  `setup()`. `hasGeneratedKeys()`/`hasKey()` are promises; await them. The
-  simplified decryption signature now additionally requires v2 metadata.
-- Group IDs match `g[A-Za-z0-9_-]+`; versions are positive safe integers, with
-  canonical decimal strings accepted and normalized for new records. A group
-  version cannot be replaced with different public coordinates.
-- `panic()` still explicitly clears only the current namespace's key and trust records
-  atomically, retaining its account binding, application stores, other namespaces,
-  unselected legacy records and database-wide usage counters. Retained counters
-  prevent resetting an old derivation budget; they are not automatically removed.
-  It never deletes the application database.
-- Public imports remain async but no longer silently replace peers. Calls without
-  local trust options retain first-contact data as unverified. Convenience calls
-  now require a confirmed or explicitly TOFU peer; update callers accordingly.
-- Added `getPeerTrust()`, `replacePublicKey()`, and `migratePublicKeyTrust()`.
-- Named ESM/static exports are `upgradeBe8Schema`, `STORES`, `jwkThumbprint`,
-  `V2_SUITE`, `encodeV2DerivationInfo`, `encodeBase64url`, `decodeBase64url`, and
-  `V2_LIMITS`.
-  The IIFE remains a callable `be8` constructor with the same static helpers.
+- `generatePrivAndPubKey()` returns `{ publicKey, keyReference }` after commit,
+  retaining an existing identity. Private JWK tuples and the old private export
+  helper are removed; migration is explicitly `migratePrivateKeys()`, never setup.
+- The opaque reference belongs to one local instance and committed identity.
+  References and CryptoKeys stay local. Reload obtains a fresh reference;
+  panic discards references and derivation registrations.
+- `createDerivationContext(publicJWK, reference, { contextID, sender, receiver,
+  purpose })` and `getDerivedKey(publicJWK, reference, derivation)` use full-width
+  ECDH/HKDF with actual fingerprints and non-extractable AES. Modern endpoint
+  contexts use account IDs. Raw AES methods retain their signatures and caller
+  trust/context responsibilities; they have no implicit envelope or replay check.
+- Simple text/image encryption now returns `{ header, ciphertext }`.
+  Simple decryptors take `(sender, receiver, envelope, { contextID })`.
+  The application should independently supply its expected context.
+  Other convenience options, including custom IVs, reject. Sender must be the
+  local account and receiver must match the decrypting engine's account.
+- `encryptEnvelope(sender, receiver, bytes, { contextID, purpose })` and
+  `decryptEnvelope(envelope, { sender, receiver, contextID, purpose })` use the
+  strictly authenticated [envelope profile](docs/envelope-state.md).
+  `encodeEnvelopeAAD` exposes deterministic public header bytes.
+- Open application contexts explicitly with `openContext`. `closeContext`
+  permanently closes that ID. Simple sending without context creates a fresh
+  random context. Archive decryptors remain repeatable. For replay protection,
+  initialize independent expectations via `openReceiveContext`, then use
+  `receiveEnvelope`, `receiveText` or `receiveImage`. Output follows replay commit.
+- New groups use `createGroupEpoch`, recipient-specific encrypted packages,
+  `importGroupEpoch` and explicit CAS `activateGroupEpoch`. Group encryptors use
+  the active epoch; archive decryptors require an explicitly expected epoch.
+  Getters expose metadata only. See [group APIs and limits](docs/group-epochs.md).
+- `generateGroupKeys` and ambiguous `addGroupKeys` reject `LEGACY_GROUP_API`.
+  Retained ECDH groups use `addLegacyGroupKeys`, `getCachedLegacyGroupKeys`,
+  `getCachedLegacyGroupVersions`, `hasLegacyGroupKey`, `getLegacyGroupKeyReference`
+  and explicit legacy readers. They never become symmetric epochs implicitly.
+- New encrypted values are strict unpadded Base64url, with 12 random IV bytes and
+  128-bit GCM tags. Byte/text/image helpers share 16 MiB bounds. Private and
+  derived/operative symmetric keys are non-extractable. Existing image strings
+  remain text; use byte APIs for raw image bytes.
+- Previous ciphertext/IV/HKDF tuples use `decryptTextUnframedLegacy` or its image
+  equivalent. Only explicitly selected `{ legacyUUID: true }` accepts the earlier
+  UUID/padded-Base64 HKDF representation. Direct-ECDH data uses `getLegacyDerivedKey`
+  and `decryptText/Image(Simple)Legacy`. No validation/authentication failure
+  selects another format. DeriveKey-only identities remain available for legacy
+  reading; unsupported v2 usage never silently rotates them.
+- All public imports validate keys and separate local trust decisions. Ordinary
+  imports never replace a changed key; explicit replacement uses fingerprint CAS.
+  Bulk imports cannot bypass policy. Embedded account/trust metadata cannot
+  override separate arguments. Old unverified records remain unverified.
+- Integrate all additional stores with `upgradeBe8Schema` in the application's
+  version upgrade. Native request success is insufficient: mutations wait for
+  commit. Persistent actual-key usage limits survive reload and namespace aliases;
+  raw/cloned keys and direct WebCrypto require caller accounting.
+- `panic()` now immediately locks, invalidates in-flight results, deletes only
+  selected namespace keys and replay/security state atomically, and commits a
+  tombstone. Failure leaves it locked. `setup()` cannot unlock/recreate identity;
+  use explicit `reinitialize()` after successful panic. Other live/stale instances
+  cannot adopt that new generation. [Lifecycle contract](docs/lifecycle.md).
+- Named ESM and constructor static helpers: `upgradeBe8Schema`, `STORES`,
+  `jwkThumbprint`, `V2_SUITE`, `GROUP_SUITE`, `encodeV2DerivationInfo`,
+  `encodeEnvelopeAAD`, `encodeBase64url`, `decodeBase64url`, `V2_LIMITS`,
+  `REPLAY_WINDOW`.
 
 ## hasGeneratedKeys()
 
@@ -404,11 +403,11 @@ Confirm through a separate local argument before convenience use.
 await be8.addPublicKey('2', bobPublicJWK, { expectedFingerprint: independentlyConfirmedFingerprint });
 ```
 
-## async addGroupKeys(groupID, keys, options = {})
+## async addLegacyGroupKeys(groupID, keys, options = {})
 Remote public group endpoints require their own separate local trust decision.
 
 ```javascript
-await be8.addGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }], {
+await be8.addLegacyGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }], {
     decisions: [{ peerID: 'g10300:1', trust: 'confirmed' }],
 });
 ```
@@ -420,12 +419,14 @@ Returns the existing or newly committed public JWK and an opaque local key refer
 const { publicKey, keyReference } = await be8.generatePrivAndPubKey();
 ```
 
-## async generateGroupKeys(version, groupID)
-Generates or restores a local group identity in the current namespace after commit.
+## Group epochs and explicit legacy reads
 
-```javascript
-const { publicKey, keyReference } = await be8.generateGroupKeys(1, 'g10300');
-```
+New groups use independent symmetric 256-bit epochs, encrypted pairwise key
+packages and separate activation. See [group-epochs.md](docs/group-epochs.md)
+for creation/import, active/archive APIs, replay and caller changes.
+`generateGroupKeys()` rejects: production code does not create new ECDH groups.
+`getLegacyGroupKeyReference(groupID, version)` restores only an existing local
+private ECDH group reference for explicit legacy readers.
 
 ## v2 derivation and encryption
 
@@ -473,24 +474,25 @@ key (or explicitly enables first-contact TOFU), the convenience APIs perform
 committed peer-trust checks and internal v2 derivation:
 
 ```javascript
+await alice.openContext('example');
 const packet = await alice.encryptTextSimple('1', '2', 'Hello World', {
     contextID: 'example',
 });
 const text = await bob.decryptTextSimple(
-    '1', '2', packet.cipherText, packet.iv, packet.derivation,
+    '1', '2', packet,
     { contextID: 'example' },
 );
 
 const imagePacket = await alice.encryptImageSimple('1', '2', base64Image);
 const image = await bob.decryptImageSimple(
-    '1', '2', imagePacket.cipherImage, imagePacket.iv, imagePacket.derivation,
+    '1', '2', imagePacket,
 );
 ```
 
 Text uses purpose `data`; images use `attachment`. An omitted sender context ID
-gets a public random UUID. Every new context gets a fresh public 32-byte salt;
-the recipient always reuses the transferred salt. Encryption returns ciphertext,
-IV and `derivation`; decryption requires all three. Sender/receiver arguments
+gets a public random UUID. Every new derivation gets a fresh public 32-byte salt;
+the recipient reuses the transferred salt. Encryption returns a complete
+authenticated envelope; decryption takes that envelope. Sender/receiver arguments
 keep the original packet direction on both engines. Reverse communication creates
 a new context with reversed endpoints and actual fingerprints.
 
@@ -555,11 +557,10 @@ Readiness and cleanup use native IndexedDB open, request, complete, and abort
 events, rather than fixed delays. Only the test-created databases are deleted.
 
 `test/aes.mjs` contains separate single-instance AES unit tests. Group tests
-exercise pairwise ECDH with Alice's local private group key, Bob's own private
-identity key, and the corresponding exchanged public keys. They do not claim
-broadcast encryption, membership enforcement, invitation handling, or protection
-based on group membership. Different versions must authenticate independently;
-old installed versions remain available.
+exercise recipient-specific encrypted handoff to three isolated engines,
+non-extractable symmetric epochs, bidirectional data, image strings, next-epoch
+exclusion, archive/replay/reload, immutable epochs, activation CAS and explicit
+retained ECDH legacy readers. No private keys or already derived keys are shared.
 
 #### Validation and remaining limits
 
@@ -590,7 +591,12 @@ large-array roundtrips, native fixed IV fixtures, Unicode/BOM, image text over
 usage counters across reload, re-derivation, parallel connections, namespace
 aliases and panic. Native transaction aborts and unique-index write errors
 verify reservation rollback; application-owned schema integration is covered.
-The participant fixtures make separate explicit local decisions for their known
+`test/envelope.mjs` validates every header field and an independent Python AAD
+vector. `test/replay.mjs` exercises bounded windows, overflow, missing/closed
+state, concurrent acceptance and commit failures. `test/panic.mjs` checks
+in-flight crypto/setup/reinitialization, native delete rollback, idempotency,
+other connections, a separate module worker realm, restart and namespace/store
+isolation. The participant fixtures make separate explicit local decisions for their known
 synthetic peers; no trust record is taken from an exchanged key object.
 Timeouts in the runner and failure tests are failure deadlines, not readiness
 waits. Test output excludes assertion data and raw browser errors.
@@ -598,14 +604,19 @@ waits. Test output excludes assertion data and raw browser errors.
 The suite exercises native Chromium WebCrypto/IndexedDB. Other browsers,
 hardware failures, and storage exhaustion beyond native constraint/abort error
 paths were not validated here. Application-level trust decisions remain with the
-caller. Group tests establish pairwise ECDH, not broadcast encryption or group
-membership enforcement. The [v2 KDF and field encoding](docs/v2-profile.md)
-and nonce/Base64url/budget rules are implemented. The authenticated envelope,
-header/AAD rules and replay state remain outstanding. Random IVs do not guarantee
+caller. The [v2 profile](docs/v2-profile.md), authenticated
+[envelope and replay state](docs/envelope-state.md), [group epochs](docs/group-epochs.md)
+and [local invalidation](docs/lifecycle.md) are implemented. Shared group secrets
+do not prove individual authorship or enforce membership. Random IVs do not guarantee
 collision freedom; state coordination is limited to one application-owned
 database and assumes preserved counters. This is not a security audit, and no
 guaranteed secret-memory erasure is claimed.
 
 Run `npm test` for the automated source suite and `npm run build` to regenerate
-both outputs in `dist/`. The suite imports `lib/` directly. No runtime dependency
+both outputs in `dist/`. The default suite imports `lib/`. After build, `npm test -- --bundle esm` and
+`npm test -- --bundle iife` run the same native integration suite against each
+generated constructor. The IIFE is evaluated unchanged with an ESM adapter for
+tests/workers; public codec/persistence unit helpers still import source modules. No runtime dependency
 was added for persistence.
+
+Abschluss und vollständige Dateiliste für Todo 6–9: [Umsetzungsbericht](docs/todo6-9.md).

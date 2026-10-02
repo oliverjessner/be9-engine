@@ -1,3 +1,4 @@
+import { createLegacyGroup, legacyGroupToPublic } from './legacy-fixture.mjs';
 import Be8, { STORES, upgradeBe8Schema, jwkThumbprint } from '../lib/bundle.mjs';
 import { participantHooks, exchangePublicKeys, createParticipant } from './participants.mjs';
 import { readRecord, requestResult, storedIDs } from './database.mjs';
@@ -76,13 +77,13 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         assert.strictEqual((await rawTrust(alice.database, alice.id, bob.id)).status, 'unverified', 'A dedicated namespace/peer trust record exists');
         await assert.rejects(alice.engine.encryptTextSimple(alice.id, bob.id, 'Unverified'), error => error.code === 'UNTRUSTED_PUBLIC_KEY', 'Text encryption refuses an unverified peer');
         await assert.rejects(alice.engine.encryptImageSimple(alice.id, bob.id, ''), error => error.code === 'UNTRUSTED_PUBLIC_KEY', 'Image encryption refuses an unverified peer');
-        const incomingContext = await bob.createContext(alice.publicKey);
-        const incoming = { ...await bob.engine.encryptText(incomingContext.key, 'Unverified sender'), derivation: incomingContext.derivation };
-        await assert.rejects(alice.engine.decryptTextSimple(bob.id, alice.id, incoming.cipherText, incoming.iv, incoming.derivation),
+        await bob.engine.addPublicKey(alice.id, alice.publicKey, { trust: 'confirmed' });
+        const incoming = await bob.engine.encryptTextSimple(bob.id, alice.id, 'Unverified sender');
+        await assert.rejects(alice.engine.decryptTextSimple(bob.id, alice.id, incoming),
             error => error.code === 'UNTRUSTED_PUBLIC_KEY', 'Convenience decryption also refuses an unverified sender');
         await alice.engine.addPublicKey(bob.id, bob.publicKey, { trust: 'confirmed' });
         assert.strictEqual((await alice.engine.getPeerTrust(bob.id)).status, 'confirmed', 'A separate explicit local decision authorizes the same key');
-        assert.true(await alice.engine.decryptTextSimple(bob.id, alice.id, incoming.cipherText, incoming.iv, incoming.derivation) === 'Unverified sender', 'Confirmation enables actual recipient decryption');
+        assert.true(await alice.engine.decryptTextSimple(bob.id, alice.id, incoming) === 'Unverified sender', 'Confirmation enables actual recipient decryption');
     });
 
     QUnit.test('Wrong expected fingerprints reject first contact and preserve an existing confirmed key', async function (assert) {
@@ -110,7 +111,8 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         await alice.engine.addPublicKey(bob.id, bob.publicKey, { tofu: true });
         assert.strictEqual((await alice.engine.getPeerTrust(bob.id)).status, 'tofu', 'First contact is labeled TOFU rather than independently confirmed');
         const packet = await alice.engine.encryptTextSimple(alice.id, bob.id, 'Explicit TOFU');
-        assert.true(await bob.engine.decryptText(await bob.derive(alice.publicKey, packet.derivation), packet.cipherText, packet.iv) === 'Explicit TOFU', 'Explicit TOFU enables interoperability');
+        await bob.engine.addPublicKey(alice.id, alice.publicKey, { trust: 'confirmed' });
+        assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, packet) === 'Explicit TOFU', 'Explicit TOFU enables interoperability');
         await alice.engine.addPublicKey(bob.id, bob.publicKey);
         assert.strictEqual((await alice.engine.getPeerTrust(bob.id)).status, 'tofu', 'Unchanged reimport retains the TOFU decision');
         const changed = await settles(alice.engine.addPublicKey(bob.id, eve.publicKey, { tofu: true }));
@@ -158,8 +160,9 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         assert.true(trust.fingerprint === next && trust.status === 'confirmed', 'New point and explicit confirmation commit together');
         assert.deepEqual(await storedIDs(alice.database, 'publicKeys'), ['101', '102'], 'Embedded account metadata cannot change the selected peer');
         const packet = await alice.engine.encryptTextSimple(alice.id, bob.id, 'Confirmed replacement');
-        assert.true(await replacement.engine.decryptText(await replacement.derive(alice.publicKey, packet.derivation), packet.cipherText, packet.iv) === 'Confirmed replacement', 'Convenience derivation sees the newly committed key');
-        await assert.rejects(bob.derive(alice.publicKey, packet.derivation), error => error.code === 'DERIVATION_KEY_MISMATCH',
+        await replacement.engine.addPublicKey(alice.id, alice.publicKey, { trust: 'confirmed' });
+        assert.true(await replacement.engine.decryptTextSimple(alice.id, bob.id, packet) === 'Confirmed replacement', 'Convenience derivation sees the newly committed key');
+        await assert.rejects(bob.engine.decryptTextSimple(alice.id, bob.id, packet), error => error.code === 'DERIVATION_KEY_MISMATCH',
             'The previous private endpoint cannot derive a key under the new fingerprint');
         const stale = await settles(alice.engine.replacePublicKey(bob.id, bob.publicKey,
             { expectedPreviousFingerprint: previous, confirmedNewFingerprint: previous }));
@@ -242,15 +245,15 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
     QUnit.test('Remote group endpoints require separate decisions and retain immutable public versions', async function (assert) {
         const { alice, bob } = this;
         await exchangePublicKeys(alice, bob);
-        const { publicKey } = await alice.engine.generateGroupKeys(1, 'g200');
-        await bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: { ...publicKey, verified: true }, verified: true }]);
+        const { publicKey } = await createLegacyGroup(alice.engine, alice.database, 1, 'g200');
+        await bob.engine.addLegacyGroupKeys('g200', [{ version: 1, groupKey: { ...publicKey, verified: true }, verified: true }]);
         assert.strictEqual((await bob.engine.getPeerTrust('g200:1')).status, 'unverified', 'Imported group verification flags are ignored');
-        await assert.rejects(bob.engine.encryptTextSimple(bob.id, 'g200:1', 'Group'), error => error.code === 'UNTRUSTED_PUBLIC_KEY', 'Remote group convenience use is blocked by default');
-        await bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: publicKey }],
+        const packet = await legacyGroupToPublic(alice, 'g200', 1, bob.publicKey, 'Confirmed group');
+        await assert.rejects(bob.engine.decryptTextSimpleLegacy('g200:1', bob.id, packet.cipherText, packet.iv), error => error.code === 'UNTRUSTED_PUBLIC_KEY', 'Remote legacy group reading is blocked by default');
+        await bob.engine.addLegacyGroupKeys('g200', [{ version: 1, groupKey: publicKey }],
             { decisions: [{ peerID: 'g200:1', expectedFingerprint: await jwkThumbprint(publicKey) }] });
-        const packet = await bob.engine.encryptTextSimple(bob.id, 'g200:1', 'Confirmed group');
-        assert.true(await alice.engine.decryptTextSimple(bob.id, 'g200:1', packet.cipherText, packet.iv, packet.derivation) === 'Confirmed group', 'Explicit group confirmation enables the owner round trip');
-        const changed = await settles(bob.engine.addGroupKeys('g200', [{ version: 1, groupKey: this.eve.publicKey }], { tofu: true }));
+        assert.true(await bob.engine.decryptTextSimpleLegacy('g200:1', bob.id, packet.cipherText, packet.iv) === 'Confirmed group', 'Explicit group confirmation enables the owner round trip');
+        const changed = await settles(bob.engine.addLegacyGroupKeys('g200', [{ version: 1, groupKey: this.eve.publicKey }], { tofu: true }));
         assert.true(changed.error?.code === 'GROUP_CONFLICT', 'Existing group version immutability remains enforced');
         bob.database.acknowledgeAborts();
         assert.strictEqual((await bob.engine.getPeerTrust('g200:1')).fingerprint, await jwkThumbprint(publicKey), 'Rejected group change leaves its trust intact');
@@ -275,7 +278,9 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         assert.strictEqual((await reopened.getPeerTrust(bob.id)).fingerprint, expected, 'Reopening restores committed trust');
         assert.strictEqual((await reopened.getPeerTrust(bob.id)).status, 'confirmed', 'Reopening preserves the explicit decision');
         await reopened.panic();
-        assert.strictEqual(await reopened.getPeerTrust(bob.id), undefined, 'Explicit panic clears trust with the selected namespace keys');
+        await assert.rejects(reopened.getPeerTrust(bob.id), error => error.code === 'ENGINE_LOCKED', 'Explicit panic prevents further trust access');
+        const remaining = await readRecord(database, STORES.trust, [alice.id, bob.id]);
+        assert.strictEqual(remaining, undefined, 'Panic clears trust with the selected namespace keys');
         assert.strictEqual((await isolated.getPeerTrust(bob.id)).status, 'unverified', 'Other namespace trust is retained');
     });
 

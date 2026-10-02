@@ -35,9 +35,9 @@ QUnit.module('Images / independent participants', hooks => {
             await exchangePublicKeys(alice, bob);
             const toBob = structuredClone(await alice.engine.encryptImageSimple(alice.id, bob.id, image));
             const toAlice = structuredClone(await bob.engine.encryptImageSimple(bob.id, alice.id, image));
-            assert.true(await bob.engine.decryptImageSimple(alice.id, bob.id, toBob.cipherImage, toBob.iv, toBob.derivation) === image,
+            assert.true(await bob.engine.decryptImageSimple(alice.id, bob.id, toBob) === image,
                 'The Bob engine decrypts Alice to Bob');
-            assert.true(await alice.engine.decryptImageSimple(bob.id, alice.id, toAlice.cipherImage, toAlice.iv, toAlice.derivation) === image,
+            assert.true(await alice.engine.decryptImageSimple(bob.id, alice.id, toAlice) === image,
                 'The Alice engine decrypts Bob to Alice');
         });
     }
@@ -47,10 +47,10 @@ QUnit.module('Images / independent participants', hooks => {
         await exchangePublicKeys(alice, bob, eve);
         for (const [sender, receiver] of [[alice, bob], [bob, alice]]) {
             const packet = structuredClone(await sender.engine.encryptImageSimple(sender.id, receiver.id, base64Img));
-            await assert.rejects(eve.engine.decryptImageSimple(sender.id, eve.id, packet.cipherImage, packet.iv, packet.derivation),
-                error => error.code === 'INVALID_DERIVATION_CONTEXT', 'The third local endpoint does not match the bound recipient');
-            await assert.rejects(eve.engine.decryptImageSimple(sender.id, receiver.id, packet.cipherImage, packet.iv, packet.derivation),
-                /Missing private key/, 'The third endpoint has no recipient private key');
+            await assert.rejects(eve.engine.decryptImageSimple(sender.id, eve.id, packet),
+                error => error.code === 'ENVELOPE_EXPECTATION_MISMATCH', 'The third local endpoint does not match the bound recipient');
+            await assert.rejects(eve.engine.decryptImageSimple(sender.id, receiver.id, packet),
+                error => error.code === 'ENVELOPE_EXPECTATION_MISMATCH', 'The third endpoint has no recipient private key');
         }
     });
 

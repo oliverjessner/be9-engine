@@ -33,9 +33,9 @@ QUnit.module('Text / independent participants', hooks => {
             await exchangePublicKeys(alice, bob);
             const toBob = structuredClone(await alice.engine.encryptTextSimple(alice.id, bob.id, text));
             const toAlice = structuredClone(await bob.engine.encryptTextSimple(bob.id, alice.id, text));
-            assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, toBob.cipherText, toBob.iv, toBob.derivation) === text,
+            assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, toBob) === text,
                 'Bob independently decrypts Alice to Bob');
-            assert.true(await alice.engine.decryptTextSimple(bob.id, alice.id, toAlice.cipherText, toAlice.iv, toAlice.derivation) === text,
+            assert.true(await alice.engine.decryptTextSimple(bob.id, alice.id, toAlice) === text,
                 'Alice independently decrypts Bob to Alice');
         });
     }
@@ -45,10 +45,10 @@ QUnit.module('Text / independent participants', hooks => {
         await exchangePublicKeys(alice, bob);
         const first = await alice.engine.encryptTextSimple(alice.id, bob.id, 'Repeated content');
         const second = await alice.engine.encryptTextSimple(alice.id, bob.id, 'Repeated content');
-        assert.notStrictEqual(first.iv, second.iv, 'IVs differ');
-        assert.true(first.cipherText !== second.cipherText, 'Ciphertexts differ');
+        assert.notStrictEqual(first.header.iv, second.header.iv, 'IVs differ');
+        assert.true(first.ciphertext !== second.ciphertext, 'Ciphertexts differ');
         for (const packet of [first, second]) {
-            assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, packet.cipherText, packet.iv, packet.derivation) === 'Repeated content',
+            assert.true(await bob.engine.decryptTextSimple(alice.id, bob.id, packet) === 'Repeated content',
                 'The receiver can independently decrypt each packet');
         }
     });
@@ -58,10 +58,10 @@ QUnit.module('Text / independent participants', hooks => {
         await exchangePublicKeys(alice, bob, eve);
         for (const [sender, receiver] of [[alice, bob], [bob, alice]]) {
             const packet = structuredClone(await sender.engine.encryptTextSimple(sender.id, receiver.id, 'Private content'));
-            await assert.rejects(eve.engine.decryptTextSimple(sender.id, eve.id, packet.cipherText, packet.iv, packet.derivation),
-                error => error.code === 'INVALID_DERIVATION_CONTEXT', 'The third local endpoint does not match the bound recipient');
-            await assert.rejects(eve.engine.decryptTextSimple(sender.id, receiver.id, packet.cipherText, packet.iv, packet.derivation),
-                /Missing private key/, 'The third endpoint does not possess the recipient private key');
+            await assert.rejects(eve.engine.decryptTextSimple(sender.id, eve.id, packet),
+                error => error.code === 'ENVELOPE_EXPECTATION_MISMATCH', 'The third local endpoint does not match the bound recipient');
+            await assert.rejects(eve.engine.decryptTextSimple(sender.id, receiver.id, packet),
+                error => error.code === 'ENVELOPE_EXPECTATION_MISMATCH', 'The third endpoint does not possess the recipient private key');
         }
     });
 

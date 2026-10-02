@@ -29,3 +29,9 @@ Zusätzlich eine vollständig unveränderte gültige Envelope unter einem
 falschen erwarteten Kontext, Empfänger oder Verwendungszweck ablehnen.
 
 AAD schützt Metadatenintegrität, verbirgt diese Metadaten aber nicht.
+
+Status: Implementiert; Profil und Aufruferänderungen in docs/envelope-state.md.
+Native Browser-Prüfung: Envelope-Header-Manipulation, unabhängige Erwartungen und Interoperabilität.
+
+Gemeinsamer Abschlusslauf: Quelle, ESM und IIFE jeweils 140 Tests / 859 Assertions;
+Dateiliste und Grenzen in docs/todo6-9.md.
