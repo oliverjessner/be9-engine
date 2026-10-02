@@ -24,13 +24,17 @@ separaten Group-Envelope/Text/Image-Methoden. Alte `generateGroupKeys`/
 Nach Panic kann `setup()` keine Identität neu erzeugen: `reinitialize()` ist
 bewusst erforderlich, erzeugt eine neue Identität und verlangt neue lokale
 Vertrauensentscheidungen/Kontexte. Die Anwendung integriert neue Stores über
-`upgradeBe8Schema` in ihrem eigenen Versionsupgrade.
+`upgradeBe9Schema` in ihrem eigenen Versionsupgrade.
 
 Die genauen Signaturen, Feldkodierungen, Fehler und Integrationspflichten stehen
 in [Envelope und Replay](envelope-state.md), [Gruppenepochen](group-epochs.md),
 [Lifecycle](lifecycle.md) und [KDF/Nonce/Budget](v2-profile.md).
 
 ## Tatsächlich ausgeführte Abschlussprüfungen
+
+Diese Ergebnisse stammen vom Abschluss von Todo 6–9 vor der Be9-Umbenennung.
+Die Beispiele verwenden die heutigen Namen. Die Prüfungen der Umbenennung und
+die dafür nötige explizite Migration stehen in [Be9-Migration](be9-migration.md).
 
 | Prüfung | Ergebnis |
 | --- | --- |

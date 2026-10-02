@@ -1,12 +1,12 @@
-import Be8 from '../lib/bundle.mjs';
+import Be9 from '../lib/bundle.mjs';
 import { participantHooks, exchangePublicKeys } from './participants.mjs';
 
 QUnit.module('Exceptions / independent participants', hooks => {
     participantHooks(hooks);
 
     QUnit.test('Constructor rejects a missing identifier or database', function (assert) {
-        assert.throws(() => new Be8(), /no acc id or wrong type/, 'Missing identifier is rejected');
-        assert.throws(() => new Be8('101'), /no indexedDB/, 'Missing database is rejected');
+        assert.throws(() => new Be9(), /no acc id or wrong type/, 'Missing identifier is rejected');
+        assert.throws(() => new Be9('101'), /no indexedDB/, 'Missing database is rejected');
     });
 
     for (const kind of ['Text', 'Image']) {

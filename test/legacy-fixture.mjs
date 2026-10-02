@@ -50,12 +50,15 @@ export async function legacyGroupToPublic(participant, groupID, version, publicK
 export async function legacyGroupHKDFPacket(participant, groupID, version, peerPublic, text) {
     const { STORES } = await import('../lib/bundle.mjs');
     const { withTransaction, requestResult } = await import('../lib/persistence.mjs');
-    const { createV2Metadata, deriveV2AES } = await import('../lib/v2.mjs');
+    const { createV2Metadata, hkdfAES, encodeV2DerivationInfo, decode32 } = await import('../lib/v2.mjs');
+    const { BE8_V2_SUITE } = await import('../lib/legacy-be8.mjs');
     const record = await withTransaction(participant.database.connection, [STORES.groupKeys], 'readonly', tx =>
         requestResult(tx.objectStore(STORES.groupKeys).get([participant.id, groupID, version])));
     const sender = groupID + ':' + version;
-    const derivation = await createV2Metadata(sender, record.key, peerPublic,
-        { sender, receiver: peerPublic.accID, contextID: 'historic HKDF group', purpose: 'data' });
-    const key = await deriveV2AES(sender, record.key, peerPublic, record.privateKey, derivation);
+    const derivation = { ...await createV2Metadata(sender, record.key, peerPublic,
+        { sender, receiver: peerPublic.accID, contextID: 'historic HKDF group', purpose: 'data' }), suite: BE8_V2_SUITE };
+    const peer = await crypto.subtle.importKey('jwk', peerPublic, { name: 'ECDH', namedCurve: 'P-384' }, false, []);
+    const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: peer }, record.privateKey, 384));
+    const key = await hkdfAES(bits, decode32(derivation.salt), encodeV2DerivationInfo(derivation, true), 'data');
     return { ...await encryptLegacyFixture(key, text), derivation };
 }

@@ -1,3 +1,27 @@
+// Exact frozen historical identifiers, used only by explicitly selected readers
+// and schema migration. New writers never select this profile.
+const BE8_V2_SUITE = 'BE8-P384-HKDF-SHA256-A256GCM';
+const BE8_GROUP_SUITE = 'BE8-GROUP-HKDF-SHA256-A256GCM';
+const BE8_DOMAINS = Object.freeze({
+    pairInfo: 'BE8-HKDF-INFO',
+    groupInfo: 'BE8-GROUP-HKDF-INFO',
+    aad: 'BE8-ENVELOPE-AAD',
+    replay: 'BE8-REPLAY-STREAM',
+});
+const BE8_STORES = Object.freeze({
+    scopes: 'be8.scopes',
+    publicKeys: 'be8.publicKeys',
+    privateKeys: 'be8.privateKeys',
+    groupKeys: 'be8.groupKeys',
+    groupEpochs: 'be8.groupEpochs',
+    activeEpochs: 'be8.activeEpochs',
+    trust: 'be8.trust',
+    keyUsage: 'be8.keyUsage',
+    contexts: 'be8.contexts',
+    sendState: 'be8.sendState',
+    receiveState: 'be8.receiveState',
+});
+
 function getTypeOfKey(id) {
     if (!id) {
         throw new Error('engine: id is required in getTypeOfKey');
@@ -13,17 +37,17 @@ function getTypeOfKey(id) {
 }
 
 const STORES = Object.freeze({
-    scopes: 'be8.scopes',
-    publicKeys: 'be8.publicKeys',
-    privateKeys: 'be8.privateKeys',
-    groupKeys: 'be8.groupKeys',
-    groupEpochs: 'be8.groupEpochs',
-    activeEpochs: 'be8.activeEpochs',
-    trust: 'be8.trust',
-    keyUsage: 'be8.keyUsage',
-    contexts: 'be8.contexts',
-    sendState: 'be8.sendState',
-    receiveState: 'be8.receiveState',
+    scopes: 'be9.scopes',
+    publicKeys: 'be9.publicKeys',
+    privateKeys: 'be9.privateKeys',
+    groupKeys: 'be9.groupKeys',
+    groupEpochs: 'be9.groupEpochs',
+    activeEpochs: 'be9.activeEpochs',
+    trust: 'be9.trust',
+    keyUsage: 'be9.keyUsage',
+    contexts: 'be9.contexts',
+    sendState: 'be9.sendState',
+    receiveState: 'be9.receiveState',
 });
 
 function engineError(message, code = 'INVALID_STATE') {
@@ -82,12 +106,18 @@ function databaseConnection(connection) {
 
 // Must be called synchronously by the application's onupgradeneeded handler.
 // Only engine-owned stores are created. Existing stores and records are retained.
-function upgradeBe8Schema(db, transaction) {
+function upgradeBe9Schema(db, transaction) {
     if (transaction?.mode !== 'versionchange' || transaction.db !== db) {
         throw engineError(
             'schema integration requires a versionchange transaction',
             'SCHEMA_ERROR'
         );
+    }
+    try {
+        requireBe9Schema(db);
+    } catch (error) {
+        transaction.abort();
+        throw error;
     }
     const definitions = [
         [STORES.scopes, 'namespace'],
@@ -143,6 +173,58 @@ function upgradeBe8Schema(db, transaction) {
             'schema integration failed; upgrade aborted',
             'SCHEMA_ERROR'
         );
+    }
+}
+
+// Explicit integration into the application's own version upgrade. Renaming
+// IDBObjectStore.name preserves records, indexes and CryptoKeys atomically;
+// abort restores all original names. No merge, deletion, export or key rotation.
+function requireBe9Schema(connection) {
+    const db = databaseConnection(connection);
+    if (
+        Object.values(BE8_STORES).some((name) =>
+            db.objectStoreNames.contains(name)
+        )
+    ) {
+        throw engineError(
+            'explicit migrateBe8Schema() is required before using Be9 stores',
+            'LEGACY_SCHEMA_MIGRATION_REQUIRED'
+        );
+    }
+}
+function migrateBe8Schema(db, transaction) {
+    if (transaction?.mode !== 'versionchange' || transaction.db !== db)
+        throw engineError(
+            'migration requires an application versionchange transaction',
+            'SCHEMA_ERROR'
+        );
+    try {
+        const names = Object.keys(BE8_STORES).filter((key) =>
+            db.objectStoreNames.contains(BE8_STORES[key])
+        );
+        // Validate all conflicts first; even empty target stores must not be
+        // silently replaced. The caller resolves conflicts explicitly.
+        if (names.some((key) => db.objectStoreNames.contains(STORES[key])))
+            throw engineError(
+                'both legacy and current engine stores exist; explicit conflict resolution required',
+                'SCHEMA_MIGRATION_CONFLICT'
+            );
+        for (const key of names)
+            transaction.objectStore(BE8_STORES[key]).name = STORES[key];
+        upgradeBe9Schema(db, transaction);
+        return { migratedStores: names.length };
+    } catch (error) {
+        try {
+            transaction.abort();
+        } catch {
+            /* Already terminal. */
+        }
+        throw error?.code === 'SCHEMA_MIGRATION_CONFLICT'
+            ? error
+            : engineError(
+                  'legacy schema migration failed; upgrade aborted',
+                  'SCHEMA_ERROR'
+              );
     }
 }
 
@@ -610,7 +692,7 @@ async function migratePair(publicJWK, privateJWK) {
             ['verify']
         );
         const challenge = new TextEncoder().encode(
-            'be8 private-key migration validation'
+            'be9 private-key migration validation'
         );
         const parameters = { name: 'ECDSA', hash: 'SHA-384' };
         const signature = await crypto.subtle.sign(
@@ -983,6 +1065,7 @@ class KeyStore {
 
     run(stores, mode, work) {
         this.assertActive();
+        requireBe9Schema(this.connection);
         return withTransaction(
             this.connection,
             [STORES.scopes, ...new Set(stores)],
@@ -1002,7 +1085,7 @@ class KeyStore {
             )
         ) {
             throw engineError(
-                'application must upgrade its schema with upgradeBe8Schema() before v2 encryption',
+                'application must upgrade its schema with upgradeBe9Schema() before v2 encryption',
                 'SCHEMA_UPGRADE_REQUIRED'
             );
         }
@@ -1081,6 +1164,7 @@ class KeyStore {
 
     async legacyPresent() {
         const db = databaseConnection(this.connection);
+        requireBe9Schema(db);
         const stores = ['publicKeys', 'privateKeys'].filter((name) =>
             db.objectStoreNames.contains(name)
         );
@@ -1098,6 +1182,7 @@ class KeyStore {
     // Concurrent initializers recheck inside the same multi-store write lock.
     async storeIdentity(candidate) {
         const db = databaseConnection(this.connection);
+        requireBe9Schema(db);
         const legacy = ['publicKeys', 'privateKeys'].filter((name) =>
             db.objectStoreNames.contains(name)
         );
@@ -1768,6 +1853,7 @@ class KeyStore {
             );
         }
         const db = databaseConnection(this.connection);
+        requireBe9Schema(db);
         const legacy = ['publicKeys', 'privateKeys'].filter((name) =>
             db.objectStoreNames.contains(name)
         );
@@ -1997,6 +2083,7 @@ class KeyStore {
         // instances. An unbound/wrong owner must first pass the native scope check.
         if (this.#generation !== undefined) this.#lockPeers();
         const db = databaseConnection(this.connection);
+        requireBe9Schema(db);
         const owned = Object.values(STORES).filter(
             (name) =>
                 name !== STORES.scopes &&
@@ -2061,6 +2148,7 @@ class KeyStore {
         // reservations remain: deletion must neither claim ownership nor refund.
     }
     async reinitializationState() {
+        requireBe9Schema(this.connection);
         return withTransaction(
             this.connection,
             [STORES.scopes],
@@ -2089,6 +2177,7 @@ class KeyStore {
         );
     }
     async reinitialize(candidate, expectedGeneration, valid) {
+        requireBe9Schema(this.connection);
         return withTransaction(
             this.connection,
             [STORES.scopes, STORES.publicKeys, STORES.privateKeys],
@@ -2139,7 +2228,7 @@ class KeyStore {
     }
 }
 
-const V2_SUITE = 'BE8-P384-HKDF-SHA256-A256GCM';
+const V2_SUITE = 'BE9-P384-HKDF-SHA256-A256GCM';
 const V2_PURPOSES = Object.freeze(['data', 'attachment', 'key-wrap']);
 const fields$1 = [
     'version',
@@ -2196,7 +2285,7 @@ function endpoint(value) {
     return value;
 }
 
-function derivationSnapshot(value) {
+function derivationSnapshot(value, legacy = false) {
     if (!value)
         throw fail(
             'v2 derivation metadata is required; use the explicit legacy reader for old ciphertexts',
@@ -2215,7 +2304,7 @@ function derivationSnapshot(value) {
         );
         if (
             snapshot.version !== 2 ||
-            snapshot.suite !== V2_SUITE ||
+            snapshot.suite !== (legacy ? BE8_V2_SUITE : V2_SUITE) ||
             !V2_PURPOSES.includes(snapshot.purpose)
         )
             throw fail();
@@ -2233,8 +2322,8 @@ function derivationSnapshot(value) {
 
 // Fixed domain prefix plus eight ordered, uint32-BE length-prefixed byte strings.
 // No separators, normalization, optional fields or object serialization enter info.
-function encodeV2DerivationInfo(metadata) {
-    const context = derivationSnapshot(metadata);
+function encodeV2DerivationInfo$1(metadata, legacy = false) {
+    const context = derivationSnapshot(metadata, legacy);
     const values = [
         encoder.encode('2'),
         encoder.encode(context.suite),
@@ -2245,7 +2334,10 @@ function encodeV2DerivationInfo(metadata) {
         decode32(context.receiverFingerprint),
         encoder.encode(context.purpose),
     ];
-    return encodeFields('BE8-HKDF-INFO', values);
+    return encodeFields(
+        legacy ? BE8_DOMAINS.pairInfo : 'BE9-HKDF-INFO',
+        values
+    );
 }
 
 function encodeFields(domain, values) {
@@ -2299,7 +2391,7 @@ async function createV2Metadata(localID, ownPublicKey, peerPublicKey, options) {
 
 // Internal helper also exercised against RFC 5869 public test vectors.
 // It never returns IKM, PRK, raw AES bytes or an extractable derived key.
-async function hkdfAES(secret, salt, info, purpose) {
+async function hkdfAES(secret, salt, info, purpose, readOnly = false) {
     if (!V2_PURPOSES.includes(purpose)) throw fail();
     let material;
     try {
@@ -2311,7 +2403,11 @@ async function hkdfAES(secret, salt, info, purpose) {
     }
     const usages =
         purpose === 'key-wrap'
-            ? ['wrapKey', 'unwrapKey']
+            ? readOnly
+                ? ['unwrapKey']
+                : ['wrapKey', 'unwrapKey']
+            : readOnly
+            ? ['decrypt']
             : ['encrypt', 'decrypt'];
     return crypto.subtle.deriveKey(
         { name: 'HKDF', hash: 'SHA-256', salt, info },
@@ -2327,9 +2423,10 @@ async function deriveV2AES(
     ownPublicKey,
     peerPublicKey,
     privateKey,
-    metadata
+    metadata,
+    legacy = false
 ) {
-    const context = derivationSnapshot(metadata);
+    const context = derivationSnapshot(metadata, legacy);
     const priv = privateCryptoKey(privateKey);
     if (priv.usages[0] !== 'deriveBits') {
         throw fail(
@@ -2378,8 +2475,9 @@ async function deriveV2AES(
         return await hkdfAES(
             secret,
             decode32(context.salt),
-            encodeV2DerivationInfo(context),
-            context.purpose
+            encodeV2DerivationInfo$1(context, legacy),
+            context.purpose,
+            legacy
         );
     } finally {
         // Best effort only: WebCrypto/runtime copies and GC are outside our control.
@@ -2474,12 +2572,12 @@ function decryptPayload(key, payload) {
 // Only actual, validated derivation inputs enter this identity. No caller alias
 // or storage namespace can make the same HKDF key get a fresh local budget.
 async function derivationUsageID(derivation) {
-    const info = encodeV2DerivationInfo(derivation);
+    const info = encodeV2DerivationInfo$1(derivation);
     return usageIdentity(derivation.salt, info);
 }
 
 async function usageIdentity(salt, info) {
-    const prefix = new TextEncoder().encode('BE8-GCM-USAGE');
+    const prefix = new TextEncoder().encode('BE9-GCM-USAGE');
     const bytes = new Uint8Array(prefix.length + 32 + info.length);
     bytes.set(prefix);
     bytes.set(decode32(salt), prefix.length);
@@ -2488,7 +2586,7 @@ async function usageIdentity(salt, info) {
 }
 
 /* global BigInt */
-const GROUP_SUITE = 'BE8-GROUP-HKDF-SHA256-A256GCM';
+const GROUP_SUITE = 'BE9-GROUP-HKDF-SHA256-A256GCM';
 const fields = [
     'version',
     'suite',
@@ -2500,13 +2598,13 @@ const fields = [
     'purpose',
     'salt',
 ];
-function groupDerivationSnapshot(value) {
+function groupDerivationSnapshot(value, legacy = false) {
     const result = Object.fromEntries(
         fields.map((field) => [field, value[field]])
     );
     if (
         result.version !== 2 ||
-        result.suite !== GROUP_SUITE ||
+        result.suite !== (legacy ? BE8_GROUP_SUITE : GROUP_SUITE) ||
         !['data', 'attachment'].includes(result.purpose) ||
         typeof result.sender !== 'string' ||
         !/^(0|[1-9][0-9]*)$/.test(result.sender) ||
@@ -2523,8 +2621,8 @@ function groupDerivationSnapshot(value) {
     decode32(result.salt);
     return Object.freeze(result);
 }
-function encodeGroupInfo(header) {
-    const h = groupDerivationSnapshot(header);
+function encodeGroupInfo(header, legacy = false) {
+    const h = groupDerivationSnapshot(header, legacy);
     const g = header.group;
     if (
         !g ||
@@ -2534,19 +2632,22 @@ function encodeGroupInfo(header) {
         throw engineError('group binding mismatch', 'INVALID_ENVELOPE');
     const epoch = new Uint8Array(8);
     new DataView(epoch.buffer).setBigUint64(0, BigInt(g.epoch), false);
-    return encodeFields('BE8-GROUP-HKDF-INFO', [
-        scalarString('2'),
-        scalarString(h.suite),
-        scalarString(h.contextID),
-        scalarString(h.sender, 256),
-        scalarString(h.receiver),
-        decode32(h.senderFingerprint),
-        decode32(h.receiverFingerprint),
-        scalarString(h.purpose),
-        scalarString(g.groupID),
-        epoch,
-        decode32(g.generation),
-    ]);
+    return encodeFields(
+        legacy ? BE8_DOMAINS.groupInfo : 'BE9-GROUP-HKDF-INFO',
+        [
+            scalarString('2'),
+            scalarString(h.suite),
+            scalarString(h.contextID),
+            scalarString(h.sender, 256),
+            scalarString(h.receiver),
+            decode32(h.senderFingerprint),
+            decode32(h.receiverFingerprint),
+            scalarString(h.purpose),
+            scalarString(g.groupID),
+            epoch,
+            decode32(g.generation),
+        ]
+    );
 }
 async function groupGeneration(bytes) {
     return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
@@ -2582,18 +2683,18 @@ function requireGroupSecret(key) {
         );
     return key;
 }
-async function deriveGroupAES(key, header) {
+async function deriveGroupAES(key, header, legacy = false) {
     return crypto.subtle.deriveKey(
         {
             name: 'HKDF',
             hash: 'SHA-256',
             salt: decode32(header.salt),
-            info: encodeGroupInfo(header),
+            info: encodeGroupInfo(header, legacy),
         },
         requireGroupSecret(key),
         { name: 'AES-GCM', length: 256 },
         false,
-        ['encrypt', 'decrypt']
+        legacy ? ['decrypt'] : ['encrypt', 'decrypt']
     );
 }
 
@@ -2674,23 +2775,23 @@ function groupSnapshot(value) {
         generation: value.generation,
     });
 }
-function headerMetadata(header) {
+function headerMetadata(header, legacy = false) {
     const value = Object.fromEntries(
         metadataFields.map((field) => [field, header[field]])
     );
-    return header.suite === GROUP_SUITE
-        ? groupDerivationSnapshot(value)
-        : derivationSnapshot(value);
+    return header.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE)
+        ? groupDerivationSnapshot(value, legacy)
+        : derivationSnapshot(value, legacy);
 }
-function headerSnapshot(value) {
+function headerSnapshot(value, legacy = false) {
     try {
         value = exactObject(value, headerFields);
-        const metadata = headerMetadata(value);
+        const metadata = headerMetadata(value, legacy);
         const iv = decodeBase64url(value.iv, 12);
         if (iv.length !== 12 || sequenceValue(value.sequence) === 0n)
             throw invalidEnvelope();
         const group = groupSnapshot(value.group);
-        if (metadata.suite === GROUP_SUITE) {
+        if (metadata.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE)) {
             if (
                 !group ||
                 group.groupID !== metadata.receiver ||
@@ -2715,20 +2816,20 @@ function headerSnapshot(value) {
         throw invalidEnvelope();
     }
 }
-function envelopeSnapshot(value) {
+function envelopeSnapshot(value, legacy = false) {
     value = exactObject(value, ['header', 'ciphertext']);
-    const header = headerSnapshot(value.header);
+    const header = headerSnapshot(value.header, legacy);
     if (typeof value.ciphertext !== 'string') throw invalidEnvelope();
     const payload = payloadSnapshot(value.ciphertext, header.iv);
     return { header, payload, ciphertext: value.ciphertext };
 }
-function encodeEnvelopeAAD(value) {
-    const h = headerSnapshot(value);
+function encodeEnvelopeAAD$1(value, legacy = false) {
+    const h = headerSnapshot(value, legacy);
     const g = h.group;
-    const aad = encodeFields('BE8-ENVELOPE-AAD', [
-        h.suite === GROUP_SUITE
-            ? encodeGroupInfo(h)
-            : encodeV2DerivationInfo(headerMetadata(h)),
+    const aad = encodeFields(legacy ? BE8_DOMAINS.aad : 'BE9-ENVELOPE-AAD', [
+        h.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE)
+            ? encodeGroupInfo(h, legacy)
+            : encodeV2DerivationInfo$1(headerMetadata(h, legacy), legacy),
         decode32(h.salt),
         decodeBase64url(h.iv, 12),
         uint64(h.sequence),
@@ -2764,7 +2865,7 @@ function checkExpected(header, expected, localID) {
 // One byte-based authenticated operation. Wrapping is internal; no public
 // group-secret decoder or private-key export is introduced.
 async function sealBytes(key, header, bytes) {
-    const additionalData = encodeEnvelopeAAD(header);
+    const additionalData = encodeEnvelopeAAD$1(header);
     const algorithm = {
         name: 'AES-GCM',
         iv: decodeBase64url(header.iv, 12),
@@ -2786,13 +2887,13 @@ async function sealBytes(key, header, bytes) {
     }
     return encodeBase64url(await crypto.subtle.encrypt(algorithm, key, bytes));
 }
-async function openBytes(key, snapshot) {
+async function openBytes(key, snapshot, legacy = false) {
     const h = snapshot.header;
     const algorithm = {
         name: 'AES-GCM',
         iv: snapshot.payload.iv,
         tagLength: 128,
-        additionalData: encodeEnvelopeAAD(h),
+        additionalData: encodeEnvelopeAAD$1(h, legacy),
     };
     if (h.purpose === 'key-wrap') {
         if (snapshot.payload.bytes.length !== 48 || !h.group)
@@ -2869,7 +2970,7 @@ class Envelopes {
         await this.keys.reserveUsage(
             await derivationUsageID(metadata),
             bytes.length,
-            encodeEnvelopeAAD(template).length
+            encodeEnvelopeAAD$1(template).length
         );
         const header = headerSnapshot({
             ...template,
@@ -2877,15 +2978,16 @@ class Envelopes {
         });
         return { header, ciphertext: await sealBytes(key, header, bytes) };
     }
-    async open(value, expected) {
-        const snapshot = envelopeSnapshot(value);
+    async open(value, expected, legacy = false) {
+        const snapshot = envelopeSnapshot(value, legacy);
         expected = expected && {
             sender: expected.sender,
             receiver: expected.receiver,
             contextID: expected.contextID,
             purpose: expected.purpose,
         };
-        if (snapshot.header.suite === GROUP_SUITE) throw invalidEnvelope();
+        if (snapshot.header.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE))
+            throw invalidEnvelope();
         checkExpected(snapshot.header, expected, this.localID);
         const [peer, privateKey, own] = await this.keys.endpointKeys(
             snapshot.header.sender,
@@ -2907,11 +3009,12 @@ class Envelopes {
             own,
             peer,
             privateKey,
-            headerMetadata(snapshot.header)
+            headerMetadata(snapshot.header, legacy),
+            legacy
         );
         return {
             header: snapshot.header,
-            bytes: await openBytes(key, snapshot),
+            bytes: await openBytes(key, snapshot, legacy),
         };
     }
 }
@@ -3059,8 +3162,8 @@ class Groups {
             bytes.fill(0);
         }
     }
-    async import(value, expected) {
-        const packet = envelopeSnapshot(value);
+    async import(value, expected, legacy = false) {
+        const packet = envelopeSnapshot(value, legacy);
         const group = groupSnapshot(
             expected && {
                 groupID: expected.groupID,
@@ -3088,7 +3191,8 @@ class Groups {
         }
         const opened = await this.envelopes.open(
             { header: packet.header, ciphertext: packet.ciphertext },
-            copied
+            copied,
+            legacy
         );
         try {
             if ((await groupGeneration(opened.bytes)) !== group.generation)
@@ -3193,7 +3297,7 @@ class Groups {
                 )
         );
     }
-    async stream(expected) {
+    async stream(expected, legacy = false) {
         expected = expected && {
             groupID: expected.groupID,
             epoch: expected.epoch,
@@ -3231,7 +3335,7 @@ class Groups {
             record,
             header: {
                 version: 2,
-                suite: GROUP_SUITE,
+                suite: legacy ? BE8_GROUP_SUITE : GROUP_SUITE,
                 contextID: expected.contextID,
                 sender: expected.sender,
                 receiver: group.groupID,
@@ -3242,10 +3346,10 @@ class Groups {
             },
         };
     }
-    async openReceive(expected) {
-        const { header } = await this.stream(expected);
+    async openReceive(expected, legacy = false) {
+        const { header } = await this.stream(expected, legacy);
         await this.replay.openContext(header.contextID);
-        await this.replay.initialize(header, 'receive');
+        await this.replay.initialize(header, 'receive', legacy);
     }
     async seal(id, value, options) {
         const bytes = bytesSnapshot(value, V2_LIMITS.plaintextBytes);
@@ -3278,7 +3382,7 @@ class Groups {
         await this.keys.reserveUsage(
             await usageIdentity(template.salt, encodeGroupInfo(template)),
             bytes.length,
-            encodeEnvelopeAAD(template).length
+            encodeEnvelopeAAD$1(template).length
         );
         const header = headerSnapshot({
             ...template,
@@ -3286,8 +3390,8 @@ class Groups {
         });
         return { header, ciphertext: await sealBytes(key, header, bytes) };
     }
-    async open(value, expected) {
-        const packet = envelopeSnapshot(value);
+    async open(value, expected, legacy = false) {
+        const packet = envelopeSnapshot(value, legacy);
         // Copy expectations before storage or crypto yields.
         expected = expected && {
             sender: expected.sender,
@@ -3299,7 +3403,7 @@ class Groups {
         };
         const h = packet.header;
         if (
-            h.suite !== GROUP_SUITE ||
+            h.suite !== (legacy ? BE8_GROUP_SUITE : GROUP_SUITE) ||
             !h.group ||
             h.sender !== expected?.sender ||
             h.contextID !== expected?.contextID ||
@@ -3313,7 +3417,7 @@ class Groups {
                 'ENVELOPE_EXPECTATION_MISMATCH'
             );
         }
-        const { record, header } = await this.stream(expected);
+        const { record, header } = await this.stream(expected, legacy);
         if (
             header.senderFingerprint !== h.senderFingerprint ||
             header.receiverFingerprint !== h.receiverFingerprint
@@ -3322,8 +3426,8 @@ class Groups {
                 'group key generation or sender fingerprint mismatch',
                 'DERIVATION_KEY_MISMATCH'
             );
-        const key = await deriveGroupAES(record.key, h);
-        return { header: h, bytes: await openBytes(key, packet) };
+        const key = await deriveGroupAES(record.key, h, legacy);
+        return { header: h, bytes: await openBytes(key, packet, legacy) };
     }
 }
 
@@ -3332,7 +3436,7 @@ class Groups {
 const REPLAY_WINDOW = 128;
 const MASK = (1n << 128n) - 1n;
 const emptyBitmap = '0'.repeat(32);
-async function streamIdentity(header) {
+async function streamIdentity(header, legacy = false) {
     const g = header.group;
     const fields = [
         header.suite,
@@ -3347,7 +3451,7 @@ async function streamIdentity(header) {
         g?.generation || '',
     ];
     const bytes = encodeFields(
-        'BE8-REPLAY-STREAM',
+        legacy ? BE8_DOMAINS.replay : 'BE9-REPLAY-STREAM',
         fields.map((value) => new TextEncoder().encode(value))
     );
     return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
@@ -3427,8 +3531,8 @@ class Replay {
             );
         });
     }
-    async initialize(header, direction) {
-        const streamID = await streamIdentity(header);
+    async initialize(header, direction, legacy = false) {
+        const streamID = await streamIdentity(header, legacy);
         const name =
             direction === 'send' ? STORES.sendState : STORES.receiveState;
         return this.keys.run([STORES.contexts, name], 'readwrite', (tx) => {
@@ -3535,8 +3639,8 @@ class Replay {
                 )
         );
     }
-    async accept(header) {
-        const streamID = await streamIdentity(header);
+    async accept(header, legacy = false) {
+        const streamID = await streamIdentity(header, legacy);
         return this.keys.run(
             [STORES.contexts, STORES.receiveState],
             'readwrite',
@@ -3627,8 +3731,17 @@ class Replay {
     }
 }
 
-class Be8 {
-    static upgradeBe8Schema = upgradeBe8Schema;
+const encodeV2DerivationInfo = (metadata) => encodeV2DerivationInfo$1(metadata);
+const encodeBe8DerivationInfo = (metadata) =>
+    encodeV2DerivationInfo$1(metadata, true);
+const encodeEnvelopeAAD = (header) => encodeEnvelopeAAD$1(header);
+const encodeBe8EnvelopeAAD = (header) => encodeEnvelopeAAD$1(header, true);
+
+class Be9 {
+    static upgradeBe9Schema = upgradeBe9Schema;
+    static migrateBe8Schema = migrateBe8Schema;
+    static encodeBe8DerivationInfo = encodeBe8DerivationInfo;
+    static encodeBe8EnvelopeAAD = encodeBe8EnvelopeAAD;
     static STORES = STORES;
     static jwkThumbprint = jwkThumbprint;
     static V2_SUITE = V2_SUITE;
@@ -3715,14 +3828,14 @@ class Be8 {
         this.#keys.onLock = () => this.#invalidateLocal();
         // Guard every public async operation, including raw AES/archive/getters.
         // Invoke synchronously so each method snapshots caller inputs before yields.
-        for (const name of Object.getOwnPropertyNames(Be8.prototype)) {
+        for (const name of Object.getOwnPropertyNames(Be9.prototype)) {
             if (
                 ['constructor', 'getAccID', 'panic', 'reinitialize'].includes(
                     name
                 )
             )
                 continue;
-            const method = Be8.prototype[name];
+            const method = Be9.prototype[name];
             Object.defineProperty(this, name, {
                 value: (...args) => this.#guard(method, args),
             });
@@ -4183,6 +4296,12 @@ class Be8 {
         return this.#replay.closeContext(contextID);
     }
     async openReceiveContext(expected) {
+        return this.#openReceiveContext(expected, false);
+    }
+    async openReceiveBe8Context(expected) {
+        return this.#openReceiveContext(expected, true);
+    }
+    async #openReceiveContext(expected, legacy) {
         if (
             !expected ||
             expected.receiver !== this.#accID ||
@@ -4210,14 +4329,14 @@ class Be8 {
             );
         const metadata = {
             version: 2,
-            suite: V2_SUITE,
+            suite: legacy ? BE8_V2_SUITE : V2_SUITE,
             ...expected,
             senderFingerprint: await jwkThumbprint(peer),
             receiverFingerprint: await jwkThumbprint(own),
             group: null,
         };
         await this.#replay.openContext(expected.contextID);
-        await this.#replay.initialize(metadata, 'receive');
+        await this.#replay.initialize(metadata, 'receive', legacy);
     }
     async receiveEnvelope(envelope, expected) {
         if (!expected || !['data', 'attachment'].includes(expected.purpose))
@@ -4331,7 +4450,8 @@ class Be8 {
         iv,
         derivation,
         purpose,
-        options = {}
+        options = {},
+        legacy = false
     ) {
         if (
             !options ||
@@ -4353,7 +4473,7 @@ class Be8 {
             iv,
             options.legacyUUID === true
         );
-        const metadata = derivationSnapshot(derivation);
+        const metadata = derivationSnapshot(derivation, legacy);
         if (
             metadata.sender !== sender ||
             metadata.receiver !== receiver ||
@@ -4384,7 +4504,8 @@ class Be8 {
             own,
             peer,
             privateKey,
-            metadata
+            metadata,
+            legacy
         );
         return decodeText(await decryptPayload(key, payload));
     }
@@ -4423,6 +4544,143 @@ class Be8 {
             'attachment',
             options
         );
+    }
+
+    // Frozen Be8 profile readers. They never retry Be9 or direct-ECDH after
+    // failure; suite selection is the explicit caller method, not wire sniffing.
+    async getBe8DerivedKey(publicKey, keyReference, metadata) {
+        publicKey = keySnapshot(publicKey);
+        const context = derivationSnapshot(metadata, true);
+        if (!['data', 'attachment'].includes(context.purpose))
+            throw engineError(
+                'legacy derived key reader accepts data and attachment only',
+                'INVALID_PURPOSE'
+            );
+        const local = await this.#localPair(keyReference, true);
+        return deriveV2AES(
+            local.endpoint,
+            local.publicKey,
+            publicKey,
+            local.privateKey,
+            context,
+            true
+        );
+    }
+    async decryptBe8TextUnframedLegacy(
+        sender,
+        receiver,
+        ciphertext,
+        iv,
+        derivation,
+        options = {}
+    ) {
+        return this.#unframedLegacy(
+            sender,
+            receiver,
+            ciphertext,
+            iv,
+            derivation,
+            'data',
+            options,
+            true
+        );
+    }
+    async decryptBe8ImageUnframedLegacy(
+        sender,
+        receiver,
+        ciphertext,
+        iv,
+        derivation,
+        options = {}
+    ) {
+        return this.#unframedLegacy(
+            sender,
+            receiver,
+            ciphertext,
+            iv,
+            derivation,
+            'attachment',
+            options,
+            true
+        );
+    }
+    async decryptBe8Envelope(envelope, expected) {
+        if (!expected || !['data', 'attachment'].includes(expected.purpose))
+            throw engineError(
+                'independent data expectations required',
+                'ENVELOPE_EXPECTATION_REQUIRED'
+            );
+        return (await this.#envelopes.open(envelope, expected, true)).bytes;
+    }
+    async #readBe8(envelope, expected, purpose, receive) {
+        if (expected?.purpose !== purpose)
+            throw engineError(
+                'expected legacy purpose required',
+                'INVALID_PURPOSE'
+            );
+        const result = await this.#envelopes.open(envelope, expected, true);
+        const text = decodeText(result.bytes);
+        if (receive) await this.#replay.accept(result.header, true);
+        return text;
+    }
+    async decryptBe8Text(envelope, expected) {
+        return this.#readBe8(envelope, expected, 'data', false);
+    }
+    async decryptBe8Image(envelope, expected) {
+        return this.#readBe8(envelope, expected, 'attachment', false);
+    }
+    async receiveBe8Text(envelope, expected) {
+        return this.#readBe8(envelope, expected, 'data', true);
+    }
+    async receiveBe8Image(envelope, expected) {
+        return this.#readBe8(envelope, expected, 'attachment', true);
+    }
+    async receiveBe8Envelope(envelope, expected) {
+        if (!expected || !['data', 'attachment'].includes(expected.purpose))
+            throw engineError(
+                'independent data expectations required',
+                'ENVELOPE_EXPECTATION_REQUIRED'
+            );
+        const result = await this.#envelopes.open(envelope, expected, true);
+        await this.#replay.accept(result.header, true);
+        return result.bytes;
+    }
+    async importBe8GroupEpoch(envelope, expected) {
+        return this.#groups.import(envelope, expected, true);
+    }
+    async openReceiveBe8GroupContext(expected) {
+        return this.#groups.openReceive(expected, true);
+    }
+    async decryptBe8GroupEnvelope(envelope, expected) {
+        return (await this.#groups.open(envelope, expected, true)).bytes;
+    }
+    async receiveBe8GroupEnvelope(envelope, expected) {
+        const result = await this.#groups.open(envelope, expected, true);
+        await this.#replay.accept(result.header, true);
+        return result.bytes;
+    }
+    async #readBe8Group(envelope, expected, purpose, receive) {
+        if (expected?.purpose !== purpose)
+            throw engineError(
+                'expected legacy purpose required',
+                'INVALID_PURPOSE'
+            );
+        const result = await this.#groups.open(envelope, expected, true);
+        const text = decodeText(result.bytes);
+        if (receive) await this.#replay.accept(result.header, true);
+        return text;
+    }
+    async decryptBe8GroupText(envelope, expected) {
+        return this.#readBe8Group(envelope, expected, 'data', false);
+    }
+    async decryptBe8GroupImage(envelope, expected) {
+        return this.#readBe8Group(envelope, expected, 'attachment', false);
+    }
+    async receiveBe8GroupText(envelope, expected) {
+        return this.#readBe8Group(envelope, expected, 'data', true);
+    }
+    async receiveBe8GroupImage(envelope, expected) {
+        return this.#readBe8Group(envelope, expected, 'attachment', true);
     }
 
     async decryptTextLegacy(key, ciphertext, iv) {
@@ -4519,10 +4777,13 @@ export {
     V2_LIMITS,
     V2_SUITE,
     decodeBase64url,
-    Be8 as default,
+    Be9 as default,
     encodeBase64url,
+    encodeBe8DerivationInfo,
+    encodeBe8EnvelopeAAD,
     encodeEnvelopeAAD,
     encodeV2DerivationInfo,
     jwkThumbprint,
-    upgradeBe8Schema,
+    migrateBe8Schema,
+    upgradeBe9Schema,
 };

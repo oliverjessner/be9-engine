@@ -1,11 +1,11 @@
-import Be8 from '../lib/bundle.mjs';
+import Be9 from '../lib/bundle.mjs';
 import { openDatabase, deleteDatabase } from './database.mjs';
 import { encodeBase64url, decodeBase64url } from '../lib/encoding.mjs';
 
 // Opaque local key references stay inside each participant's closure. Only public JWKs are
 // exchanged. The derive method always uses this participant's local private key.
 export async function createParticipant(id, database) {
-    const engine = new Be8(id, database.connection);
+    const engine = new Be9(id, database.connection);
     await engine.setup();
     await database.whenIdle();
     const { keyReference } = await engine.generatePrivAndPubKey();

@@ -1,7 +1,14 @@
-# be8-engine
-Be8 is a reusable JavaScript ESM cryptography engine using native WebCrypto
+# be9-engine
+Be9 is a reusable JavaScript ESM cryptography engine using native WebCrypto
 P-384 ECDH plus HKDF-SHA-256 and AES-256-GCM. Applications supply data, public keys, trust
 decisions, context, and an application-owned IndexedDB connection.
+
+The constructor is `Be9`, the classic-script global is `be9`, and schema
+integration uses `upgradeBe9Schema`. Existing `be8.*` databases require the
+explicit `migrateBe8Schema` application upgrade. New encryption uses Be9 suite
+and domain identifiers; retained Be8 ciphertexts require explicit Be8 readers.
+See [rename and migration](docs/be9-migration.md) for breaking changes, code,
+compatibility APIs and validation results.
 
 ## usage
 
@@ -16,13 +23,13 @@ The application integrates the engine schema into its own upgrade handler and
 chooses its database name and version:
 
 ```javascript
-import Be8, { upgradeBe8Schema } from 'be8-engine';
+import Be9, { upgradeBe9Schema } from 'be9-engine';
 
 const request = indexedDB.open('my-application', 2); // Application-owned version.
 let upgradeError;
 request.onupgradeneeded = () => {
     try {
-        upgradeBe8Schema(request.result, request.transaction);
+        upgradeBe9Schema(request.result, request.transaction);
         // Integrate other application stores here.
     } catch (error) {
         upgradeError = error; // The helper has already aborted its failed upgrade.
@@ -35,31 +42,31 @@ const db = await new Promise((resolve, reject) => {
 });
 db.addEventListener('versionchange', () => db.close()); // Application lifecycle.
 
-const be8 = new Be8('1', db, { namespace: '1' });
-await be8.setup();
-const hasKeys = await be8.hasGeneratedKeys();
+const be9 = new Be9('1', db, { namespace: '1' });
+await be9.setup();
+const hasKeys = await be9.hasGeneratedKeys();
 ```
 
-`upgradeBe8Schema(db, transaction)` is synchronous and requires the application's
+`upgradeBe9Schema(db, transaction)` is synchronous and requires the application's
 native versionchange transaction. Repeated calls are safe for a matching schema.
 Incompatible engine store/index definitions abort the upgrade; no store is deleted
 or replaced. The engine uses these dedicated stores alongside application stores:
 
 | Store | Primary key | Contents |
 | --- | --- | --- |
-| `be8.scopes` | `namespace` | Permanent account/namespace binding, lifecycle status and generation |
-| `be8.publicKeys` | `[namespace, accID]` | Public JWK in a separate `key` field |
-| `be8.privateKeys` | `[namespace, accID]` | Non-extractable private ECDH `CryptoKey` in `key`, public JWK in `publicKey` |
-| `be8.groupKeys` | `[namespace, groupID, version]` | Retained legacy public JWK in `key`, optional non-extractable ECDH `CryptoKey` in `privateKey` |
-| `be8.trust` | `[namespace, peerID]` | SHA-256 thumbprint and local `unverified`, `confirmed`, or `tofu` status |
-| `be8.groupEpochs` | `[namespace, groupID, epoch]` | Non-extractable symmetric HKDF key and public generation/issuer metadata |
-| `be8.activeEpochs` | `[namespace, groupID]` | Explicit active epoch selection |
-| `be8.contexts` | `[namespace, contextID]` | Open/closed state and bounded stream registry |
-| `be8.sendState` | `[namespace, contextID, streamID]` | Committed uint64 send counter |
-| `be8.receiveState` | `[namespace, contextID, streamID]` | Highest uint64 sequence and 128-bit replay bitmap |
-| `be8.keyUsage` | `derivationID` | Database-wide encryption/GHASH counters keyed by validated actual derivation |
+| `be9.scopes` | `namespace` | Permanent account/namespace binding, lifecycle status and generation |
+| `be9.publicKeys` | `[namespace, accID]` | Public JWK in a separate `key` field |
+| `be9.privateKeys` | `[namespace, accID]` | Non-extractable private ECDH `CryptoKey` in `key`, public JWK in `publicKey` |
+| `be9.groupKeys` | `[namespace, groupID, version]` | Retained legacy public JWK in `key`, optional non-extractable ECDH `CryptoKey` in `privateKey` |
+| `be9.trust` | `[namespace, peerID]` | SHA-256 thumbprint and local `unverified`, `confirmed`, or `tofu` status |
+| `be9.groupEpochs` | `[namespace, groupID, epoch]` | Non-extractable symmetric HKDF key and public generation/issuer metadata |
+| `be9.activeEpochs` | `[namespace, groupID]` | Explicit active epoch selection |
+| `be9.contexts` | `[namespace, contextID]` | Open/closed state and bounded stream registry |
+| `be9.sendState` | `[namespace, contextID, streamID]` | Committed uint64 send counter |
+| `be9.receiveState` | `[namespace, contextID, streamID]` | Highest uint64 sequence and 128-bit replay bitmap |
+| `be9.keyUsage` | `derivationID` | Database-wide encryption/GHASH counters keyed by validated actual derivation |
 
-All namespace-scoped stores other than `be8.scopes` have a nonunique `namespace` index. The
+All namespace-scoped stores other than `be9.scopes` have a nonunique `namespace` index. The
 usage store is global to this database and has no namespace index. A namespace is bound to
 one account on its first successful mutation. A different account cannot read,
 write, initialize, or clear it. The same account can use multiple explicitly
@@ -109,9 +116,9 @@ label does not implement JOSE ECDH-ES or its KDF/envelope. Primitive derivation
 validates the same supported public-key profile.
 
 ```javascript
-import Be8, { jwkThumbprint } from 'be8-engine';
+import Be9, { jwkThumbprint } from 'be9-engine';
 const fingerprint = await jwkThumbprint(bobPublicJWK);
-// Also available as Be8.jwkThumbprint(), including on the IIFE constructor.
+// Also available as Be9.jwkThumbprint(), including on the IIFE constructor.
 ```
 
 The thumbprint follows [RFC 7638](https://www.rfc-editor.org/rfc/rfc7638.html):
@@ -129,14 +136,14 @@ or making its own explicit trust decision:
 
 ```javascript
 // Default: retain the key for inspection, without authorizing convenience use.
-await be8.addPublicKey('2', bobPublicJWK);
+await be9.addPublicKey('2', bobPublicJWK);
 
 // A fingerprint supplied by the application from its independent trust process.
-await be8.addPublicKey('2', bobPublicJWK, { expectedFingerprint: independentlyConfirmedFingerprint });
+await be9.addPublicKey('2', bobPublicJWK, { expectedFingerprint: independentlyConfirmedFingerprint });
 
 // Alternatively, the application explicitly takes responsibility for trust.
-await be8.addPublicKey('2', bobPublicJWK, { trust: 'confirmed' });
-const trust = await be8.getPeerTrust('2');
+await be9.addPublicKey('2', bobPublicJWK, { trust: 'confirmed' });
+const trust = await be9.getPeerTrust('2');
 // { peerID: '2', fingerprint, status: 'unverified' | 'confirmed' | 'tofu' }
 // undefined means no persisted decision exists; it never grants authorization.
 ```
@@ -150,7 +157,7 @@ objects into the separate local decision argument.
 TOFU is enabled only explicitly, per import:
 
 ```javascript
-await be8.addPublicKey('2', bobPublicJWK, { tofu: true });
+await be9.addPublicKey('2', bobPublicJWK, { tofu: true });
 ```
 
 TOFU grants convenience use only for a genuinely new contact with neither an
@@ -166,7 +173,7 @@ decision preserves its status. A wrong expected fingerprint rejects with
 Bulk decisions are a separate application-owned list selected by `peerID`:
 
 ```javascript
-await be8.addPublicKeys([
+await be9.addPublicKeys([
     { accID: '2', publicKey: bobPublicJWK },
     { accID: '3', publicKey: carolPublicJWK },
 ], { decisions: [
@@ -185,7 +192,7 @@ separately supplied account or namespace metadata.
 Retained legacy public ECDH group endpoints use the same policy, with `peerID: 'g10300:1'`:
 
 ```javascript
-await be8.addLegacyGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }], {
+await be9.addLegacyGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }], {
     decisions: [{ peerID: 'g10300:1', expectedFingerprint: independentlyConfirmedGroupFingerprint }],
 });
 ```
@@ -203,7 +210,7 @@ peer-trust enforcement.
 Peer replacement is a separate compare-and-swap operation:
 
 ```javascript
-await be8.replacePublicKey('2', newBobPublicJWK, {
+await be9.replacePublicKey('2', newBobPublicJWK, {
     expectedPreviousFingerprint: previouslyStoredBobFingerprint,
     confirmedNewFingerprint: independentlyConfirmedNewBobFingerprint,
 });
@@ -221,14 +228,14 @@ crypto operations may finish with the committed snapshot they read before a
 replacement; a trust update is not cancellation of in-flight work.
 
 Existing applications must increment their own database version and call
-`upgradeBe8Schema()` in their upgrade handler to create `be8.trust`. The helper
+`upgradeBe9Schema()` in their upgrade handler to create `be9.trust`. The helper
 only creates/checks dedicated engine schema; it does not validate or confirm old
 keys. Records lacking trust remain unauthorized. After integrating the schema,
 the application can explicitly initialize trust records for the old scoped public
 peer/group records:
 
 ```javascript
-const { migratedPeers } = await be8.migratePublicKeyTrust();
+const { migratedPeers } = await be9.migratePublicKeyTrust();
 ```
 
 This validates existing public keys and atomically adds only missing `unverified`
@@ -256,8 +263,8 @@ Existing private JWKs require an explicit application migration decision:
 ```javascript
 // Convert this namespace's existing identity and private group JWK records.
 // Call before setup when setup reports PRIVATE_KEY_MIGRATION_REQUIRED.
-const { migratedIdentity, migratedGroups } = await be8.migratePrivateKeys();
-await be8.setup();
+const { migratedIdentity, migratedGroups } = await be9.migratePrivateKeys();
+await be9.setup();
 ```
 
 For an old unscoped `publicKeys`/`privateKeys` identity, default setup reports
@@ -265,14 +272,14 @@ For an old unscoped `publicKeys`/`privateKeys` identity, default setup reports
 handler first, then explicitly adopt that account's existing identity:
 
 ```javascript
-await be8.migratePrivateKeys({
+await be9.migratePrivateKeys({
     legacyIdentity: true,
     // Optional, explicit application-owned selection of old local private groups.
     // Old group ownership cannot be inferred by the engine.
     // Keep the original IndexedDB version key type (number or canonical string).
     legacyGroups: [{ groupID: 'g10300', version: '1' }],
 });
-await be8.setup();
+await be9.setup();
 ```
 
 Migration validates the existing public/private pair, imports the private JWK
@@ -347,8 +354,9 @@ It also does not guarantee forensic erasure of prior JWK storage.
   128-bit GCM tags. Byte/text/image helpers share 16 MiB bounds. Private and
   derived/operative symmetric keys are non-extractable. Existing image strings
   remain text; use byte APIs for raw image bytes.
-- Previous ciphertext/IV/HKDF tuples use `decryptTextUnframedLegacy` or its image
-  equivalent. Only explicitly selected `{ legacyUUID: true }` accepts the earlier
+- Be9 ciphertext/IV/HKDF tuples use `decryptTextUnframedLegacy` or its image
+  equivalent. Retained Be8 HKDF tuples instead use `decryptBe8TextUnframedLegacy`
+  or `decryptBe8ImageUnframedLegacy`. Only explicitly selected `{ legacyUUID: true }` accepts the earlier
   UUID/padded-Base64 HKDF representation. Direct-ECDH data uses `getLegacyDerivedKey`
   and `decryptText/Image(Simple)Legacy`. No validation/authentication failure
   selects another format. DeriveKey-only identities remain available for legacy
@@ -357,7 +365,7 @@ It also does not guarantee forensic erasure of prior JWK storage.
   imports never replace a changed key; explicit replacement uses fingerprint CAS.
   Bulk imports cannot bypass policy. Embedded account/trust metadata cannot
   override separate arguments. Old unverified records remain unverified.
-- Integrate all additional stores with `upgradeBe8Schema` in the application's
+- Integrate all additional stores with `upgradeBe9Schema` in the application's
   version upgrade. Native request success is insufficient: mutations wait for
   commit. Persistent actual-key usage limits survive reload and namespace aliases;
   raw/cloned keys and direct WebCrypto require caller accounting.
@@ -366,24 +374,26 @@ It also does not guarantee forensic erasure of prior JWK storage.
   tombstone. Failure leaves it locked. `setup()` cannot unlock/recreate identity;
   use explicit `reinitialize()` after successful panic. Other live/stale instances
   cannot adopt that new generation. [Lifecycle contract](docs/lifecycle.md).
-- Named ESM and constructor static helpers: `upgradeBe8Schema`, `STORES`,
+- Named ESM and constructor static helpers: `upgradeBe9Schema`, `STORES`,
   `jwkThumbprint`, `V2_SUITE`, `GROUP_SUITE`, `encodeV2DerivationInfo`,
   `encodeEnvelopeAAD`, `encodeBase64url`, `decodeBase64url`, `V2_LIMITS`,
   `REPLAY_WINDOW`.
+  Explicit compatibility helpers are `migrateBe8Schema`, `encodeBe8DerivationInfo`
+  and `encodeBe8EnvelopeAAD`; they never enable new Be8 encryption.
 
 ## hasGeneratedKeys()
 
 Checks the committed identity pair in this namespace. Returns a Promise<boolean>.
 
 ```javascript
-await be8.hasGeneratedKeys();
+await be9.hasGeneratedKeys();
 ```
 
 ## getAccID
 Return the accID.
 
 ```javascript
-be8.getAccID();
+be9.getAccID();
 ```
 
 ## async addPublicKeys(publicKeys = [], options = {})
@@ -392,7 +402,7 @@ separate decisions, first-contact keys remain unverified. Changed peer keys reje
 
 ```javascript
 const publicKeys = [{ accID: '2', publicKey: bobPublicJWK }];
-await be8.addPublicKeys(publicKeys);
+await be9.addPublicKeys(publicKeys);
 ```
 
 ## async addPublicKey(accID, key, decision = {})
@@ -400,14 +410,14 @@ Stores one peer public key and local trust state, resolving only after commit.
 Confirm through a separate local argument before convenience use.
 
 ```javascript
-await be8.addPublicKey('2', bobPublicJWK, { expectedFingerprint: independentlyConfirmedFingerprint });
+await be9.addPublicKey('2', bobPublicJWK, { expectedFingerprint: independentlyConfirmedFingerprint });
 ```
 
 ## async addLegacyGroupKeys(groupID, keys, options = {})
 Remote public group endpoints require their own separate local trust decision.
 
 ```javascript
-await be8.addLegacyGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }], {
+await be9.addLegacyGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }], {
     decisions: [{ peerID: 'g10300:1', trust: 'confirmed' }],
 });
 ```
@@ -416,7 +426,7 @@ await be8.addLegacyGroupKeys('g10300', [{ version: 1, groupKey: publicGroupJWK }
 Returns the existing or newly committed public JWK and an opaque local key reference. Existing identities are retained.
 
 ```javascript
-const { publicKey, keyReference } = await be8.generatePrivAndPubKey();
+const { publicKey, keyReference } = await be9.generatePrivAndPubKey();
 ```
 
 ## Group epochs and explicit legacy reads

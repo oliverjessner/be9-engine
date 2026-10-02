@@ -1,8 +1,11 @@
 # Symmetric group epochs
 
+This page specifies new Be9 packages. Retained Be8 key packages/group data use
+the explicit readers described in [Be9 migration](be9-migration.md).
+
 New groups use independent random 32-byte secrets as non-extractable HKDF
 CryptoKeys (`deriveKey` only), stored by `[namespace, groupID, epoch]` in
-`be8.groupEpochs`. They are separate from retained ECDH group records. Epochs
+`be9.groupEpochs`. They are separate from retained ECDH group records. Epochs
 are canonical positive uint64 decimal strings; IDs match `g[A-Za-z0-9_-]+`
 with at most 128 ASCII characters. `generation` is SHA-256 of the random secret,
 as canonical Base64url. It binds the actual secret generation, not a caller alias.
@@ -43,11 +46,11 @@ send sequences and nonce reservations without releasing packages. Old records
 are retained for archive reads. `getGroupEpochs()` and `getActiveGroupEpoch()`
 project public metadata only, never CryptoKeys or raw secret material.
 
-Group data has the separate fixed suite `BE8-GROUP-HKDF-SHA256-A256GCM`.
+Group data has the separate fixed suite `BE9-GROUP-HKDF-SHA256-A256GCM`.
 The header retains the exact envelope schema. Receiver is the group ID;
 receiverFingerprint is the generation digest; group is the structured
 `{ groupID, epoch, generation }`. SenderFingerprint is the actual locally trusted
-public sender fingerprint. The HKDF-info domain is `BE8-GROUP-HKDF-INFO`, followed
+public sender fingerprint. The HKDF-info domain is `BE9-GROUP-HKDF-INFO`, followed
 by the same length-prefixed fields as pairwise info, then group ID (UTF-8), epoch
 (8-byte big endian), generation (raw 32 bytes). Group secret is HKDF input,
 SHA-256 is the hash, public per-packet salt is 32 fresh random bytes, output is
@@ -71,6 +74,6 @@ Old `generateGroupKeys` and ambiguous `addGroupKeys` reject with
 use explicit `addLegacyGroupKeys`, `getCachedLegacyGroupKeys/Versions`,
 `getLegacyGroupKeyReference`, and legacy KDF/ciphertext readers. They are not
 silently converted to symmetric epochs. Application schema upgrades call
-`upgradeBe8Schema` to add group epoch and active-selection stores, retaining
+`upgradeBe9Schema` to add group epoch and active-selection stores, retaining
 other stores and records. Malicious JavaScript in the same context can still
 use non-extractable keys; they are not XSS-safe or hardware-backed.

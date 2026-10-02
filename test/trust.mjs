@@ -1,5 +1,5 @@
 import { createLegacyGroup, legacyGroupToPublic } from './legacy-fixture.mjs';
-import Be8, { STORES, upgradeBe8Schema, jwkThumbprint } from '../lib/bundle.mjs';
+import Be9, { STORES, upgradeBe9Schema, jwkThumbprint } from '../lib/bundle.mjs';
 import { participantHooks, exchangePublicKeys, createParticipant } from './participants.mjs';
 import { readRecord, requestResult, storedIDs } from './database.mjs';
 
@@ -36,7 +36,7 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         assert.strictEqual(await jwkThumbprint(vector), vectorFingerprint, 'The SHA-256 base64url thumbprint matches the independent vector');
         const reordered = { y: vector.y, verified: true, accID: '999', x: vector.x, kid: 'transport label',
             kty: 'EC', namespace: 'different', crv: 'P-384', use: 'enc', alg: 'ECDH-ES', ext: false, key_ops: [] };
-        assert.strictEqual(await Be8.jwkThumbprint(reordered), vectorFingerprint, 'Optional JWK fields, metadata and property ordering are excluded');
+        assert.strictEqual(await Be9.jwkThumbprint(reordered), vectorFingerprint, 'Optional JWK fields, metadata and property ordering are excluded');
         assert.notStrictEqual(await jwkThumbprint(this.bob.publicKey), await jwkThumbprint(this.eve.publicKey), 'Independent public keys have different fingerprints');
         assert.true(/^[A-Za-z0-9_-]{43}$/.test(vectorFingerprint), 'Fingerprint encoding is unpadded base64url SHA-256');
     });
@@ -199,7 +199,7 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         const { alice, bob, eve } = this;
         await alice.engine.addPublicKey(bob.id, bob.publicKey, { trust: 'confirmed' });
         const secondDB = await this.open(alice.database.name);
-        const other = new Be8(alice.id, secondDB.connection);
+        const other = new Be9(alice.id, secondDB.connection);
         await other.setup();
         const previous = await jwkThumbprint(bob.publicKey);
         const candidates = [eve.publicKey, vector];
@@ -263,17 +263,17 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         const { alice, bob } = this;
         const expected = await jwkThumbprint(bob.publicKey);
         await alice.engine.addPublicKey(bob.id, bob.publicKey, { expectedFingerprint: expected });
-        const isolated = new Be8(alice.id, alice.database.connection, { namespace: 'isolated' });
+        const isolated = new Be9(alice.id, alice.database.connection, { namespace: 'isolated' });
         await isolated.setup();
         await isolated.addPublicKey(bob.id, bob.publicKey);
         assert.strictEqual((await isolated.getPeerTrust(bob.id)).status, 'unverified', 'Confirmation does not leak to another namespace');
         await assert.rejects(isolated.encryptTextSimple(alice.id, bob.id, 'Other namespace'), error => error.code === 'UNTRUSTED_PUBLIC_KEY', 'The isolated namespace remains blocked');
-        const wrongOwner = new Be8('104', alice.database.connection, { namespace: alice.id });
+        const wrongOwner = new Be9('104', alice.database.connection, { namespace: alice.id });
         const denied = await settles(wrongOwner.getPeerTrust(bob.id));
         assert.true(denied.error?.code === 'ACCOUNT_MISMATCH', 'Another account cannot read this namespace trust');
         alice.database.acknowledgeAborts();
         const database = await this.open(alice.database.name);
-        const reopened = new Be8(alice.id, database.connection);
+        const reopened = new Be9(alice.id, database.connection);
         await reopened.setup();
         assert.strictEqual((await reopened.getPeerTrust(bob.id)).fingerprint, expected, 'Reopening restores committed trust');
         assert.strictEqual((await reopened.getPeerTrust(bob.id)).status, 'confirmed', 'Reopening preserves the explicit decision');
@@ -290,7 +290,7 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
             db.deleteObjectStore(STORES.trust);
             db.createObjectStore('appSettings', { keyPath: 'id' });
         } });
-        const owner = new Be8('104', database.connection);
+        const owner = new Be9('104', database.connection);
         await owner.setup();
         const tx = database.transaction([STORES.publicKeys, STORES.groupKeys, 'appSettings'], 'readwrite');
         tx.objectStore(STORES.publicKeys).put({ namespace: '104', accID: this.bob.id, key: { ...this.bob.publicKey, verified: true }, verified: true });
@@ -299,8 +299,8 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         await database.whenIdle();
         const ownBefore = await owner.getMyPublicKey();
         database.close();
-        const upgraded = await this.open(database.name, { version: 2, upgrade(db, tx) { upgradeBe8Schema(db, tx); } });
-        const engine = new Be8('104', upgraded.connection);
+        const upgraded = await this.open(database.name, { version: 2, upgrade(db, tx) { upgradeBe9Schema(db, tx); } });
+        const engine = new Be9('104', upgraded.connection);
         await engine.setup();
         assert.strictEqual(await engine.getPeerTrust(this.bob.id), undefined, 'Schema integration grants no old peer trust');
         await assert.rejects(engine.encryptTextSimple('104', this.bob.id, 'Old unchecked'), error => error.code === 'UNTRUSTED_PUBLIC_KEY', 'Absent old trust cannot authorize convenience use');
@@ -321,7 +321,7 @@ QUnit.module('Public-key validation and local peer trust', hooks => {
         const database = await this.open(undefined, { upgrade(db, tx) {
             tx.objectStore(STORES.trust).createIndex('testUniqueFingerprint', ['namespace', 'fingerprint'], { unique: true });
         } });
-        const engine = new Be8('104', database.connection);
+        const engine = new Be9('104', database.connection);
         await engine.setup();
         let publicWrites = 0;
         database.observe(tx => {

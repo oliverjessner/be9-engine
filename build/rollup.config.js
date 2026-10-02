@@ -15,7 +15,7 @@ const config = {
   input: 'lib/bundle.mjs',
   output: {
     format: 'esm',
-    name: 'be8',
+    name: 'be9',
     file: './dist/bundle.mjs'
   },
   plugins: [

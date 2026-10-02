@@ -1,14 +1,14 @@
 // Observe real IndexedDB requests and transactions. Do not add a synthetic
 // transaction.complete property or change the engine's persistence semantics.
-import { upgradeBe8Schema, STORES } from '../lib/bundle.mjs';
+import { upgradeBe9Schema, STORES } from '../lib/bundle.mjs';
 
-export async function openDatabase(name = 'be8-test-' + crypto.randomUUID(), options = {}) {
+export async function openDatabase(name = 'be9-test-' + crypto.randomUUID(), options = {}) {
     const request = indexedDB.open(name, options.version || 1);
     let upgradeFailed = false;
     request.addEventListener('upgradeneeded', () => {
         const db = request.result;
         try {
-            if (!options.skipEngineSchema) upgradeBe8Schema(db, request.transaction);
+            if (!options.skipEngineSchema) upgradeBe9Schema(db, request.transaction);
             if (options.upgrade) options.upgrade(db, request.transaction);
         } catch {
             upgradeFailed = true;

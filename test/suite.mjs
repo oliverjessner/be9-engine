@@ -4,7 +4,7 @@ QUnit.config.testTimeout = 15000;
 
 const tests = [];
 let resolveDone;
-window.__be8TestDone = new Promise(resolve => { resolveDone = resolve; });
+window.__be9TestDone = new Promise(resolve => { resolveDone = resolve; });
 QUnit.testDone(details => {
     // Do not serialize assertion actual/expected values, exceptions, stacks,
     // console output, or DOM snapshots: they may contain cryptographic data.
@@ -35,4 +35,5 @@ await import('./encoding.mjs');
 await import('./envelope.mjs');
 await import('./replay.mjs');
 await import('./panic.mjs');
+await import('./rename.mjs');
 QUnit.start();

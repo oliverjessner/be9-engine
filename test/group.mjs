@@ -1,4 +1,4 @@
-import Be8, { STORES, GROUP_SUITE } from '../lib/bundle.mjs';
+import Be9, { STORES, GROUP_SUITE } from '../lib/bundle.mjs';
 import { participantHooks, exchangePublicKeys, createParticipant, changedCiphertext, changedIV, isAuthenticationFailure } from './participants.mjs';
 import { withTransaction, requestResult } from '../lib/persistence.mjs';
 import { createLegacyGroup, legacyGroupToPublic, legacyToPublic, legacyGroupHKDFPacket } from './legacy-fixture.mjs';
@@ -109,7 +109,7 @@ QUnit.module('Symmetric group epochs / isolated instances', hooks => {
     QUnit.test('Concurrent activation uses CAS; conflicting immutable epochs and aborted imports preserve prior records', async function (assert) {
         const { alice, bob } = this; await exchangePublicKeys(alice, bob);
         const first = await create(alice, [bob]); const second = await create(alice, [bob], '2');
-        const connection = await this.open(bob.database.name); const other = new Be8(bob.id, connection.connection); await other.setup();
+        const connection = await this.open(bob.database.name); const other = new Be9(bob.id, connection.connection); await other.setup();
         const results = await Promise.allSettled([bob.engine.activateGroupEpoch(groupID, '1', { expectedCurrentEpoch: null }), other.activateGroupEpoch(groupID, '2', { expectedCurrentEpoch: null })]);
         assert.strictEqual(results.filter(item => item.status === 'fulfilled').length, 1, 'Only one competing activation commits');
         assert.strictEqual(results.find(item => item.status === 'rejected').reason.code, 'GROUP_EPOCH_CONFLICT', 'Loser reports explicit CAS conflict');
@@ -148,7 +148,7 @@ QUnit.module('Symmetric group epochs / isolated instances', hooks => {
         assert.strictEqual(await bob.engine.decryptTextSimpleLegacy(groupID + ':1', bob.id, outbound.cipherText, outbound.iv), 'Legacy outbound', 'Historic owner-to-peer ciphertext remains readable');
         assert.strictEqual(await alice.engine.decryptTextSimpleLegacy(bob.id, groupID + ':1', inbound.cipherText, inbound.iv), 'Legacy inbound', 'Historic reverse direction remains readable');
         const historicalHKDF = await legacyGroupHKDFPacket(alice, groupID, 1, bob.publicKey, 'Historic HKDF group');
-        assert.strictEqual(await bob.engine.decryptTextUnframedLegacy(groupID + ':1', bob.id, historicalHKDF.cipherText, historicalHKDF.iv, historicalHKDF.derivation,
+        assert.strictEqual(await bob.engine.decryptBe8TextUnframedLegacy(groupID + ':1', bob.id, historicalHKDF.cipherText, historicalHKDF.iv, historicalHKDF.derivation,
             { contextID: 'historic HKDF group', legacyUUID: true }), 'Historic HKDF group', 'Historic HKDF group UUID packets have an explicit bounded reader');
         const local = await bob.engine.generatePrivAndPubKey();
         await assert.rejects(bob.engine.createDerivationContext(group.publicKey, local.keyReference, { sender: bob.id, receiver: groupID + ':1', contextID: 'forbidden', purpose: 'data' }),

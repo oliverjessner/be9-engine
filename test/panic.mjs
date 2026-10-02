@@ -1,4 +1,4 @@
-import Be8, { STORES, jwkThumbprint } from '../lib/bundle.mjs';
+import Be9, { STORES, jwkThumbprint } from '../lib/bundle.mjs';
 import { participantHooks, exchangePublicKeys } from './participants.mjs';
 import { withTransaction, requestResult } from '../lib/persistence.mjs';
 const locked = error => error.code === 'ENGINE_LOCKED';
@@ -59,13 +59,13 @@ QUnit.module('Panic / namespace lifecycle invalidation', hooks => {
         assert.deepEqual(await rows(bob.database, STORES.receiveState), [], 'Replay state is deleted with keys');
     });
     QUnit.test('Initialization invalidated while pending cannot persist or return a replacement identity', async function (assert) {
-        const database = await this.open(); const engine = new Be8('104', database.connection); let deletion;
+        const database = await this.open(); const engine = new Be9('104', database.connection); let deletion;
         database.observe(tx => { if (!deletion && tx.mode === 'readonly' && tx.objectStoreNames.contains(STORES.privateKeys)) tx.addEventListener('complete', () => { deletion = engine.panic(); }, { once: true }); });
         await assert.rejects(engine.setup(), failed, 'Pending initialization settles without success'); database.observe(undefined); await deletion; database.acknowledgeAborts();
         assert.true(!!deletion, 'Native initial read completion triggered invalidation');
         assert.deepEqual(await rows(database, STORES.privateKeys), [], 'No identity write can follow invalidation');
         await assert.rejects(engine.setup(), locked, 'Retry requires explicit reinitialization');
-        const reopened = new Be8('104', (await this.open(database.name)).connection);
+        const reopened = new Be9('104', (await this.open(database.name)).connection);
         await assert.rejects(reopened.setup(), locked, 'Restart cannot replace invalidated identity');
         this.databases.forEach(db => db.acknowledgeAborts());
     });
@@ -74,7 +74,7 @@ QUnit.module('Panic / namespace lifecycle invalidation', hooks => {
         await alice.engine.openContext('group wrapping');
         await alice.engine.createGroupEpoch('gPending', '1', [bob.id], { contextID: 'group wrapping' });
         await alice.engine.activateGroupEpoch('gPending', '1', { expectedCurrentEpoch: null });
-        const otherDB = await this.open(alice.database.name); const other = new Be8(alice.id, otherDB.connection); await other.setup();
+        const otherDB = await this.open(alice.database.name); const other = new Be9(alice.id, otherDB.connection); await other.setup();
         const before = await Promise.all(Object.values(STORES).map(name => rows(alice.database, name)));
         let abort = false;
         alice.database.observe(tx => { if (tx.mode === 'readwrite' && tx.objectStoreNames.contains(STORES.groupEpochs)) tx.addEventListener('success', event => {
@@ -91,10 +91,10 @@ QUnit.module('Panic / namespace lifecycle invalidation', hooks => {
     });
     QUnit.test('Another connection is immediately locked; restart and explicit reinitialization preserve lifecycle boundaries', async function (assert) {
         const { alice, bob } = this; await exchangePublicKeys(alice, bob); const previous = await jwkThumbprint(alice.publicKey);
-        const otherDB = await this.open(alice.database.name); const other = new Be8(alice.id, otherDB.connection); await other.setup();
+        const otherDB = await this.open(alice.database.name); const other = new Be9(alice.id, otherDB.connection); await other.setup();
         const oldRef = await other.generatePrivAndPubKey(); const context = await other.createDerivationContext(bob.publicKey, oldRef.keyReference, { contextID: 'other realm', sender: alice.id, receiver: bob.id, purpose: 'data' });
         const pending = alice.engine.panic(); await assert.rejects(other.encryptText(context.key, 'Blocked'), locked, 'Other connection cannot use cached derived key immediately'); await pending;
-        alice.database.close(); otherDB.close(); const restartedDB = await this.open(alice.database.name); const restarted = new Be8(alice.id, restartedDB.connection);
+        alice.database.close(); otherDB.close(); const restartedDB = await this.open(alice.database.name); const restarted = new Be9(alice.id, restartedDB.connection);
         await assert.rejects(restarted.setup(), locked, 'Restart sees persistent invalidation'); restartedDB.acknowledgeAborts();
         const first = restarted.reinitialize(); assert.strictEqual(restarted.reinitialize(), first, 'Parallel explicit reinitialization coalesces'); await first;
         assert.notStrictEqual(await jwkThumbprint(await restarted.getMyPublicKey()), previous, 'Explicit reinitialization creates a new identity');
@@ -117,7 +117,7 @@ QUnit.module('Panic / namespace lifecycle invalidation', hooks => {
     });
     QUnit.test('Deletion is namespace-local; foreign accounts, unscoped legacy data and application stores remain intact', async function (assert) {
         const database = await this.open(undefined, { upgrade(db) { db.createObjectStore('appData', { keyPath: 'id' }); db.createObjectStore('privateKeys', { keyPath: 'accID' }); } });
-        const first = new Be8('104', database.connection, { namespace: 'first' }); const second = new Be8('105', database.connection, { namespace: 'second' });
+        const first = new Be9('104', database.connection, { namespace: 'first' }); const second = new Be9('105', database.connection, { namespace: 'second' });
         await first.setup(); await second.setup(); const original = await second.getMyPublicKey();
         await withTransaction(database.connection, ['appData', 'privateKeys'], 'readwrite', tx => { tx.objectStore('appData').put({ id: 'setting', value: true }); return requestResult(tx.objectStore('privateKeys').put({ accID: '106', marker: 'application-owned legacy data' })); });
         const before = await rows(database, 'privateKeys');

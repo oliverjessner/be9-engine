@@ -1,4 +1,4 @@
-import Be8, { STORES } from '../lib/bundle.mjs';
+import Be9, { STORES } from '../lib/bundle.mjs';
 import { participantHooks, exchangePublicKeys } from './participants.mjs';
 import { requestResult } from './database.mjs';
 import { streamIdentity } from '../lib/replay.mjs';
@@ -43,7 +43,7 @@ QUnit.module('v2 persistent receive and send sequences', hooks => {
     QUnit.test('Two connections processing the same packet accept at most once', async function (assert) {
         const packet = await this.send('parallel');
         const database = await this.open(this.bob.database.name);
-        const other = new Be8('102', database.connection); await other.setup();
+        const other = new Be9('102', database.connection); await other.setup();
         const results = await Promise.allSettled([this.bob.engine.receiveText(packet, this.expected), other.receiveText(packet, this.expected)]);
         assert.strictEqual(results.filter(value => value.status === 'fulfilled').length, 1, 'One transaction commits acceptance');
         assert.true(results.some(value => value.reason?.code === 'REPLAY_DUPLICATE'), 'The other reports a duplicate');
@@ -61,8 +61,8 @@ QUnit.module('v2 persistent receive and send sequences', hooks => {
         const packet = await this.send('before restart');
         await this.bob.engine.receiveText(packet, this.expected);
         this.alice.database.close(); this.bob.database.close();
-        const a = new Be8('101', (await this.open(this.alice.database.name)).connection);
-        const bdb = await this.open(this.bob.database.name); const b = new Be8('102', bdb.connection);
+        const a = new Be9('101', (await this.open(this.alice.database.name)).connection);
+        const bdb = await this.open(this.bob.database.name); const b = new Be9('102', bdb.connection);
         await Promise.all([a.setup(), b.setup()]);
         await a.openContext(this.expected.contextID); await b.openReceiveContext(this.expected);
         const next = await a.encryptTextSimple('101', '102', 'after restart', { contextID: this.expected.contextID });
@@ -88,7 +88,7 @@ QUnit.module('v2 persistent receive and send sequences', hooks => {
     });
     QUnit.test('Concurrent senders reserve unique sequences; reverse direction needs its own receive stream', async function (assert) {
         const database = await this.open(this.alice.database.name);
-        const other = new Be8('101', database.connection); await other.setup();
+        const other = new Be9('101', database.connection); await other.setup();
         const packets = await Promise.all(Array.from({ length: 8 }, (_, index) => (index % 2 ? other : this.alice.engine)
             .encryptTextSimple('101', '102', String(index), { contextID: this.expected.contextID })));
         assert.deepEqual(packets.map(packet => packet.header.sequence).sort(), ['1', '2', '3', '4', '5', '6', '7', '8'], 'Independent native connections assign each positive sequence exactly once');

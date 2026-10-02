@@ -1,7 +1,7 @@
-# Be8 v2 cryptographic profile
+# Be9 v2 cryptographic profile
 
 This specifies the implemented pairwise KDF and its public metadata for protocol version
-`2`, suite `BE8-P384-HKDF-SHA256-A256GCM`. It is one v2 profile, not a menu of
+`2`, suite `BE9-P384-HKDF-SHA256-A256GCM`. It is one v2 profile, not a menu of
 automatically detected algorithms. Unsupported versions/suites reject. The nonce, binary encoding and encryption budget are specified below.
 The [authenticated envelope and replay state](envelope-state.md), separate
 [symmetric group suite](group-epochs.md) and [lifecycle](lifecycle.md) complete
@@ -43,7 +43,7 @@ order is immaterial; extra or missing fields reject. It contains no key material
 | Field | Wire value / validation |
 | --- | --- |
 | `version` | JSON number `2` |
-| `suite` | Exact string `BE8-P384-HKDF-SHA256-A256GCM` |
+| `suite` | Exact string `BE9-P384-HKDF-SHA256-A256GCM` |
 | `contextID` | Nonempty Unicode scalar string, at most 1024 UTF-8 bytes |
 | `sender` | Canonical endpoint string, at most 256 UTF-8 bytes |
 | `receiver` | Canonical endpoint string, at most 256 UTF-8 bytes |
@@ -74,7 +74,7 @@ valid scalar characters are unambiguous under the length encoding below.
 
 ## Exact HKDF-info encoding
 
-Start with the 13 ASCII bytes `BE8-HKDF-INFO`, without a NUL terminator. Append
+Start with the 13 ASCII bytes `BE9-HKDF-INFO`, without a NUL terminator. Append
 exactly eight fields in the following order. Each field is encoded as a 4-byte
 unsigned **big-endian byte length**, followed by that many bytes. No separators,
 JSON serialization, optional fields, or trailing bytes occur.
@@ -209,15 +209,22 @@ they do not infer format from them. Legacy reads also enforce the bounded
 ciphertext size below; oversized original packets are retained but refused.
 No legacy writer is provided.
 
-Previous HKDF ciphertext/IV/derivation tuples are explicitly read with
+Be9 HKDF ciphertext/IV/derivation tuples are explicitly read with
 `decryptTextUnframedLegacy(sender, receiver, ciphertext, iv, derivation, options)`
-or its image equivalent. Default encoding is the prior 12-byte-IV/Base64url
+or its image equivalent. Retained Be8 HKDF tuples require
+`decryptBe8TextUnframedLegacy` / `decryptBe8ImageUnframedLegacy` with unchanged
+Be8 metadata. Default encoding is the prior 12-byte-IV/Base64url
 format. Set the separate local option `{ legacyUUID: true }` to read earlier
 HKDF UUID/padded-Base64 packets. This reader also retains old HKDF ECDH group
 endpoints; modern writers cannot use them. Expected endpoint/purpose/context,
 actual fingerprints and stored trust are checked. No private key or AES key is
 exported. Do not select the direct-ECDH KDF for HKDF packets. Format choice is an
 explicit application decision; neither failure nor validation triggers fallback.
+
+The Be9 suites and domain bytes differ from the frozen Be8 profile. Do not
+rewrite old metadata or headers. Explicit old envelope/group readers, schema
+migration and retained replay/counter behavior are specified in
+[Be9 migration](be9-migration.md).
 
 ## Nonces, binary encoding and input limits
 
@@ -304,15 +311,15 @@ write lock. Re-deriving a CryptoKey, reloading an engine or changing a storage
 namespace does not reset the budget.
 
 The actual derivation identity is canonical Base64url SHA-256 of this byte
-sequence: ASCII `BE8-GCM-USAGE` (13 bytes), the 32 raw salt bytes, then the complete
-`encodeV2DerivationInfo()` result (or `BE8-GROUP-HKDF-INFO` bytes for the group suite). Fingerprints have already been verified against
+sequence: ASCII `BE9-GCM-USAGE` (13 bytes), the 32 raw salt bytes, then the complete
+`encodeV2DerivationInfo()` result (or `BE9-GROUP-HKDF-INFO` bytes for the group suite). Fingerprints have already been verified against
 the actual keys before registration. Identity thus includes all key-selecting
 HKDF inputs and purposes; its equality relies on the hash/KDF's collision
 resistance. There is no independently selectable `keyId`. Changing a genuine KDF
 input derives a different key and legitimately starts a different budget.
 
 The application must increment its own IndexedDB version and invoke
-`upgradeBe8Schema()` in its upgrade handler to add `be8.keyUsage`. Its primary key
+`upgradeBe9Schema()` in its upgrade handler to add `be9.keyUsage`. Its primary key
 is `derivationID`; records contain only that hash and numeric `encryptions` and
 `blocks`. It has no namespace index: the same actual derivation shares one budget
 throughout this database, including namespace aliases. No identity or ciphertext

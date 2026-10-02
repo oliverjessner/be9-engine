@@ -39,12 +39,12 @@ try {
     // Event-driven completion; the timer is a failure deadline, not a readiness wait.
     const result = await page.evaluate(() => new Promise((resolve, reject) => {
         const deadline = setTimeout(() => reject(new Error('Browser suite deadline exceeded')), 60000);
-        if (!window.__be8TestDone) {
+        if (!window.__be9TestDone) {
             clearTimeout(deadline);
             reject(new Error('Browser suite not registered'));
             return;
         }
-        window.__be8TestDone.then(value => {
+        window.__be9TestDone.then(value => {
             clearTimeout(deadline);
             resolve(value);
         }, reject);

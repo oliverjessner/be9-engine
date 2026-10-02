@@ -1,4 +1,4 @@
-import Be8, { STORES } from '../lib/bundle.mjs';
+import Be9, { STORES } from '../lib/bundle.mjs';
 import { participantHooks, exchangePublicKeys } from './participants.mjs';
 import { readRecord, requestResult, storedIDs } from './database.mjs';
 import { withTransaction, requestResult as nativeResult } from '../lib/persistence.mjs';
@@ -46,7 +46,7 @@ async function scopedFixture(context) {
     tx.objectStore(STORES.privateKeys).put({ namespace: '104', accID: '104', key: identity[1] });
     tx.objectStore(STORES.groupKeys).put({ namespace: '104', groupID: 'g200', version: 1, key: group[1] });
     await database.whenIdle();
-    return { database, identity, group, engine: new Be8('104', database.connection) };
+    return { database, identity, group, engine: new Be9('104', database.connection) };
 }
 
 async function records(database, names) {
@@ -113,7 +113,7 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
             'A retained local group reference decrypts the explicit legacy profile');
         assert.false(receiverAES.extractable, 'Explicit legacy derived keys remain non-extractable');
         assert.false(Object.hasOwn(getters[2][0].groupKey, 'privateKey'), 'The group getter does not expose the stored private CryptoKey');
-        assert.strictEqual(Be8.readLegacyIdentity, undefined, 'The old private-JWK inspection API is removed');
+        assert.strictEqual(Be9.readLegacyIdentity, undefined, 'The old private-JWK inspection API is removed');
     });
 
     QUnit.test('References are local capabilities; a fresh reference after reopening keeps cryptographic identity', async function (assert) {
@@ -127,7 +127,7 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         const packet = await bob.engine.encryptTextSimple(bob.id, alice.id, 'Before reload');
         alice.database.close();
         const database = await this.open(alice.database.name);
-        const reopened = new Be8(alice.id, database.connection);
+        const reopened = new Be9(alice.id, database.connection);
         await reopened.setup();
         const after = await reopened.generatePrivAndPubKey();
         assert.true(await fingerprint(before.publicKey) === await fingerprint(after.publicKey), 'Reload preserves the fingerprint');
@@ -167,7 +167,7 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         assert.true(noPrivateJWK(rows), 'All selected original private JWKs were replaced, with no hidden backup');
         await assert.rejects(crypto.subtle.exportKey('jwk', rows[0][0].key), error => error.name === 'InvalidAccessError', 'Migrated private export is denied');
         database.close();
-        const reopened = new Be8('104', (await this.open(database.name)).connection);
+        const reopened = new Be9('104', (await this.open(database.name)).connection);
         await reopened.setup();
         assert.true(await reopened.decryptTextSimpleLegacy(this.bob.id, '104', packet.cipherText, packet.iv) === 'Before migration', 'Old identity ciphertext decrypts after migration and reload');
         const declaredV2 = await this.bob.createContext(identity[0], { receiver: '104' });
@@ -276,7 +276,7 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         tx.objectStore('privateKeys').put({ ...group[1], accID: '999' });
         tx.objectStore('groupKeys').put({ ...group[1], groupID: 'g200', version: '1' });
         await database.whenIdle();
-        const engine = new Be8('104', database.connection);
+        const engine = new Be9('104', database.connection);
         const options = { legacyIdentity: true, legacyGroups: [{ groupID: 'g200', version: '1' }] };
         let deleted = false;
         database.observe(tx => {
@@ -308,7 +308,7 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
     QUnit.test('Missing CryptoKey clone capability rejects generation and migration without a JWK fallback', async function (assert) {
         const fixture = await scopedFixture(this);
         const empty = await this.open();
-        const fresh = new Be8('105', empty.connection);
+        const fresh = new Be9('105', empty.connection);
         const originalClone = window.structuredClone;
         let generation;
         let migration;
@@ -345,7 +345,7 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
     QUnit.test('Concurrent migrations settle without rotation; namespace ownership also protects migration', async function (assert) {
         const { engine, database, identity } = await scopedFixture(this);
         const secondDB = await this.open(database.name);
-        const other = new Be8('104', secondDB.connection);
+        const other = new Be9('104', secondDB.connection);
         const concurrent = await settles(Promise.allSettled([engine.migratePrivateKeys(), other.migratePrivateKeys()]));
         assert.true(!concurrent.error, 'All independent migration promises settle');
         assert.true(concurrent.value.some(result => result.status === 'fulfilled'), 'At least one atomic migration commits');
@@ -356,7 +356,7 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         const repeated = await settles(other.migratePrivateKeys());
         assert.true(!repeated.error && !repeated.value.migratedIdentity, 'Explicit retry sees the committed migration');
         assert.true(await fingerprint(await engine.getMyPublicKey()) === await fingerprint(identity[0]), 'The shared identity remains unchanged');
-        const wrongOwner = new Be8('105', database.connection, { namespace: '104' });
+        const wrongOwner = new Be9('105', database.connection, { namespace: '104' });
         const refused = await settles(wrongOwner.migratePrivateKeys());
         assert.true(refused.error instanceof Error && refused.error.code === 'ACCOUNT_MISMATCH', 'A different account cannot migrate this namespace');
         database.acknowledgeAborts();

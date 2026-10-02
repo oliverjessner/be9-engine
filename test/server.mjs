@@ -9,12 +9,12 @@ const assets = new Map([
     ['/', ['test/index.html', 'text/html']],
     ['/vendor/qunit.js', ['node_modules/qunit/qunit/qunit.js', 'text/javascript']],
     ['/vendor/qunit.css', ['node_modules/qunit/qunit/qunit.css', 'text/css']],
-    ...['suite', 'database', 'participants', 'basics', 'text', 'image', 'group', 'exceptions', 'aes', 'persistence', 'key-protection', 'trust', 'v2', 'legacy-fixture', 'encoding', 'envelope', 'replay', 'panic', 'panic-worker']
+    ...['suite', 'database', 'participants', 'basics', 'text', 'image', 'group', 'exceptions', 'aes', 'persistence', 'key-protection', 'trust', 'v2', 'legacy-fixture', 'encoding', 'envelope', 'replay', 'panic', 'panic-worker', 'be8-legacy-vectors', 'be8-legacy-fixture', 'rename']
         .map(name => ['/test/' + name + '.mjs', ['test/' + name + '.mjs', 'text/javascript']]),
-    ...['bundle', 'util', 'persistence', 'key-store', 'crypto-keys', 'trust', 'v2', 'encoding', 'limits', 'aes', 'usage', 'group-profile', 'groups', 'envelope', 'replay'].map(name => ['/lib/' + name + '.mjs', ['lib/' + name + '.mjs', 'text/javascript']]),
+    ...['bundle', 'util', 'persistence', 'key-store', 'crypto-keys', 'trust', 'v2', 'encoding', 'limits', 'aes', 'usage', 'group-profile', 'groups', 'legacy-be8', 'envelope', 'replay'].map(name => ['/lib/' + name + '.mjs', ['lib/' + name + '.mjs', 'text/javascript']]),
 ]);
 
-const helpers = ['upgradeBe8Schema', 'STORES', 'jwkThumbprint', 'V2_SUITE', 'GROUP_SUITE', 'encodeV2DerivationInfo', 'encodeBase64url', 'decodeBase64url', 'V2_LIMITS', 'REPLAY_WINDOW', 'encodeEnvelopeAAD'];
+const helpers = ['upgradeBe9Schema', 'migrateBe8Schema', 'encodeBe8DerivationInfo', 'encodeBe8EnvelopeAAD', 'STORES', 'jwkThumbprint', 'V2_SUITE', 'GROUP_SUITE', 'encodeV2DerivationInfo', 'encodeBase64url', 'decodeBase64url', 'V2_LIMITS', 'REPLAY_WINDOW', 'encodeEnvelopeAAD'];
 export async function createTestServer(port = 0, { bundle = 'source' } = {}) {
     if (!['source', 'esm', 'iife'].includes(bundle)) throw new Error('Unknown test bundle');
     const selected = new Map(assets);
@@ -31,7 +31,7 @@ export async function createTestServer(port = 0, { bundle = 'source' } = {}) {
             if (bundle === 'iife' && pathname === '/lib/bundle.mjs') {
                 // Evaluate the generated IIFE unchanged, then expose its callable
                 // constructor/statics to the ESM tests (also in module workers).
-                body = body.toString() + '\nconst Be8 = be8; export default Be8;\n' + helpers.map(name => 'export const ' + name + ' = Be8.' + name + ';').join('\n');
+                body = body.toString() + '\nconst Be9 = be9; export default Be9;\n' + helpers.map(name => 'export const ' + name + ' = Be9.' + name + ';').join('\n');
             }
             response.writeHead(200, { 'Content-Type': asset[1], 'Cache-Control': 'no-store' }).end(body);
         } catch {

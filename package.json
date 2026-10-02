@@ -12,14 +12,14 @@
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/Be8-Systems/be8-engine.git"
+        "url": "git+https://github.com/oliverjessner/be9-engine.git"
     },
     "author": "",
     "license": "MIT",
     "bugs": {
-        "url": "https://github.com/Be8-Systems/be8-engine/issues"
+        "url": "https://github.com/oliverjessner/be9-engine/issues"
     },
-    "homepage": "https://github.com/Be8-Systems/be8-engine#readme",
+    "homepage": "https://github.com/oliverjessner/be9-engine#readme",
     "devDependencies": {
         "@babel/eslint-parser": "^7.18.2",
         "@rollup/plugin-eslint": "^8.0.2",

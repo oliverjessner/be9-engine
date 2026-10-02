@@ -1,5 +1,8 @@
 # Local namespace invalidation
 
+Existing `be8.*` databases require [explicit schema migration](be9-migration.md)
+before using Be9. That migration preserves these lifecycle boundaries.
+
 `panic()` immediately locks the calling engine, drops opaque references and
 engine derivation registrations, and aborts its still-open native transactions.
 No new engine operation is accepted; key/trust getters, setup, raw AES and legacy readers are
@@ -13,7 +16,7 @@ be reliably erased. The engine has no retained private/group key cache.
 A single committed native transaction deletes selected namespace public/private
 keys, trust, retained scoped ECDH group records, symmetric group epochs and active
 selection, contexts, send counters and replay windows. It writes a tombstone to
-`be8.scopes`: `{ namespace, accID, status: 'invalidated', generation }`.
+`be9.scopes`: `{ namespace, accID, status: 'invalidated', generation }`.
 The permanent owner binding is retained. Generation is an integer from 0 through
 `Number.MAX_SAFE_INTEGER`, advancing on panic and explicit reinitialization;
 exhaustion fails closed. Existing scope records without lifecycle fields are
@@ -57,7 +60,7 @@ await engine.reinitialize(); // New identity, new generation, empty peer trust.
 ```
 
 Panic never deletes a database, schema, application store, another namespace, or
-unselected unscoped legacy data. Database-wide `be8.keyUsage` reservations are
+unselected unscoped legacy data. Database-wide `be9.keyUsage` reservations are
 retained deliberately: namespaces/aliases can refer to the same actual key, so
 clearing them would refund another writer's security budget. They contain only
 public derivation hashes/counts, no key material. They are not automatically

@@ -1,4 +1,4 @@
-import Be8 from '../lib/bundle.mjs';
+import Be9 from '../lib/bundle.mjs';
 import { storedIDs } from './database.mjs';
 import { createParticipant, exchangePublicKeys, participantHooks } from './participants.mjs';
 
@@ -49,7 +49,7 @@ QUnit.module('Basics / isolated persistence', hooks => {
 
     QUnit.test('Persistence contract: generation resolves only after write transactions complete', async function (assert) {
         const database = await this.open();
-        const engine = new Be8('104', database.connection);
+        const engine = new Be9('104', database.connection);
         await engine.generatePrivAndPubKey();
         assert.strictEqual(database.pendingWrites(), 0, 'Key generation must await native transaction completion');
         await database.whenIdle();

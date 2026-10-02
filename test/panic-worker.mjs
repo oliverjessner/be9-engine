@@ -1,6 +1,6 @@
 // A second JS realm exercises persisted lifecycle checks, not the same-realm
 // weak registry. Only public control metadata and sanitized error codes cross.
-import Be8 from '../lib/bundle.mjs';
+import Be9 from '../lib/bundle.mjs';
 let engine, key, db;
 async function code(work) { try { await work(); return 'UNEXPECTED_SUCCESS'; } catch (error) { return error.code || 'UNEXPECTED_ERROR'; } }
 self.onmessage = async event => {
@@ -11,7 +11,7 @@ self.onmessage = async event => {
                 request.onsuccess = () => resolve(request.result);
                 request.onerror = () => reject(new Error());
             });
-            engine = new Be8(event.data.accID, db);
+            engine = new Be9(event.data.accID, db);
             await engine.setup();
             key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
             self.postMessage({ status: 'ready' });

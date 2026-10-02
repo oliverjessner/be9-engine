@@ -1,5 +1,5 @@
 import { createLegacyGroup, legacyToPublic } from './legacy-fixture.mjs';
-import Be8, { STORES, upgradeBe8Schema } from '../lib/bundle.mjs';
+import Be9, { STORES, upgradeBe9Schema } from '../lib/bundle.mjs';
 import { requestResult, transactionComplete, withTransaction } from '../lib/persistence.mjs';
 import { participantHooks, exchangePublicKeys, createParticipant } from './participants.mjs';
 import { storedIDs, readRecord } from './database.mjs';
@@ -45,7 +45,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
 
     QUnit.test('An aborted identity transaction rolls back both halves after one successful write', async function (assert) {
         const database = await this.open();
-        const engine = new Be8('104', database.connection);
+        const engine = new Be9('104', database.connection);
         const seen = {};
         abortSuccessfulWrite(database, STORES.publicKeys, seen);
         const result = await outcome(engine.generatePrivAndPubKey());
@@ -65,7 +65,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const database = await this.open(undefined, { upgrade(db, tx) {
             tx.objectStore(STORES.publicKeys).createIndex('testUniquePoint', ['namespace', 'key.x'], { unique: true });
         } });
-        const engine = new Be8('104', database.connection);
+        const engine = new Be9('104', database.connection);
         await engine.setup();
         database.observe(tx => tx.addEventListener('error', event => event.preventDefault()));
         const result = await outcome(engine.addPublicKeys([
@@ -86,7 +86,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
 
     QUnit.test('Read failure in setup does not generate an identity and can be retried', async function (assert) {
         const database = await this.open();
-        const engine = new Be8('104', database.connection);
+        const engine = new Be9('104', database.connection);
         let writes = 0;
         database.observe(tx => {
             if (tx.mode === 'readwrite') writes++;
@@ -108,7 +108,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
 
     QUnit.test('Closed database operations settle as Errors, including setup and mutations', async function (assert) {
         const database = await this.open();
-        const engine = new Be8('104', database.connection);
+        const engine = new Be9('104', database.connection);
         database.close();
         for (const operation of [
             () => engine.setup(), () => engine.getCachedKeys(), () => engine.getMyPublicKey(),
@@ -165,7 +165,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
 
     QUnit.test('Parallel setup on one instance is coalesced and repeat setup retains the identity', async function (assert) {
         const database = await this.open();
-        const engine = new Be8('104', database.connection);
+        const engine = new Be9('104', database.connection);
         const first = engine.setup();
         assert.strictEqual(engine.setup(), first, 'Parallel initialization shares a single pending promise');
         const result = await outcome(Promise.all([first, engine.setup(), engine.setup()]));
@@ -180,8 +180,8 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
     QUnit.test('Independent connections racing setup retain the same committed identity', async function (assert) {
         const database = await this.open();
         const secondDB = await this.open(database.name);
-        const left = new Be8('104', database.connection);
-        const right = new Be8('104', secondDB.connection);
+        const left = new Be9('104', database.connection);
+        const right = new Be9('104', secondDB.connection);
         const result = await outcome(Promise.all([left.setup(), right.setup()]));
         assert.strictEqual(result.status, 'fulfilled', 'Both independent initializers finish');
         const leftKey = await left.getMyPublicKey();
@@ -201,7 +201,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const database = this.alice.database;
         const alternativeBob = await createParticipant(this.bob.id, await this.open());
         const secondDB = await this.open(database.name);
-        const other = new Be8(this.alice.id, secondDB.connection);
+        const other = new Be9(this.alice.id, secondDB.connection);
         await other.setup();
         const result = await outcome(Promise.allSettled([
             this.alice.engine.addPublicKey(this.bob.id, this.bob.publicKey, { trust: 'confirmed' }),
@@ -265,7 +265,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         assert.strictEqual(this.alice.database.acknowledgeAborts(), 1, 'The conflicting identity mutation aborted');
         assert.true(await this.alice.engine.hasGeneratedKeys(), 'The original complete identity remains');
         const database = await this.open();
-        const incomplete = new Be8('104', database.connection);
+        const incomplete = new Be9('104', database.connection);
         await incomplete.addPublicKey('104', this.bob.publicKey);
         const result = await outcome(incomplete.setup());
         rejected(assert, result, 'An existing incomplete identity is not replaced');
@@ -277,8 +277,8 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
 
     QUnit.test('Shared application database isolates accounts and namespace ownership', async function (assert) {
         const database = await this.open();
-        const alice = new Be8('201', database.connection);
-        const bob = new Be8('202', database.connection);
+        const alice = new Be9('201', database.connection);
+        const bob = new Be9('202', database.connection);
         await outcome(Promise.all([alice.setup(), bob.setup()]));
         const alicePub = await alice.getMyPublicKey();
         const bobPub = await bob.getMyPublicKey();
@@ -288,7 +288,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
             'Separate scopes interoperate using public exchange in the same application database');
         assert.deepEqual(await storedIDs(database, 'privateKeys', '201'), ['201'], 'Alice scope contains only Alice private key');
         assert.deepEqual(await storedIDs(database, 'privateKeys', '202'), ['202'], 'Bob scope contains only Bob private key');
-        const wrongOwner = new Be8('203', database.connection, { namespace: '201' });
+        const wrongOwner = new Be9('203', database.connection, { namespace: '201' });
         for (const operation of [() => wrongOwner.setup(), () => wrongOwner.getCachedKeys(),
             () => wrongOwner.addPublicKey('202', this.bob.publicKey), () => wrongOwner.panic()]) {
             const result = await outcome(operation());
@@ -305,8 +305,8 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
 
     QUnit.test('Same account in different explicit namespaces retains separate identities', async function (assert) {
         const database = await this.open();
-        const one = new Be8('201', database.connection, { namespace: 'tenant:one' });
-        const two = new Be8('201', database.connection, { namespace: 'tenant:two' });
+        const one = new Be9('201', database.connection, { namespace: 'tenant:one' });
+        const two = new Be9('201', database.connection, { namespace: 'tenant:two' });
         await outcome(Promise.all([one.setup(), two.setup()]));
         const first = await one.getMyPublicKey();
         const second = await two.getMyPublicKey();
@@ -314,15 +314,15 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         await one.addPublicKey(this.bob.id, this.bob.publicKey);
         assert.strictEqual((await two.getCachedKeys()).length, 1, 'Public peer caches do not leak across namespaces');
         for (const id of ['', ' ', '01', '-1', '1e2', 1]) {
-            assert.throws(() => new Be8(id, database.connection), Error, 'Invalid or ambiguous account identifiers are rejected');
+            assert.throws(() => new Be9(id, database.connection), Error, 'Invalid or ambiguous account identifiers are rejected');
         }
-        assert.throws(() => new Be8('201', database.connection, { namespace: ' ' }), Error, 'Empty namespace is rejected');
+        assert.throws(() => new Be9('201', database.connection, { namespace: ' ' }), Error, 'Empty namespace is rejected');
     });
 
     QUnit.test('Two different accounts racing for one namespace cannot both bind or mix data', async function (assert) {
         const database = await this.open();
-        const one = new Be8('201', database.connection, { namespace: 'shared' });
-        const two = new Be8('202', database.connection, { namespace: 'shared' });
+        const one = new Be9('201', database.connection, { namespace: 'shared' });
+        const two = new Be9('202', database.connection, { namespace: 'shared' });
         const result = await outcome(Promise.allSettled([one.setup(), two.setup()]));
         assert.strictEqual(result.status, 'fulfilled', 'Both competing initializers settled');
         assert.strictEqual(result.value.filter(value => value.status === 'fulfilled').length, 1, 'Exactly one account owns the namespace');
@@ -348,13 +348,13 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         assert.strictEqual(reopened.native.version, 1, 'The schema version was rolled back');
         assert.false(reopened.native.objectStoreNames.contains(STORES.scopes), 'Partially created engine stores were rolled back');
         assert.true((await readRecord(reopened, 'appSettings', 'setting')).value, 'Application records were preserved');
-        assert.throws(() => upgradeBe8Schema(reopened.native), Error, 'Schema integration cannot run outside versionchange');
+        assert.throws(() => upgradeBe9Schema(reopened.native), Error, 'Schema integration cannot run outside versionchange');
     });
 
     QUnit.test('Generated group private key persists, racing generation is idempotent, and versions cannot be overwritten', async function (assert) {
         const { alice, bob } = this;
         const secondDB = await this.open(alice.database.name);
-        const other = new Be8(alice.id, secondDB.connection);
+        const other = new Be9(alice.id, secondDB.connection);
         await other.setup();
         const result = await outcome(Promise.all([
             createLegacyGroup(alice.engine, alice.database, 1, 'g200'), createLegacyGroup(other, secondDB, 1, 'g200'),
@@ -379,7 +379,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         const database = await this.open(undefined, { upgrade(db) {
             db.createObjectStore('appSettings', { keyPath: 'id' });
         } });
-        const engine = new Be8('104', database.connection);
+        const engine = new Be9('104', database.connection);
         await engine.setup();
         await engine.addPublicKey(this.bob.id, this.bob.publicKey);
         await createLegacyGroup(engine, database, 1, 'g200');
@@ -412,7 +412,7 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
             db.createObjectStore('groupKeys', { keyPath: ['groupID', 'version'] });
             db.createObjectStore('application', { keyPath: 'id' });
         } });
-        rejected(assert, await outcome(new Be8('104', original.connection).setup()),
+        rejected(assert, await outcome(new Be9('104', original.connection).setup()),
             'An application without schema integration is rejected instead of automatically upgraded');
         const cryptoPair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-384' }, true, ['deriveKey', 'deriveBits']);
         const legacyPair = await Promise.all([crypto.subtle.exportKey('jwk', cryptoPair.publicKey),
@@ -425,8 +425,8 @@ QUnit.module('Persistence / native failures and concurrency', hooks => {
         tx.objectStore('application').put({ id: 'setting', value: true });
         await original.whenIdle();
         original.close();
-        const database = await this.open(original.name, { version: 2, upgrade(db, tx) { upgradeBe8Schema(db, tx); } });
-        const owner = new Be8('104', database.connection);
+        const database = await this.open(original.name, { version: 2, upgrade(db, tx) { upgradeBe9Schema(db, tx); } });
+        const owner = new Be9('104', database.connection);
         const result = await outcome(owner.setup());
         rejected(assert, result, 'Default setup refuses to silently create a new legacy identity');
         assert.strictEqual(result.error?.code, 'LEGACY_IDENTITY', 'The explicit migration requirement is reported');

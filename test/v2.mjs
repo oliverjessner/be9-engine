@@ -18,7 +18,7 @@ const vector = {
     },
     "metadata": {
         "version": 2,
-        "suite": "BE8-P384-HKDF-SHA256-A256GCM",
+        "suite": "BE9-P384-HKDF-SHA256-A256GCM",
         "contextID": "vector|:\u0000👩🏽‍💻",
         "sender": "101",
         "receiver": "102",
@@ -27,15 +27,16 @@ const vector = {
         "purpose": "data",
         "salt": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
     },
-    "infoDigest": "d31cc465d8c6db94fd1b1d7a1260f2c0c2f508ea8fdd39c3d20cc75dbb96a668",
-    "ciphertext": "6e625ccb93a88c12b52df1b3efa3385d02ad8fbc84e73fcbf681d0af9dabb79691d6c97d2a084967"
+    "infoDigest": "bfdb9ed99b3e9d60ff37208b43ec7e2bbf493460e7425c3d2a597ac492478d41",
+    "ciphertext": "bbed949053192139c47ab1b997adb47a0274b604f7844d6bb343efb6692130ab0e253666b5c152d3"
 };
 
-import Be8, { STORES, V2_SUITE, encodeV2DerivationInfo, jwkThumbprint } from '../lib/bundle.mjs';
+import Be9, { STORES, V2_SUITE, encodeV2DerivationInfo, jwkThumbprint } from '../lib/bundle.mjs';
 import { hkdfAES, decode32, encodeBase64url } from '../lib/v2.mjs';
 import { participantHooks, exchangePublicKeys, isAuthenticationFailure } from './participants.mjs';
 import { readRecord } from './database.mjs';
 import { encryptLegacyFixture } from './legacy-fixture.mjs';
+import { vector as be8Vector } from './be8-legacy-vectors.mjs';
 
 const hex = value => Uint8Array.from(value.match(/../g) || [], byte => parseInt(byte, 16));
 const hexString = bytes => [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('');
@@ -55,7 +56,7 @@ async function fixedOwner(context, id, scalar, publicKey) {
     tx.objectStore(STORES.publicKeys).add({ namespace: id, accID: id, key: publicKey });
     tx.objectStore(STORES.privateKeys).add({ namespace: id, accID: id, key: privateKey, publicKey });
     await database.whenIdle();
-    const engine = new Be8(id, database.connection);
+    const engine = new Be9(id, database.connection);
     await engine.setup();
     return { engine, database, keyReference: (await engine.generatePrivAndPubKey()).keyReference };
 }
@@ -101,6 +102,23 @@ QUnit.module('v2 / P-384 ECDH plus HKDF-SHA-256', hooks => {
         assert.true(new TextDecoder().decode(await crypto.subtle.decrypt(encryption, recipient, ciphertext)) === 'v2 full-width P-384 test',
             'The independent recipient derives an interoperable native key');
         assert.true(key !== recipient && !key.extractable && !recipient.extractable, 'Participants retain distinct non-extractable keys');
+    });
+
+    QUnit.test('Explicit Be8 derivation reads the independent historical vector with decrypt-only non-extractable keys', async function (assert) {
+        const alice = await fixedOwner(this, '101', 1, be8Vector.alicePublic);
+        const bob = await fixedOwner(this, '102', 2, be8Vector.bobPublic);
+        const key = await alice.engine.getBe8DerivedKey(be8Vector.bobPublic, alice.keyReference, be8Vector.metadata);
+        const recipient = await bob.engine.getBe8DerivedKey(be8Vector.alicePublic, bob.keyReference, structuredClone(be8Vector.metadata));
+        const ciphertext = hex(be8Vector.ciphertext);
+        for (const local of [key, recipient]) {
+            assert.strictEqual(new TextDecoder().decode(await crypto.subtle.decrypt(encryption, local, ciphertext)), 'v2 full-width P-384 test', 'Local owner derives the frozen historical key without exchanging private material');
+            assert.deepEqual(local.usages, ['decrypt'], 'Legacy key cannot generate new Be8 ciphertexts');
+            await assert.rejects(crypto.subtle.exportKey('raw', local), error => error.name === 'InvalidAccessError', 'Historical key remains non-extractable');
+            await assert.rejects(crypto.subtle.encrypt(encryption, local, knownMessage), error => error.name === 'InvalidAccessError', 'Native crypto refuses legacy encryption');
+        }
+        await bob.engine.addPublicKey('101', be8Vector.alicePublic, { trust: 'confirmed' });
+        assert.strictEqual(await bob.engine.decryptBe8TextUnframedLegacy('101', '102', encodeBase64url(ciphertext), encodeBase64url(new Uint8Array(12)), be8Vector.metadata), 'v2 full-width P-384 test', 'Actual recipient convenience reader consumes the old unframed vector');
+        await assert.rejects(bob.engine.getDerivedKey(be8Vector.alicePublic, bob.keyReference, be8Vector.metadata), error => error.code === 'INVALID_DERIVATION_CONTEXT', 'Modern KDF refuses old metadata instead of auto-detecting it');
     });
 
     QUnit.test('New contexts generate public salts; recipient reuses metadata and does not generate randomness', async function (assert) {
@@ -227,7 +245,7 @@ QUnit.module('v2 / P-384 ECDH plus HKDF-SHA-256', hooks => {
         tx.objectStore(STORES.publicKeys).put({ namespace: '104', accID: '104', key: ownPublic });
         tx.objectStore(STORES.privateKeys).put({ namespace: '104', accID: '104', key: oldPair.privateKey, publicKey: ownPublic });
         await database.whenIdle();
-        const engine = new Be8('104', database.connection);
+        const engine = new Be9('104', database.connection);
         await engine.setup();
         await engine.addPublicKey(this.bob.id, this.bob.publicKey, { trust: 'confirmed' });
         const { keyReference } = await engine.generatePrivAndPubKey();

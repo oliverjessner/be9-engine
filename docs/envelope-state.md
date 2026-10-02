@@ -1,5 +1,8 @@
 # v2 envelope and local security state
 
+This page specifies the Be9 profile. Retained Be8 packets require the explicitly
+named readers and database migration in [Be9 migration](be9-migration.md).
+
 New convenience encryption returns `{ header, ciphertext }`, not the old
 ciphertext/IV/derivation tuple. `encryptEnvelope(sender, receiver, bytes,
 { contextID, purpose })` handles bytes; text/image Simple APIs are thin text
@@ -17,7 +20,7 @@ ciphertext limits reject before key derivation.
 
 AAD uses the same `encodeFields(domain, byteFields)` codec as HKDF: ASCII domain
 prefix followed by ordered uint32-BE length-prefixed byte fields. For envelope
-AAD the domain is `BE8-ENVELOPE-AAD`, followed by complete HKDF-info bytes, raw
+AAD the domain is `BE9-ENVELOPE-AAD`, followed by complete HKDF-info bytes, raw
 32-byte salt, raw 12-byte IV, 8-byte big-endian sequence, group marker, group ID,
 8-byte group epoch and raw generation digest (empty fields for null group).
 Every header field is bound. AAD provides integrity, not metadata secrecy.
@@ -54,7 +57,7 @@ sequence; it never refunds it. Send states bind namespace, context, ordered
 endpoints, actual fingerprints, suite/purpose and structured group generation.
 Salt is deliberately excluded from stream identity so per-packet salt changes
 cannot reset sequences. Stream identity uses the common length-prefix codec
-with domain `BE8-REPLAY-STREAM` and SHA-256 of those public fields.
+with domain `BE9-REPLAY-STREAM` and SHA-256 of those public fields.
 
 `openReceiveContext({ sender, receiver, contextID, purpose })` initializes the
 expected stream using actual trusted peer and local public fingerprints, not
@@ -73,7 +76,7 @@ streams reject with `STREAM_NOT_OPEN`; unopened contexts reject with
 bindings per context) detects missing counter/window rows and rejects with
 `STATE_LOST`, including attempted reinitialization. Invalid state fails closed.
 
-Applications integrate `be8.contexts`, `be8.sendState`, `be8.receiveState` through
+Applications integrate `be9.contexts`, `be9.sendState`, `be9.receiveState` through
 their own schema upgrade. A complete database/registry loss cannot be
 cryptographically distinguished from a new installation: do not resume old
 context IDs after loss; establish fresh contexts independently. Selective

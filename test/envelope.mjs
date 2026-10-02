@@ -61,13 +61,13 @@ QUnit.module('v2 authenticated envelope', hooks => {
 
 QUnit.module('v2 envelope / independent public encoding vector', () => {
     QUnit.test('AAD matches independent Python struct/SHA-256 encoding through the full uint64 range', async function (assert) {
-        const header = { version: 2, suite: 'BE8-P384-HKDF-SHA256-A256GCM', contextID: 'ctx🌍', sender: '101', receiver: '102',
+        const header = { version: 2, suite: 'BE9-P384-HKDF-SHA256-A256GCM', contextID: 'ctx🌍', sender: '101', receiver: '102',
             senderFingerprint: encodeBase64url(new Uint8Array(32)), receiverFingerprint: encodeBase64url(new Uint8Array(32).fill(1)),
             purpose: 'data', salt: encodeBase64url(new Uint8Array(32).fill(2)), iv: encodeBase64url(new Uint8Array(12).fill(3)),
             sequence: '18446744073709551615', group: null };
         const aad = encodeEnvelopeAAD(header);
         const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', aad))].map(byte => byte.toString(16).padStart(2, '0')).join('');
-        assert.strictEqual(digest, '7c90bdeadf7097ef265a27f361e41fd8e70bf2b2bee5ec62cf6b327efa411b31', 'Deterministic public header bytes match independent encoding');
+        assert.strictEqual(digest, '4823db3985f140873fd6c93cfa25b41d7067dd6694a04e6253af901e07012ca1', 'Deterministic public header bytes match independent encoding');
         assert.strictEqual(aad.length, 255, 'All length prefixes and fields are accounted for');
     });
 });

@@ -1,4 +1,4 @@
-import Be8, { STORES, V2_LIMITS, encodeBase64url, decodeBase64url, jwkThumbprint } from '../lib/bundle.mjs';
+import Be9, { STORES, V2_LIMITS, encodeBase64url, decodeBase64url, jwkThumbprint } from '../lib/bundle.mjs';
 import { derivationUsageID } from '../lib/usage.mjs';
 import { participantHooks, exchangePublicKeys, packetMetadata } from './participants.mjs';
 import { readRecord } from './database.mjs';
@@ -150,7 +150,7 @@ QUnit.module('v2 / binary encoding, nonces and persisted usage', hooks => {
         assert.strictEqual((await readRecord(alice.database, 'keyUsage', id)).encryptions, 2, 'Text/image share the actual-key budget');
         alice.database.close();
         const database = await this.open(alice.database.name);
-        const reloaded = new Be8(alice.id, database.connection);
+        const reloaded = new Be9(alice.id, database.connection);
         await reloaded.setup();
         const local = await reloaded.generatePrivAndPubKey();
         const key = await reloaded.getDerivedKey(bob.publicKey, local.keyReference, context.derivation);
@@ -165,7 +165,7 @@ QUnit.module('v2 / binary encoding, nonces and persisted usage', hooks => {
         const context = await alice.createContext(bob.publicKey);
         const id = await seedUsage(alice.database, context.derivation, V2_LIMITS.encryptions - 1, V2_LIMITS.encryptions - 1);
         const database = await this.open(alice.database.name);
-        const other = new Be8(alice.id, database.connection);
+        const other = new Be9(alice.id, database.connection);
         await other.setup();
         const key = await other.getDerivedKey(bob.publicKey, (await other.generatePrivAndPubKey()).keyReference, context.derivation);
         const results = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => index % 2
@@ -197,7 +197,7 @@ QUnit.module('v2 / binary encoding, nonces and persisted usage', hooks => {
             // Test-only native constraint, not a synthetic storage failure.
             tx.objectStore(STORES.keyUsage).createIndex('testUniqueCount', 'encryptions', { unique: true });
         } });
-        const engine = new Be8(alice.id, database.connection);
+        const engine = new Be9(alice.id, database.connection);
         await engine.setup();
         const local = await engine.generatePrivAndPubKey();
         const options = { sender: alice.id, receiver: bob.id, purpose: 'data', contextID: 'write error' };
@@ -251,7 +251,7 @@ QUnit.module('v2 / binary encoding, nonces and persisted usage', hooks => {
         tx.objectStore(STORES.publicKeys).put({ namespace: 'alias', accID: alice.id, key: alice.publicKey });
         tx.objectStore(STORES.privateKeys).put({ namespace: 'alias', accID: alice.id, key: own, publicKey: alice.publicKey });
         await alice.database.whenIdle();
-        const alias = new Be8(alice.id, alice.database.connection, { namespace: 'alias' });
+        const alias = new Be9(alice.id, alice.database.connection, { namespace: 'alias' });
         await alias.setup();
         const key = await alias.getDerivedKey(bob.publicKey, (await alias.generatePrivAndPubKey()).keyReference, context.derivation);
         await assert.rejects(alias.encryptText(key, ''), code('KEY_USAGE_EXHAUSTED'), 'Storage namespace is not part of the budget identity');
@@ -262,7 +262,7 @@ QUnit.module('v2 / binary encoding, nonces and persisted usage', hooks => {
 
     QUnit.test('The application integrates the new store explicitly without replacing its identity', async function (assert) {
         const database = await this.open(undefined, { upgrade(db) { db.deleteObjectStore(STORES.keyUsage); } });
-        const engine = new Be8('104', database.connection);
+        const engine = new Be9('104', database.connection);
         await engine.setup();
         const local = await engine.generatePrivAndPubKey();
         const context = await engine.createDerivationContext(this.bob.publicKey, local.keyReference,
@@ -270,7 +270,7 @@ QUnit.module('v2 / binary encoding, nonces and persisted usage', hooks => {
         await assert.rejects(engine.encryptText(context.key, 'requires schema'), code('SCHEMA_UPGRADE_REQUIRED'), 'No counter fallback or implicit database upgrade');
         database.close();
         const upgraded = await this.open(database.name, { version: 2 });
-        const reloaded = new Be8('104', upgraded.connection);
+        const reloaded = new Be9('104', upgraded.connection);
         await reloaded.setup();
         assert.strictEqual(await jwkThumbprint(await reloaded.getMyPublicKey()), await jwkThumbprint(local.publicKey), 'The application upgrade preserves cryptographic identity');
         const key = await reloaded.getDerivedKey(this.bob.publicKey, (await reloaded.generatePrivAndPubKey()).keyReference, context.derivation);

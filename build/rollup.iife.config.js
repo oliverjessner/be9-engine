@@ -10,13 +10,13 @@ const config = {
   input: 'lib/iife.mjs',
   output: {
     format: 'iife',
-    name: 'be8',
+    name: 'be9',
     file: './dist/bundle.min.js',
     preferConst: true,
   },
   plugins: [
     prettier(prettierConfig),
-    terser()
+    terser({ keep_classnames: true })
   ]
 };
 
