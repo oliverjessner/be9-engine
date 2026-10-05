@@ -12,7 +12,7 @@ export const rows = (database, name) => withTransaction(database.connection, [na
 export async function toBe8Layout(context, peer, extraUpgrade) {
     peer.database.close();
     const database = await context.open(peer.database.name, { version: 2, skipEngineSchema: true, upgrade(db, tx) {
-        for (const key of Object.keys(STORES)) tx.objectStore(STORES[key]).name = BE8_STORES[key];
+        for (const key of Object.keys(BE8_STORES)) tx.objectStore(STORES[key]).name = BE8_STORES[key];
         if (extraUpgrade) extraUpgrade(db, tx);
     } });
     return { id: peer.id, publicKey: peer.publicKey, database };

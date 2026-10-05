@@ -8,7 +8,15 @@
         "test": "node test/run-browser.mjs",
         "test:manual": "node test/server.mjs",
         "watch": "rollup -w -c build/rollup.config.js",
-        "build": "rollup -c build/rollup.config.js && rollup -c build/rollup.iife.config.js"
+        "build": "rollup -c build/rollup.config.js && rollup -c build/rollup.iife.config.js",
+        "test:source": "node test/run-browser.mjs --bundle source",
+        "test:esm": "node test/run-browser.mjs --bundle esm",
+        "test:iife": "node test/run-browser.mjs --bundle iife",
+        "test:chromium": "node test/run-matrix.mjs chromium",
+        "test:firefox": "node test/run-matrix.mjs firefox",
+        "test:webkit": "node test/run-matrix.mjs webkit",
+        "test:all": "node test/run-matrix.mjs",
+        "test:build": "node test/check-build.mjs"
     },
     "repository": {
         "type": "git",

@@ -1,0 +1,28 @@
+name: Native crypto and distribution
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+        bundle: [source, esm, iife]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps ${{ matrix.browser }}
+      - run: npm run build
+      - run: git diff --exit-code -- dist/
+      - run: node test/run-browser.mjs --browser ${{ matrix.browser }} --bundle ${{ matrix.bundle }}
+      - run: npm run test:build
+      - run: git diff --exit-code -- dist/
+      - run: npm pack --dry-run

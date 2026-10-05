@@ -22,20 +22,6 @@ const BE8_STORES = Object.freeze({
     receiveState: 'be8.receiveState',
 });
 
-function getTypeOfKey(id) {
-    if (!id) {
-        throw new Error('engine: id is required in getTypeOfKey');
-    }
-    if (id.charAt(0) === 'g') {
-        return 'group';
-    }
-    if (id.charAt(0) === 'c') {
-        return 'channel';
-    }
-
-    return 'dialog';
-}
-
 const STORES = Object.freeze({
     scopes: 'be9.scopes',
     publicKeys: 'be9.publicKeys',
@@ -48,6 +34,12 @@ const STORES = Object.freeze({
     contexts: 'be9.contexts',
     sendState: 'be9.sendState',
     receiveState: 'be9.receiveState',
+    signingKeys: 'be9.signingKeys',
+    signingTrust: 'be9.signingTrust',
+    sessionRegistry: 'be9.sessionRegistry',
+    sessions: 'be9.sessions',
+    ratchetState: 'be9.ratchetState',
+    skippedKeys: 'be9.skippedKeys',
 });
 
 function engineError(message, code = 'INVALID_STATE') {
@@ -131,6 +123,12 @@ function upgradeBe9Schema(db, transaction) {
         [STORES.contexts, ['namespace', 'contextID']],
         [STORES.sendState, ['namespace', 'contextID', 'streamID']],
         [STORES.receiveState, ['namespace', 'contextID', 'streamID']],
+        [STORES.signingKeys, ['namespace', 'accID']],
+        [STORES.signingTrust, ['namespace', 'peerID']],
+        [STORES.sessionRegistry, ['namespace', 'sessionID']],
+        [STORES.sessions, ['namespace', 'sessionID']],
+        [STORES.ratchetState, ['namespace', 'sessionID']],
+        [STORES.skippedKeys, ['namespace', 'sessionID', 'chain', 'number']],
     ];
     try {
         for (const [name, keyPath] of definitions) {
@@ -161,6 +159,21 @@ function upgradeBe9Schema(db, transaction) {
                         'SCHEMA_ERROR'
                     );
                 }
+            }
+            if (name === STORES.skippedKeys) {
+                if (!store.indexNames.contains('session'))
+                    store.createIndex('session', ['namespace', 'sessionID']);
+                const session = store.index('session');
+                if (
+                    JSON.stringify(session.keyPath) !==
+                        JSON.stringify(['namespace', 'sessionID']) ||
+                    session.unique ||
+                    session.multiEntry
+                )
+                    throw engineError(
+                        'incompatible session index',
+                        'SCHEMA_ERROR'
+                    );
             }
         }
     } catch {
@@ -799,6 +812,3395 @@ function nextTrust(current, fingerprint, decision, firstContact) {
     // TOFU is a first-contact policy, never a later confirmation or key change.
     if (firstContact && decision.tofu) return 'tofu';
     return 'unverified';
+}
+
+const V2_SUITE = 'BE9-P384-HKDF-SHA256-A256GCM';
+const V2_PURPOSES = Object.freeze(['data', 'attachment', 'key-wrap']);
+const fields$2 = [
+    'version',
+    'suite',
+    'contextID',
+    'sender',
+    'receiver',
+    'senderFingerprint',
+    'receiverFingerprint',
+    'purpose',
+    'salt',
+];
+const encoder = new TextEncoder();
+
+function fail$1(
+    message = 'invalid v2 derivation context',
+    code = 'INVALID_DERIVATION_CONTEXT'
+) {
+    return engineError(message, code);
+}
+
+function scalarString(value, maxBytes = 1024) {
+    if (typeof value !== 'string' || !value.length || value.length > maxBytes)
+        throw fail$1();
+    // Reject lone UTF-16 surrogates rather than silently replacing them in UTF-8.
+    for (const character of value) {
+        const code = character.codePointAt(0);
+        if (code >= 0xd800 && code <= 0xdfff) throw fail$1();
+    }
+    const bytes = encoder.encode(value);
+    if (bytes.length > maxBytes) throw fail$1();
+    return bytes;
+}
+
+function decode32(value) {
+    fingerprintValue(value);
+    const bytes = decodeBase64url(value, 32);
+    if (bytes.length !== 32) throw fail$1();
+    return bytes;
+}
+
+function endpoint$1(value) {
+    scalarString(value, 256);
+    if (
+        !/^(0|[1-9][0-9]*)$/.test(value) &&
+        !/^g[A-Za-z0-9_-]+:[1-9][0-9]*$/.test(value)
+    )
+        throw fail$1();
+    if (
+        value.startsWith('g') &&
+        !Number.isSafeInteger(Number(value.slice(value.lastIndexOf(':') + 1)))
+    )
+        throw fail$1();
+    return value;
+}
+
+function derivationSnapshot(value, legacy = false) {
+    if (!value)
+        throw fail$1(
+            'v2 derivation metadata is required; use the explicit legacy reader for old ciphertexts',
+            'DERIVATION_CONTEXT_REQUIRED'
+        );
+    try {
+        if (
+            typeof value !== 'object' ||
+            Array.isArray(value) ||
+            Object.keys(value).length !== fields$2.length ||
+            !fields$2.every((field) => Object.keys(value).includes(field))
+        )
+            throw fail$1();
+        const snapshot = Object.fromEntries(
+            fields$2.map((field) => [field, value[field]])
+        );
+        if (
+            snapshot.version !== 2 ||
+            snapshot.suite !== (legacy ? BE8_V2_SUITE : V2_SUITE) ||
+            !V2_PURPOSES.includes(snapshot.purpose)
+        )
+            throw fail$1();
+        scalarString(snapshot.contextID);
+        endpoint$1(snapshot.sender);
+        endpoint$1(snapshot.receiver);
+        decode32(snapshot.salt);
+        decode32(snapshot.senderFingerprint);
+        decode32(snapshot.receiverFingerprint);
+        return Object.freeze(snapshot);
+    } catch {
+        throw fail$1();
+    }
+}
+
+// Fixed domain prefix plus eight ordered, uint32-BE length-prefixed byte strings.
+// No separators, normalization, optional fields or object serialization enter info.
+function encodeV2DerivationInfo$1(metadata, legacy = false) {
+    const context = derivationSnapshot(metadata, legacy);
+    const values = [
+        encoder.encode('2'),
+        encoder.encode(context.suite),
+        scalarString(context.contextID),
+        scalarString(context.sender, 256),
+        scalarString(context.receiver, 256),
+        decode32(context.senderFingerprint),
+        decode32(context.receiverFingerprint),
+        encoder.encode(context.purpose),
+    ];
+    return encodeFields(
+        legacy ? BE8_DOMAINS.pairInfo : 'BE9-HKDF-INFO',
+        values
+    );
+}
+
+function encodeFields(domain, values) {
+    const prefix = encoder.encode(domain);
+    const info = new Uint8Array(
+        prefix.length +
+            values.reduce((length, value) => length + 4 + value.length, 0)
+    );
+    info.set(prefix);
+    const view = new DataView(info.buffer);
+    let offset = prefix.length;
+    for (const value of values) {
+        view.setUint32(offset, value.length, false);
+        offset += 4;
+        info.set(value, offset);
+        offset += value.length;
+    }
+    return info;
+}
+
+async function createV2Metadata(localID, ownPublicKey, peerPublicKey, options) {
+    if (!options || typeof options !== 'object' || Array.isArray(options))
+        throw fail$1();
+    // Snapshot all application inputs before crypto yields.
+    const { contextID, sender, receiver, purpose } = options;
+    if (sender !== localID)
+        throw fail$1('only the sender creates a new derivation context');
+    scalarString(contextID);
+    endpoint$1(sender);
+    endpoint$1(receiver);
+    if (!V2_PURPOSES.includes(purpose)) throw fail$1();
+    const [own, peer] = await Promise.all([
+        preparePublicKey(ownPublicKey),
+        preparePublicKey(peerPublicKey),
+    ]);
+    if (sender === receiver && own.fingerprint !== peer.fingerprint)
+        throw fail$1();
+    const salt = crypto.getRandomValues(new Uint8Array(32));
+    return derivationSnapshot({
+        version: 2,
+        suite: V2_SUITE,
+        contextID,
+        sender,
+        receiver,
+        senderFingerprint: own.fingerprint,
+        receiverFingerprint: peer.fingerprint,
+        purpose,
+        salt: encodeBase64url(salt),
+    });
+}
+
+// Internal helper also exercised against RFC 5869 public test vectors.
+// It never returns IKM, PRK, raw AES bytes or an extractable derived key.
+async function hkdfAES(secret, salt, info, purpose, readOnly = false) {
+    if (!V2_PURPOSES.includes(purpose)) throw fail$1();
+    let material;
+    try {
+        material = await crypto.subtle.importKey('raw', secret, 'HKDF', false, [
+            'deriveKey',
+        ]);
+    } finally {
+        secret.fill(0);
+    }
+    const usages =
+        purpose === 'key-wrap'
+            ? readOnly
+                ? ['unwrapKey']
+                : ['wrapKey', 'unwrapKey']
+            : readOnly
+            ? ['decrypt']
+            : ['encrypt', 'decrypt'];
+    return crypto.subtle.deriveKey(
+        { name: 'HKDF', hash: 'SHA-256', salt, info },
+        material,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        usages
+    );
+}
+
+async function deriveV2AES(
+    localID,
+    ownPublicKey,
+    peerPublicKey,
+    privateKey,
+    metadata,
+    legacy = false
+) {
+    const context = derivationSnapshot(metadata, legacy);
+    const priv = privateCryptoKey(privateKey);
+    if (priv.usages[0] !== 'deriveBits') {
+        throw fail$1(
+            'stored non-extractable deriveKey-only identity cannot derive v2; it is retained for explicit legacy reading',
+            'V2_KEY_USAGE_UNAVAILABLE'
+        );
+    }
+    if (localID !== context.sender && localID !== context.receiver)
+        throw fail$1('local endpoint is not a participant in this context');
+    const [own, peer] = await Promise.all([
+        preparePublicKey(ownPublicKey),
+        preparePublicKey(peerPublicKey),
+    ]);
+    const sending = localID === context.sender;
+    const ownExpected = sending
+        ? context.senderFingerprint
+        : context.receiverFingerprint;
+    const peerExpected = sending
+        ? context.receiverFingerprint
+        : context.senderFingerprint;
+    if (own.fingerprint !== ownExpected || peer.fingerprint !== peerExpected) {
+        throw fail$1(
+            'derivation fingerprints do not match the actual endpoint keys',
+            'DERIVATION_KEY_MISMATCH'
+        );
+    }
+    const imported = await crypto.subtle.importKey(
+        'jwk',
+        peer.key,
+        { name: 'ECDH', namedCurve: 'P-384' },
+        peer.key.ext,
+        []
+    );
+    let secret;
+    try {
+        // P-384's complete fixed-width ECDH x-coordinate, including leading zeros.
+        secret = new Uint8Array(
+            await crypto.subtle.deriveBits(
+                { name: 'ECDH', public: imported },
+                priv,
+                384
+            )
+        );
+        if (secret.length !== 48)
+            throw fail$1('unexpected P-384 ECDH output length');
+        return await hkdfAES(
+            secret,
+            decode32(context.salt),
+            encodeV2DerivationInfo$1(context, legacy),
+            context.purpose,
+            legacy
+        );
+    } finally {
+        // Best effort only: WebCrypto/runtime copies and GC are outside our control.
+        secret?.fill(0);
+    }
+}
+
+function requireAES(key, usage) {
+    if (!key)
+        throw engineError(
+            'no derived key passed to AES operation',
+            'INVALID_KEY'
+        );
+    if (
+        !(key instanceof CryptoKey) ||
+        key.type !== 'secret' ||
+        key.algorithm.name !== 'AES-GCM' ||
+        key.algorithm.length !== 256 ||
+        key.extractable
+    ) {
+        throw engineError(
+            'a non-extractable AES-256-GCM key is required',
+            'INVALID_KEY'
+        );
+    }
+    if (!key.usages.includes(usage))
+        throw new DOMException(
+            'AES key does not permit this operation',
+            'InvalidAccessError'
+        );
+}
+
+function payloadSnapshot(ciphertext, iv, legacy = false) {
+    if (iv === undefined || iv === null)
+        throw engineError(
+            'no iv (Initialization vector) passed to decrypt',
+            'INVALID_IV'
+        );
+    let nonce;
+    if (legacy) {
+        if (
+            typeof iv !== 'string' ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+                iv
+            )
+        ) {
+            throw engineError('invalid legacy UUID IV', 'INVALID_IV');
+        }
+        // UUID bytes were ASCII/UTF-8. No random bytes pass through text codecs.
+        nonce = Uint8Array.from(iv, (character) => character.charCodeAt(0));
+    } else {
+        try {
+            nonce = decodeBytes(iv, V2_LIMITS.ivBytes);
+        } catch {
+            throw engineError(
+                'v2 IV must be exactly 12 bytes in canonical base64url or binary',
+                'INVALID_IV'
+            );
+        }
+        if (nonce.length !== V2_LIMITS.ivBytes)
+            throw engineError('v2 IV must be exactly 12 bytes', 'INVALID_IV');
+    }
+    const bytes = legacy
+        ? decodeLegacyBase64(ciphertext)
+        : decodeBytes(ciphertext);
+    if (bytes.length < V2_LIMITS.tagBits / 8)
+        throw engineError(
+            'ciphertext is shorter than the GCM tag',
+            'INVALID_CIPHERTEXT'
+        );
+    return { bytes, iv: nonce };
+}
+
+async function encryptPayload(key, bytes) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv, tagLength: 128 },
+        key,
+        bytes
+    );
+    return { cipherText: encodeBase64url(ciphertext), iv: encodeBase64url(iv) };
+}
+
+function decryptPayload(key, payload) {
+    return crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: payload.iv, tagLength: 128 },
+        key,
+        payload.bytes
+    );
+}
+
+// Only actual, validated derivation inputs enter this identity. No caller alias
+// or storage namespace can make the same HKDF key get a fresh local budget.
+async function derivationUsageID(derivation) {
+    const info = encodeV2DerivationInfo$1(derivation);
+    return usageIdentity(derivation.salt, info);
+}
+
+async function usageIdentity(salt, info) {
+    const prefix = new TextEncoder().encode('BE9-GCM-USAGE');
+    const bytes = new Uint8Array(prefix.length + 32 + info.length);
+    bytes.set(prefix);
+    bytes.set(decode32(salt), prefix.length);
+    bytes.set(info, prefix.length + 32);
+    return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
+}
+
+/* global BigInt */
+const GROUP_SUITE = 'BE9-GROUP-HKDF-SHA256-A256GCM';
+const fields$1 = [
+    'version',
+    'suite',
+    'contextID',
+    'sender',
+    'receiver',
+    'senderFingerprint',
+    'receiverFingerprint',
+    'purpose',
+    'salt',
+];
+function groupDerivationSnapshot(value, legacy = false) {
+    const result = Object.fromEntries(
+        fields$1.map((field) => [field, value[field]])
+    );
+    if (
+        result.version !== 2 ||
+        result.suite !== (legacy ? BE8_GROUP_SUITE : GROUP_SUITE) ||
+        !['data', 'attachment'].includes(result.purpose) ||
+        typeof result.sender !== 'string' ||
+        !/^(0|[1-9][0-9]*)$/.test(result.sender) ||
+        typeof result.receiver !== 'string' ||
+        result.receiver.length > 128 ||
+        !/^g[A-Za-z0-9_-]+$/.test(result.receiver)
+    ) {
+        throw engineError('invalid group derivation', 'INVALID_ENVELOPE');
+    }
+    scalarString(result.contextID);
+    scalarString(result.sender, 256);
+    decode32(result.senderFingerprint);
+    decode32(result.receiverFingerprint);
+    decode32(result.salt);
+    return Object.freeze(result);
+}
+function encodeGroupInfo(header, legacy = false) {
+    const h = groupDerivationSnapshot(header, legacy);
+    const g = header.group;
+    if (
+        !g ||
+        g.groupID !== h.receiver ||
+        g.generation !== h.receiverFingerprint
+    )
+        throw engineError('group binding mismatch', 'INVALID_ENVELOPE');
+    const epoch = new Uint8Array(8);
+    new DataView(epoch.buffer).setBigUint64(0, BigInt(g.epoch), false);
+    return encodeFields(
+        legacy ? BE8_DOMAINS.groupInfo : 'BE9-GROUP-HKDF-INFO',
+        [
+            scalarString('2'),
+            scalarString(h.suite),
+            scalarString(h.contextID),
+            scalarString(h.sender, 256),
+            scalarString(h.receiver),
+            decode32(h.senderFingerprint),
+            decode32(h.receiverFingerprint),
+            scalarString(h.purpose),
+            scalarString(g.groupID),
+            epoch,
+            decode32(g.generation),
+        ]
+    );
+}
+async function groupGeneration(bytes) {
+    return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
+}
+async function importGroupSecret(bytes) {
+    try {
+        const key = await crypto.subtle.importKey('raw', bytes, 'HKDF', false, [
+            'deriveKey',
+        ]);
+        if (typeof structuredClone !== 'function') throw new Error();
+        const clone = structuredClone(key);
+        requireGroupSecret(clone);
+        return key;
+    } catch {
+        throw engineError(
+            'browser must support non-extractable CryptoKey structured clone',
+            'CRYPTOKEY_STORAGE_UNSUPPORTED'
+        );
+    }
+}
+function requireGroupSecret(key) {
+    if (
+        !(key instanceof CryptoKey) ||
+        key.algorithm.name !== 'HKDF' ||
+        key.type !== 'secret' ||
+        key.extractable ||
+        key.usages.length !== 1 ||
+        key.usages[0] !== 'deriveKey'
+    )
+        throw engineError(
+            'invalid persisted group secret',
+            'INVALID_GROUP_KEY'
+        );
+    return key;
+}
+async function deriveGroupAES(key, header, legacy = false) {
+    return crypto.subtle.deriveKey(
+        {
+            name: 'HKDF',
+            hash: 'SHA-256',
+            salt: decode32(header.salt),
+            info: encodeGroupInfo(header, legacy),
+        },
+        requireGroupSecret(key),
+        { name: 'AES-GCM', length: 256 },
+        false,
+        legacy ? ['decrypt'] : ['encrypt', 'decrypt']
+    );
+}
+
+/* global BigInt */
+
+const MAX_SEQUENCE = (1n << 64n) - 1n;
+const text$1 = (value) => new TextEncoder().encode(value);
+const metadataFields = [
+    'version',
+    'suite',
+    'contextID',
+    'sender',
+    'receiver',
+    'senderFingerprint',
+    'receiverFingerprint',
+    'purpose',
+    'salt',
+];
+const headerFields = [...metadataFields, 'iv', 'sequence', 'group'];
+function invalidEnvelope() {
+    return engineError(
+        'invalid or unsupported v2 envelope',
+        'INVALID_ENVELOPE'
+    );
+}
+function exactObject(value, fields) {
+    try {
+        if (
+            !value ||
+            typeof value !== 'object' ||
+            Array.isArray(value) ||
+            Reflect.ownKeys(value).length !== fields.length ||
+            !fields.every((field) => Object.hasOwn(value, field))
+        )
+            throw invalidEnvelope();
+        const snapshot = {};
+        for (const field of fields) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, field);
+            if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value'))
+                throw invalidEnvelope();
+            snapshot[field] = descriptor.value;
+        }
+        return snapshot;
+    } catch {
+        throw invalidEnvelope();
+    }
+}
+function sequenceValue(value) {
+    if (
+        typeof value !== 'string' ||
+        value.length > 20 ||
+        !/^(0|[1-9][0-9]*)$/.test(value)
+    )
+        throw invalidEnvelope();
+    const number = BigInt(value);
+    if (number > MAX_SEQUENCE) throw invalidEnvelope();
+    return number;
+}
+function uint64(value) {
+    const bytes = new Uint8Array(8);
+    new DataView(bytes.buffer).setBigUint64(0, sequenceValue(value), false);
+    return bytes;
+}
+function groupSnapshot(value) {
+    if (value === null) return null;
+    value = exactObject(value, ['groupID', 'epoch', 'generation']);
+    if (
+        typeof value.groupID !== 'string' ||
+        value.groupID.length > 128 ||
+        !/^g[A-Za-z0-9_-]+$/.test(value.groupID) ||
+        sequenceValue(value.epoch) === 0n
+    )
+        throw invalidEnvelope();
+    decode32(value.generation);
+    return Object.freeze({
+        groupID: value.groupID,
+        epoch: value.epoch,
+        generation: value.generation,
+    });
+}
+function headerMetadata(header, legacy = false) {
+    const value = Object.fromEntries(
+        metadataFields.map((field) => [field, header[field]])
+    );
+    return header.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE)
+        ? groupDerivationSnapshot(value, legacy)
+        : derivationSnapshot(value, legacy);
+}
+function headerSnapshot(value, legacy = false) {
+    try {
+        value = exactObject(value, headerFields);
+        const metadata = headerMetadata(value, legacy);
+        const iv = decodeBase64url(value.iv, 12);
+        if (iv.length !== 12 || sequenceValue(value.sequence) === 0n)
+            throw invalidEnvelope();
+        const group = groupSnapshot(value.group);
+        if (metadata.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE)) {
+            if (
+                !group ||
+                group.groupID !== metadata.receiver ||
+                group.generation !== metadata.receiverFingerprint
+            )
+                throw invalidEnvelope();
+        } else {
+            if (
+                !/^(0|[1-9][0-9]*)$/.test(metadata.sender) ||
+                !/^(0|[1-9][0-9]*)$/.test(metadata.receiver) ||
+                (group !== null) !== (metadata.purpose === 'key-wrap')
+            )
+                throw invalidEnvelope();
+        }
+        return Object.freeze({
+            ...metadata,
+            iv: value.iv,
+            sequence: value.sequence,
+            group,
+        });
+    } catch {
+        throw invalidEnvelope();
+    }
+}
+function envelopeSnapshot(value, legacy = false) {
+    value = exactObject(value, ['header', 'ciphertext']);
+    const header = headerSnapshot(value.header, legacy);
+    if (typeof value.ciphertext !== 'string') throw invalidEnvelope();
+    const payload = payloadSnapshot(value.ciphertext, header.iv);
+    return { header, payload, ciphertext: value.ciphertext };
+}
+function encodeEnvelopeAAD$1(value, legacy = false) {
+    const h = headerSnapshot(value, legacy);
+    const g = h.group;
+    const aad = encodeFields(legacy ? BE8_DOMAINS.aad : 'BE9-ENVELOPE-AAD', [
+        h.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE)
+            ? encodeGroupInfo(h, legacy)
+            : encodeV2DerivationInfo$1(headerMetadata(h, legacy), legacy),
+        decode32(h.salt),
+        decodeBase64url(h.iv, 12),
+        uint64(h.sequence),
+        text$1(g ? 'group' : ''),
+        text$1(g?.groupID || ''),
+        g ? uint64(g.epoch) : new Uint8Array(),
+        g ? decode32(g.generation) : new Uint8Array(),
+    ]);
+    if (aad.length > 4096) throw invalidEnvelope();
+    return aad;
+}
+function checkExpected(header, expected, localID) {
+    if (!expected || typeof expected !== 'object')
+        throw engineError(
+            'independent envelope expectations are required',
+            'ENVELOPE_EXPECTATION_REQUIRED'
+        );
+    scalarString(expected.contextID);
+    if (
+        expected.sender !== header.sender ||
+        expected.receiver !== header.receiver ||
+        expected.contextID !== header.contextID ||
+        expected.purpose !== header.purpose ||
+        header.receiver !== localID
+    ) {
+        throw engineError(
+            'envelope does not match the expected endpoints, context or purpose',
+            'ENVELOPE_EXPECTATION_MISMATCH'
+        );
+    }
+}
+
+// One byte-based authenticated operation. Wrapping is internal; no public
+// group-secret decoder or private-key export is introduced.
+async function sealBytes(key, header, bytes) {
+    const additionalData = encodeEnvelopeAAD$1(header);
+    const algorithm = {
+        name: 'AES-GCM',
+        iv: decodeBase64url(header.iv, 12),
+        tagLength: 128,
+        additionalData,
+    };
+    if (header.purpose === 'key-wrap') {
+        if (bytes.length !== 32 || !header.group) throw invalidEnvelope();
+        const temporary = await crypto.subtle.importKey(
+            'raw',
+            bytes,
+            'AES-GCM',
+            true,
+            ['encrypt', 'decrypt']
+        );
+        return encodeBase64url(
+            await crypto.subtle.wrapKey('raw', temporary, key, algorithm)
+        );
+    }
+    return encodeBase64url(await crypto.subtle.encrypt(algorithm, key, bytes));
+}
+async function openBytes(key, snapshot, legacy = false) {
+    const h = snapshot.header;
+    const algorithm = {
+        name: 'AES-GCM',
+        iv: snapshot.payload.iv,
+        tagLength: 128,
+        additionalData: encodeEnvelopeAAD$1(h, legacy),
+    };
+    if (h.purpose === 'key-wrap') {
+        if (snapshot.payload.bytes.length !== 48 || !h.group)
+            throw invalidEnvelope();
+        const temporary = await crypto.subtle.unwrapKey(
+            'raw',
+            snapshot.payload.bytes,
+            key,
+            algorithm,
+            'AES-GCM',
+            true,
+            ['encrypt', 'decrypt']
+        );
+        return new Uint8Array(await crypto.subtle.exportKey('raw', temporary));
+    }
+    return new Uint8Array(
+        await crypto.subtle.decrypt(algorithm, key, snapshot.payload.bytes)
+    );
+}
+
+class Envelopes {
+    constructor(keys, localID, replay) {
+        this.keys = keys;
+        this.localID = localID;
+        this.replay = replay;
+    }
+    async seal(
+        sender,
+        receiver,
+        value,
+        { contextID, purpose, group = null } = {}
+    ) {
+        if (typeof receiver === 'string' && receiver.startsWith('g'))
+            throw engineError(
+                'ECDH group endpoints are legacy-only',
+                'LEGACY_GROUP_API'
+            );
+        if (sender !== this.localID)
+            throw engineError(
+                'Missing private key for local sender account',
+                'INVALID_PRIVATE_KEY'
+            );
+        const bytes = bytesSnapshot(value, V2_LIMITS.plaintextBytes);
+        scalarString(contextID);
+        const [peer, privateKey, own] = await this.keys.endpointKeys(
+            receiver,
+            sender,
+            true
+        );
+        if (!peer)
+            throw engineError(
+                'Missing public key for selected peer',
+                'INVALID_KEY'
+            );
+        if (!privateKey)
+            throw engineError(
+                'Missing private key for local endpoint',
+                'INVALID_PRIVATE_KEY'
+            );
+        const metadata = await createV2Metadata(sender, own, peer, {
+            contextID,
+            sender,
+            receiver,
+            purpose,
+        });
+        const key = await deriveV2AES(sender, own, peer, privateKey, metadata);
+        const sequence = await this.replay.reserve({ ...metadata, group });
+        const template = headerSnapshot({
+            ...metadata,
+            iv: encodeBase64url(new Uint8Array(12)),
+            sequence,
+            group,
+        });
+        await this.keys.reserveUsage(
+            await derivationUsageID(metadata),
+            bytes.length,
+            encodeEnvelopeAAD$1(template).length
+        );
+        const header = headerSnapshot({
+            ...template,
+            iv: encodeBase64url(crypto.getRandomValues(new Uint8Array(12))),
+        });
+        return { header, ciphertext: await sealBytes(key, header, bytes) };
+    }
+    async open(value, expected, legacy = false) {
+        const snapshot = envelopeSnapshot(value, legacy);
+        expected = expected && {
+            sender: expected.sender,
+            receiver: expected.receiver,
+            contextID: expected.contextID,
+            purpose: expected.purpose,
+        };
+        if (snapshot.header.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE))
+            throw invalidEnvelope();
+        checkExpected(snapshot.header, expected, this.localID);
+        const [peer, privateKey, own] = await this.keys.endpointKeys(
+            snapshot.header.sender,
+            expected.receiver,
+            true
+        );
+        if (!peer)
+            throw engineError(
+                'Missing public key for selected peer',
+                'INVALID_KEY'
+            );
+        if (!privateKey)
+            throw engineError(
+                'Missing private key for local endpoint',
+                'INVALID_PRIVATE_KEY'
+            );
+        const key = await deriveV2AES(
+            expected.receiver,
+            own,
+            peer,
+            privateKey,
+            headerMetadata(snapshot.header, legacy),
+            legacy
+        );
+        return {
+            header: snapshot.header,
+            bytes: await openBytes(key, snapshot, legacy),
+        };
+    }
+}
+
+const RATCHET_SUITE = 'BE9-RATCHET-P384-HKDF-SHA256-A256GCM';
+const SIGNED_GROUP_SUITE = 'BE9-SIGNED-GROUP-HKDF-SHA256-A256GCM';
+const SESSION_LIMITS = Object.freeze({
+    sessions: 32,
+    registry: 1024,
+    skipped: 64,
+    gap: 64,
+    ratchetSteps: 128,
+    retries: 32,
+    recipients: 256,
+    contextStreams: 1024,
+    headerBytes: 4096,
+    contextBytes: 1024,
+    ciphertextBytes: V2_LIMITS.plaintextBytes + 16,
+});
+const fail = (code) => engineError('protocol operation rejected', code);
+const text = (value) => scalarString(value);
+const fields = (domain, values) =>
+    encodeFields(
+        domain,
+        values.map((value) => (typeof value === 'string' ? text(value) : value))
+    );
+const randomID = () =>
+    encodeBase64url(crypto.getRandomValues(new Uint8Array(32)));
+const hash = async (bytes) =>
+    encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
+function exact(value, names, code = 'INVALID_ENVELOPE') {
+    try {
+        return exactObject(value, names);
+    } catch {
+        throw fail(code);
+    }
+}
+function endpoint(value) {
+    scalarString(value, 256);
+    if (!/^(0|[1-9][0-9]*)$/.test(value)) throw fail('INVALID_ACCOUNT');
+    return value;
+}
+function purpose(value) {
+    if (!['data', 'attachment'].includes(value)) throw fail('INVALID_PURPOSE');
+    return value;
+}
+function point(value) {
+    const key = exact(value, ['kty', 'crv', 'x', 'y']);
+    if (
+        key.kty !== 'EC' ||
+        key.crv !== 'P-384' ||
+        ![key.x, key.y].every(
+            (v) => typeof v === 'string' && /^[A-Za-z0-9_-]{64}$/.test(v)
+        )
+    )
+        throw fail('INVALID_KEY');
+    return Object.freeze(key);
+}
+function publicPoint(key) {
+    return point({ kty: key.kty, crv: key.crv, x: key.x, y: key.y });
+}
+const pointBytes = (key) =>
+    fields('BE9-P384-PUBLIC', [
+        key.kty,
+        key.crv,
+        decodeBase64url(key.x, 48),
+        decodeBase64url(key.y, 48),
+    ]);
+const samePoint = (a, b) =>
+    !!a &&
+    !!b &&
+    a.kty === b.kty &&
+    a.crv === b.crv &&
+    a.x === b.x &&
+    a.y === b.y;
+const counterBytes = uint64;
+function boundedHeader(bytes) {
+    if (bytes.length > SESSION_LIMITS.headerBytes)
+        throw fail('INVALID_ENVELOPE');
+    return bytes;
+}
+function schemaAvailable(keys, stores) {
+    const db =
+        typeof keys.connection.transaction === 'function'
+            ? keys.connection
+            : keys.connection.result;
+    if (stores.some((name) => !db.objectStoreNames.contains(name)))
+        throw fail('SCHEMA_UPGRADE_REQUIRED');
+}
+
+const native = (promise) =>
+    promise.catch((error) => {
+        if (typeof error?.code === 'string') throw error;
+        throw fail('CRYPTO_OPERATION_FAILED');
+    });
+
+const algorithm = { name: 'ECDSA', namedCurve: 'P-384' };
+const parameters = { name: 'ECDSA', hash: 'SHA-384' };
+const IDENTITY_STORES = [
+    STORES.publicKeys,
+    STORES.trust,
+    STORES.signingKeys,
+    STORES.signingTrust,
+];
+function signingPrivate(key) {
+    if (
+        !(key instanceof CryptoKey) ||
+        key.type !== 'private' ||
+        key.extractable ||
+        key.algorithm.name !== 'ECDSA' ||
+        key.algorithm.namedCurve !== 'P-384' ||
+        key.usages.length !== 1 ||
+        key.usages[0] !== 'sign'
+    )
+        throw fail('SIGNING_STATE_LOST');
+    return key;
+}
+function signingSnapshot(key) {
+    // Accept public usage metadata, never private members; metadata is not trust.
+    if (
+        !key ||
+        typeof key !== 'object' ||
+        ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k'].some(
+            (name) => name in key
+        ) ||
+        Reflect.ownKeys(key).some(
+            (k) =>
+                ![
+                    'kty',
+                    'crv',
+                    'x',
+                    'y',
+                    'ext',
+                    'key_ops',
+                    'use',
+                    'alg',
+                    'accID',
+                    'verified',
+                ].includes(k)
+        )
+    )
+        throw fail('INVALID_KEY');
+    for (const name of Reflect.ownKeys(key)) {
+        const descriptor = Object.getOwnPropertyDescriptor(key, name);
+        if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value'))
+            throw fail('INVALID_KEY');
+    }
+    if (
+        (key.use !== undefined && key.use !== 'sig') ||
+        (key.alg !== undefined && key.alg !== 'ES384') ||
+        (key.ext !== undefined && typeof key.ext !== 'boolean') ||
+        (key.key_ops !== undefined &&
+            (!Array.isArray(key.key_ops) ||
+                key.key_ops.length > 1 ||
+                key.key_ops.some((op) => op !== 'verify')))
+    )
+        throw fail('INVALID_KEY');
+    return publicPoint(key);
+}
+async function prepareSigning(key) {
+    const publicKey = signingSnapshot(key);
+    try {
+        const native = await crypto.subtle.importKey(
+            'jwk',
+            publicKey,
+            algorithm,
+            true,
+            ['verify']
+        );
+        // RFC 7638 prescribed public members only.
+        const canonical = JSON.stringify({
+            crv: publicKey.crv,
+            kty: publicKey.kty,
+            x: publicKey.x,
+            y: publicKey.y,
+        });
+        return {
+            publicKey,
+            native,
+            fingerprint: await hash(new TextEncoder().encode(canonical)),
+        };
+    } catch {
+        throw fail('INVALID_KEY');
+    }
+}
+async function sign(key, bytes) {
+    try {
+        return encodeBase64url(
+            await crypto.subtle.sign(parameters, signingPrivate(key), bytes)
+        );
+    } catch (error) {
+        if (typeof error.code === 'string') throw error;
+        throw fail('SIGNING_FAILED');
+    }
+}
+function signatureBytes(value) {
+    try {
+        const bytes = decodeBase64url(value, 96);
+        if (bytes.length !== 96) throw new Error();
+        return bytes;
+    } catch {
+        throw fail('INVALID_SIGNATURE');
+    }
+}
+async function verify(publicKey, signature, bytes) {
+    const encoded = signatureBytes(signature);
+    const prepared = await prepareSigning(publicKey);
+    if (
+        !(await native(
+            crypto.subtle.verify(parameters, prepared.native, encoded, bytes)
+        ))
+    )
+        throw fail('INVALID_SIGNATURE');
+}
+async function pair() {
+    const generated = await native(
+        crypto.subtle.generateKey(algorithm, false, ['sign', 'verify'])
+    );
+    const publicKey = publicPoint(
+        await crypto.subtle.exportKey('jwk', generated.publicKey)
+    );
+    try {
+        signingPrivate(structuredClone(generated.privateKey));
+    } catch {
+        throw fail('CRYPTOKEY_STORAGE_UNSUPPORTED');
+    }
+    return {
+        publicKey,
+        privateKey: generated.privateKey,
+        fingerprint: (await prepareSigning(publicKey)).fingerprint,
+    };
+}
+function readIdentities(tx, keys, peer) {
+    return Promise.all(
+        [
+            [STORES.publicKeys, keys.accID],
+            [STORES.publicKeys, peer],
+            [STORES.trust, peer],
+            [STORES.signingKeys, keys.accID],
+            [STORES.signingTrust, peer],
+        ].map(([store, id]) =>
+            requestResult(tx.objectStore(store).get([keys.namespace, id]))
+        )
+    );
+}
+function sameRows(a, b) {
+    return a.every((row, i) => {
+        const other = b[i];
+        if (!row || !other) return row === other;
+        return (
+            row.namespace === other.namespace &&
+            row.accID === other.accID &&
+            row.peerID === other.peerID &&
+            row.fingerprint === other.fingerprint &&
+            row.identityFingerprint === other.identityFingerprint &&
+            row.status === other.status &&
+            ((!row.key && !row.publicKey && !other.key && !other.publicKey) ||
+                samePoint(
+                    row.key || row.publicKey,
+                    other.key || other.publicKey
+                ))
+        );
+    });
+}
+function registryState(registry) {
+    if (
+        !registry ||
+        !Number.isSafeInteger(registry.generation) ||
+        registry.generation < 0 ||
+        !['active', 'invalidated'].includes(registry.status)
+    )
+        throw fail('SIGNING_STATE_LOST');
+    try {
+        fingerprintValue(registry.fingerprint);
+    } catch {
+        throw fail('SIGNING_STATE_LOST');
+    }
+    return registry;
+}
+function canInitialize(registry, generation) {
+    if (!registry) return;
+    registryState(registry);
+    if (registry.status !== 'invalidated' || registry.generation >= generation)
+        throw fail('SIGNING_STATE_LOST');
+}
+const footprintStores = [
+    STORES.sessions,
+    STORES.ratchetState,
+    STORES.skippedKeys,
+];
+function footprint(tx, namespace) {
+    return Promise.all(
+        [STORES.sessionRegistry, ...footprintStores].map((name) =>
+            requestResult(
+                tx.objectStore(name).index('namespace').getAllKeys(namespace, 1)
+            )
+        )
+    ).then((rows) => rows.some((row) => row.length > 0));
+}
+class Signing {
+    constructor(keys) {
+        this.keys = keys;
+    }
+    async setup() {
+        schemaAvailable(this.keys, [
+            STORES.signingKeys,
+            STORES.sessionRegistry,
+            ...footprintStores,
+        ]);
+        const own = await this.keys.myPublicKey();
+        if (!own) throw fail('SESSION_IDENTITY_MISMATCH');
+        const identityFingerprint = (await preparePublicKey(own)).fingerprint;
+        const [current, registry, scope, inUse] = await this.keys.run(
+            [STORES.signingKeys, STORES.sessionRegistry, ...footprintStores],
+            'readonly',
+            (tx) =>
+                Promise.all([
+                    requestResult(
+                        tx
+                            .objectStore(STORES.signingKeys)
+                            .get([this.keys.namespace, this.keys.accID])
+                    ),
+                    requestResult(
+                        tx
+                            .objectStore(STORES.sessionRegistry)
+                            .get([this.keys.namespace, '@signing'])
+                    ),
+                    requestResult(
+                        tx.objectStore(STORES.scopes).get(this.keys.namespace)
+                    ),
+                    footprint(tx, this.keys.namespace),
+                ])
+        );
+        if (!scope) throw fail('SIGNING_STATE_LOST');
+        if (current) {
+            await this.validateLocal(current, identityFingerprint);
+            return this.publicIdentity(current);
+        }
+        if (!registry && inUse) throw fail('SIGNING_STATE_LOST');
+        canInitialize(registry, scope.generation || 0);
+        const candidate = {
+            namespace: this.keys.namespace,
+            accID: this.keys.accID,
+            ...(await pair()),
+            identityFingerprint,
+        };
+        const winner = await this.keys.run(
+            [STORES.signingKeys, STORES.sessionRegistry, ...footprintStores],
+            'readwrite',
+            (tx) =>
+                requestResult(
+                    tx
+                        .objectStore(STORES.signingKeys)
+                        .get([this.keys.namespace, this.keys.accID]),
+                    (found) => {
+                        if (found) return found;
+                        const store = tx.objectStore(STORES.sessionRegistry);
+                        return requestResult(
+                            store.get([this.keys.namespace, '@signing']),
+                            (known) => {
+                                canInitialize(known, scope.generation || 0);
+                                return footprint(tx, this.keys.namespace).then(
+                                    (inUse) => {
+                                        if (!known && inUse)
+                                            throw fail('SIGNING_STATE_LOST');
+                                        tx.objectStore(STORES.signingKeys).add(
+                                            candidate
+                                        );
+                                        return requestResult(
+                                            store.put({
+                                                namespace: this.keys.namespace,
+                                                sessionID: '@signing',
+                                                status: 'active',
+                                                generation:
+                                                    scope.generation || 0,
+                                                fingerprint:
+                                                    candidate.fingerprint,
+                                            }),
+                                            () => candidate
+                                        );
+                                    }
+                                );
+                            }
+                        );
+                    }
+                )
+        );
+        await this.validateLocal(winner, identityFingerprint);
+        return this.publicIdentity(winner);
+    }
+    publicIdentity(row) {
+        return {
+            publicKey: publicPoint(row.publicKey),
+            fingerprint: row.fingerprint,
+            identityFingerprint: row.identityFingerprint,
+        };
+    }
+    async validateLocal(row, identityFingerprint) {
+        if (
+            !row ||
+            row.namespace !== this.keys.namespace ||
+            row.accID !== this.keys.accID ||
+            row.identityFingerprint !== identityFingerprint
+        )
+            throw fail('SIGNING_STATE_LOST');
+        const [registry, scope] = await this.keys.run(
+            [STORES.sessionRegistry],
+            'readonly',
+            (tx) =>
+                Promise.all([
+                    requestResult(
+                        tx
+                            .objectStore(STORES.sessionRegistry)
+                            .get([this.keys.namespace, '@signing'])
+                    ),
+                    requestResult(
+                        tx.objectStore(STORES.scopes).get(this.keys.namespace)
+                    ),
+                ])
+        );
+        registryState(registry);
+        if (
+            !scope ||
+            registry.generation !== (scope.generation || 0) ||
+            registry.status !== 'active' ||
+            registry.fingerprint !== row.fingerprint
+        )
+            throw fail('SIGNING_STATE_LOST');
+        const prepared = await prepareSigning(row.publicKey);
+        if (prepared.fingerprint !== row.fingerprint)
+            throw fail('SIGNING_STATE_LOST');
+        const challenge = fields('BE9-SIGNING-LOCAL-CHECK', [
+            this.keys.accID,
+            identityFingerprint,
+        ]);
+        try {
+            await verify(
+                row.publicKey,
+                await sign(row.privateKey, challenge),
+                challenge
+            );
+        } catch {
+            throw fail('SIGNING_STATE_LOST');
+        }
+    }
+    async getPublic() {
+        const current = await this.keys.run(
+            [STORES.signingKeys],
+            'readonly',
+            (tx) =>
+                requestResult(
+                    tx
+                        .objectStore(STORES.signingKeys)
+                        .get([this.keys.namespace, this.keys.accID])
+                )
+        );
+        if (!current) throw fail('SIGNING_STATE_LOST');
+        await this.validateLocal(
+            current,
+            (
+                await preparePublicKey(await this.keys.myPublicKey())
+            ).fingerprint
+        );
+        return this.publicIdentity(current);
+    }
+    async import(peer, value, options = {}) {
+        endpoint(peer);
+        if (peer === this.keys.accID) throw fail('INVALID_ACCOUNT');
+        // Validate and snapshot all fields before any yield.
+        const publicKey = signingSnapshot(value);
+        const decision = trustDecision(options);
+        const identityFingerprint = fingerprintValue(
+            options.identityFingerprint
+        );
+        const original = await this.peerBinding(peer, identityFingerprint);
+        const prepared = await prepareSigning(publicKey);
+        return this.keys.run(
+            [STORES.publicKeys, STORES.trust, STORES.signingTrust],
+            'readwrite',
+            (tx) => {
+                const store = tx.objectStore(STORES.signingTrust);
+                return requestResult(
+                    tx
+                        .objectStore(STORES.publicKeys)
+                        .get([this.keys.namespace, peer]),
+                    (pub) => {
+                        return requestResult(
+                            tx
+                                .objectStore(STORES.trust)
+                                .get([this.keys.namespace, peer]),
+                            (trusted) => {
+                                if (
+                                    !pub ||
+                                    !samePoint(pub.key, original.key) ||
+                                    !trusted ||
+                                    trusted.status === 'unverified' ||
+                                    trusted.fingerprint !== identityFingerprint
+                                )
+                                    throw fail('UNTRUSTED_SIGNING_KEY');
+                                // The key point is also captured and checked natively below before commit.
+                                return requestResult(
+                                    store.get([this.keys.namespace, peer]),
+                                    (current) => {
+                                        if (
+                                            current &&
+                                            current.identityFingerprint !==
+                                                identityFingerprint
+                                        )
+                                            throw fail(
+                                                'SESSION_IDENTITY_MISMATCH'
+                                            );
+                                        const status = nextTrust(
+                                            current,
+                                            prepared.fingerprint,
+                                            decision,
+                                            !current
+                                        );
+                                        const row = {
+                                            namespace: this.keys.namespace,
+                                            peerID: peer,
+                                            key: prepared.publicKey,
+                                            fingerprint: prepared.fingerprint,
+                                            identityFingerprint,
+                                            status,
+                                        };
+                                        return requestResult(
+                                            store.put(row),
+                                            () => ({
+                                                peerID: peer,
+                                                fingerprint: row.fingerprint,
+                                                identityFingerprint,
+                                                status,
+                                            })
+                                        );
+                                    }
+                                );
+                            }
+                        );
+                    }
+                );
+            }
+        );
+    }
+    async replace(peer, value, confirmation) {
+        endpoint(peer);
+        const publicKey = signingSnapshot(value);
+        confirmation = exact(
+            confirmation,
+            [
+                'expectedPreviousFingerprint',
+                'confirmedNewFingerprint',
+                'identityFingerprint',
+            ],
+            'INVALID_TRUST_DECISION'
+        );
+        const expected = fingerprintValue(
+            confirmation.expectedPreviousFingerprint
+        );
+        const confirmed = fingerprintValue(
+            confirmation.confirmedNewFingerprint
+        );
+        const identityFingerprint = fingerprintValue(
+            confirmation.identityFingerprint
+        );
+        const prepared = await prepareSigning(publicKey);
+        const original = await this.peerBinding(peer, identityFingerprint);
+        if (confirmed !== prepared.fingerprint)
+            throw fail('FINGERPRINT_MISMATCH');
+        return this.keys.run(
+            [STORES.signingTrust, STORES.trust, STORES.publicKeys],
+            'readwrite',
+            (tx) =>
+                requestResult(
+                    tx
+                        .objectStore(STORES.trust)
+                        .get([this.keys.namespace, peer]),
+                    (identity) => {
+                        if (
+                            !identity ||
+                            identity.status === 'unverified' ||
+                            identity.fingerprint !== identityFingerprint
+                        )
+                            throw fail('UNTRUSTED_SIGNING_KEY');
+                        const store = tx.objectStore(STORES.signingTrust);
+                        return requestResult(
+                            tx
+                                .objectStore(STORES.publicKeys)
+                                .get([this.keys.namespace, peer]),
+                            (pub) => {
+                                if (!pub || !samePoint(pub.key, original.key))
+                                    throw fail('SESSION_IDENTITY_MISMATCH');
+                                return requestResult(
+                                    store.get([this.keys.namespace, peer]),
+                                    (current) => {
+                                        if (
+                                            !current ||
+                                            current.fingerprint !== expected
+                                        )
+                                            throw fail('PUBLIC_KEY_CHANGED');
+                                        return requestResult(
+                                            store.put({
+                                                namespace: this.keys.namespace,
+                                                peerID: peer,
+                                                key: prepared.publicKey,
+                                                fingerprint: confirmed,
+                                                identityFingerprint,
+                                                status: 'confirmed',
+                                            })
+                                        );
+                                    }
+                                );
+                            }
+                        );
+                    }
+                )
+        );
+    }
+    async peerBinding(peer, fingerprint) {
+        const [pub, trust] = await this.keys.run(
+            [STORES.publicKeys, STORES.trust],
+            'readonly',
+            (tx) =>
+                Promise.all([
+                    requestResult(
+                        tx
+                            .objectStore(STORES.publicKeys)
+                            .get([this.keys.namespace, peer])
+                    ),
+                    requestResult(
+                        tx
+                            .objectStore(STORES.trust)
+                            .get([this.keys.namespace, peer])
+                    ),
+                ])
+        );
+        if (
+            !pub ||
+            !trust ||
+            !['confirmed', 'tofu'].includes(trust.status) ||
+            trust.fingerprint !== fingerprint ||
+            (await preparePublicKey(pub.key)).fingerprint !== fingerprint
+        )
+            throw fail('UNTRUSTED_SIGNING_KEY');
+        return pub;
+    }
+    async rotate(options) {
+        const { expectedPreviousFingerprint } = exact(
+            options,
+            ['expectedPreviousFingerprint'],
+            'INVALID_TRUST_DECISION'
+        );
+        fingerprintValue(expectedPreviousFingerprint);
+        const current = await this.getPublic();
+        const candidate = {
+            namespace: this.keys.namespace,
+            accID: this.keys.accID,
+            identityFingerprint: current.identityFingerprint,
+            ...(await pair()),
+        };
+        return this.keys.run(
+            [STORES.signingKeys, STORES.sessionRegistry],
+            'readwrite',
+            (tx) =>
+                requestResult(
+                    tx
+                        .objectStore(STORES.signingKeys)
+                        .get([this.keys.namespace, this.keys.accID]),
+                    (row) => {
+                        if (
+                            !row ||
+                            row.fingerprint !== expectedPreviousFingerprint
+                        )
+                            throw fail('PUBLIC_KEY_CHANGED');
+                        tx.objectStore(STORES.signingKeys).put(candidate);
+                        return requestResult(
+                            tx
+                                .objectStore(STORES.sessionRegistry)
+                                .get([this.keys.namespace, '@signing']),
+                            (registry) => {
+                                if (!registry) throw fail('SIGNING_STATE_LOST');
+                                return requestResult(
+                                    tx
+                                        .objectStore(STORES.sessionRegistry)
+                                        .put({
+                                            ...registry,
+                                            fingerprint: candidate.fingerprint,
+                                        }),
+                                    () => this.publicIdentity(candidate)
+                                );
+                            }
+                        );
+                    }
+                )
+        );
+    }
+    async snapshot(peer) {
+        endpoint(peer);
+        schemaAvailable(this.keys, IDENTITY_STORES);
+        const rows = await this.keys.run(IDENTITY_STORES, 'readonly', (tx) =>
+            readIdentities(tx, this.keys, peer)
+        );
+        const [own, remote, trust, localSigning, remoteSigning] = rows;
+        if (
+            !own ||
+            !remote ||
+            (peer !== this.keys.accID &&
+                (!trust || !['confirmed', 'tofu'].includes(trust.status)))
+        )
+            throw fail('UNTRUSTED_PEER');
+        const local = await preparePublicKey(own.key),
+            other = await preparePublicKey(remote.key);
+        if (peer !== this.keys.accID && other.fingerprint !== trust.fingerprint)
+            throw fail('SESSION_IDENTITY_MISMATCH');
+        await this.validateLocal(localSigning, local.fingerprint);
+        const selectedSigning =
+            peer === this.keys.accID
+                ? {
+                      key: localSigning.publicKey,
+                      fingerprint: localSigning.fingerprint,
+                      identityFingerprint: localSigning.identityFingerprint,
+                      status: 'confirmed',
+                  }
+                : remoteSigning;
+        if (
+            !selectedSigning ||
+            !['confirmed', 'tofu'].includes(selectedSigning.status) ||
+            selectedSigning.identityFingerprint !== other.fingerprint
+        )
+            throw fail('UNTRUSTED_SIGNING_KEY');
+        const pub = await prepareSigning(selectedSigning.key);
+        if (pub.fingerprint !== selectedSigning.fingerprint)
+            throw fail('UNTRUSTED_SIGNING_KEY');
+        return {
+            rows,
+            peer,
+            localFingerprint: local.fingerprint,
+            peerFingerprint: other.fingerprint,
+            localSigningFingerprint: localSigning.fingerprint,
+            peerSigningFingerprint: pub.fingerprint,
+            privateKey: localSigning.privateKey,
+            publicKey: pub.publicKey,
+        };
+    }
+    check(tx, snapshot) {
+        return readIdentities(tx, this.keys, snapshot.peer).then((rows) => {
+            if (!sameRows(snapshot.rows, rows))
+                throw fail('SESSION_IDENTITY_MISMATCH');
+        });
+    }
+}
+
+const bindingFields = [
+    'version',
+    'suite',
+    'sessionID',
+    'contextID',
+    'sender',
+    'receiver',
+    'senderIdentityFingerprint',
+    'receiverIdentityFingerprint',
+    'senderSigningFingerprint',
+    'receiverSigningFingerprint',
+    'generation',
+];
+function binding(value) {
+    if (value.version !== 3 || value.suite !== RATCHET_SUITE)
+        throw fail('INVALID_ENVELOPE');
+    endpoint(value.sender);
+    endpoint(value.receiver);
+    if (value.sender === value.receiver) throw fail('INVALID_ACCOUNT');
+    scalarString(value.contextID);
+    for (const name of [
+        'sessionID',
+        'generation',
+        ...bindingFields.filter((n) => n.endsWith('Fingerprint')),
+    ])
+        decode32(value[name]);
+    return Object.fromEntries(bindingFields.map((name) => [name, value[name]]));
+}
+function bindingBytes(value) {
+    const b = binding(value);
+    return [
+        new Uint8Array([3]),
+        b.suite,
+        decode32(b.sessionID),
+        b.contextID,
+        b.sender,
+        b.receiver,
+        decode32(b.senderIdentityFingerprint),
+        decode32(b.receiverIdentityFingerprint),
+        decode32(b.senderSigningFingerprint),
+        decode32(b.receiverSigningFingerprint),
+        decode32(b.generation),
+    ];
+}
+function bootstrapHeader(value, answer = false) {
+    const h = exact(
+        value,
+        [
+            ...bindingFields,
+            'ratchetPublicKey',
+            ...(answer ? ['offerHash'] : []),
+        ],
+        'SESSION_BOOTSTRAP_INVALID'
+    );
+    try {
+        binding(h);
+        h.ratchetPublicKey = point(h.ratchetPublicKey);
+        if (answer) decode32(h.offerHash);
+    } catch {
+        throw fail('SESSION_BOOTSTRAP_INVALID');
+    }
+    return Object.freeze(h);
+}
+function bootstrapBytes(value, answer = false) {
+    const h = bootstrapHeader(value, answer);
+    return boundedHeader(
+        fields(answer ? 'BE9-SESSION-ANSWER' : 'BE9-SESSION-OFFER', [
+            ...bindingBytes(h),
+            pointBytes(h.ratchetPublicKey),
+            ...(answer ? [decode32(h.offerHash)] : []),
+        ])
+    );
+}
+function bootstrapPacket(value, answer = false) {
+    const p = exact(
+        value,
+        ['header', 'signature'],
+        'SESSION_BOOTSTRAP_INVALID'
+    );
+    p.header = bootstrapHeader(p.header, answer);
+    signatureBytes(p.signature);
+    return p;
+}
+function ratchetHeader(value) {
+    const h = exact(value, [
+        ...bindingFields,
+        'ratchetPublicKey',
+        'previousChainLength',
+        'messageNumber',
+        'purpose',
+        'iv',
+    ]);
+    binding(h);
+    h.ratchetPublicKey = point(h.ratchetPublicKey);
+    sequenceValue(h.previousChainLength);
+    sequenceValue(h.messageNumber);
+    purpose(h.purpose);
+    if (decodeBase64url(h.iv, 12).length !== 12) throw fail('INVALID_IV');
+    return Object.freeze(h);
+}
+function encodeRatchetAAD(value) {
+    const h = ratchetHeader(value);
+    return boundedHeader(
+        fields('BE9-RATCHET-AAD', [
+            ...bindingBytes(h),
+            pointBytes(h.ratchetPublicKey),
+            counterBytes(h.previousChainLength),
+            counterBytes(h.messageNumber),
+            h.purpose,
+            decodeBase64url(h.iv, 12),
+        ])
+    );
+}
+function ratchetPacket(value) {
+    const p = exact(value, ['header', 'ciphertext']);
+    const h = ratchetHeader(p.header);
+    return {
+        header: h,
+        ciphertext: p.ciphertext,
+        payload: payloadSnapshot(p.ciphertext, h.iv),
+    };
+}
+function expectations$1(value) {
+    const e = exact(
+        value,
+        ['sender', 'receiver', 'sessionID', 'contextID', 'purpose'],
+        'ENVELOPE_EXPECTATION_REQUIRED'
+    );
+    endpoint(e.sender);
+    endpoint(e.receiver);
+    decode32(e.sessionID);
+    scalarString(e.contextID);
+    purpose(e.purpose);
+    return Object.freeze(e);
+}
+function bootstrapExpected(value) {
+    const e = exact(
+        value,
+        ['sender', 'receiver', 'sessionID', 'contextID'],
+        'ENVELOPE_EXPECTATION_REQUIRED'
+    );
+    endpoint(e.sender);
+    endpoint(e.receiver);
+    decode32(e.sessionID);
+    scalarString(e.contextID);
+    return e;
+}
+function checkExpectations(header, expected, localID) {
+    if (
+        header.receiver !== localID ||
+        Object.keys(expected).some((name) => header[name] !== expected[name])
+    )
+        throw fail('ENVELOPE_EXPECTATION_MISMATCH');
+}
+function reverse(b, publicKey) {
+    return {
+        ...binding(b),
+        sender: b.receiver,
+        receiver: b.sender,
+        senderIdentityFingerprint: b.receiverIdentityFingerprint,
+        receiverIdentityFingerprint: b.senderIdentityFingerprint,
+        senderSigningFingerprint: b.receiverSigningFingerprint,
+        receiverSigningFingerprint: b.senderSigningFingerprint,
+        ratchetPublicKey: publicPoint(publicKey),
+    };
+}
+
+/* global BigInt */
+
+const zero = new Uint8Array(32);
+function requireSecret(key, seed = false) {
+    if (
+        !(key instanceof CryptoKey) ||
+        key.type !== 'secret' ||
+        key.extractable ||
+        key.algorithm.name !== 'HKDF' ||
+        !key.usages.includes('deriveKey') ||
+        (!seed && !key.usages.includes('deriveBits')) ||
+        key.usages.length !== (seed ? 1 : 2)
+    )
+        throw fail('RATCHET_STATE_LOST');
+    return key;
+}
+async function importSecret(bytes, seed = false) {
+    return native(
+        crypto.subtle.importKey(
+            'raw',
+            bytes,
+            'HKDF',
+            false,
+            seed ? ['deriveKey'] : ['deriveBits', 'deriveKey']
+        )
+    );
+}
+async function expand(key, salt, info, length) {
+    return new Uint8Array(
+        await native(
+            crypto.subtle.deriveBits(
+                { name: 'HKDF', hash: 'SHA-256', salt, info },
+                requireSecret(key),
+                length
+            )
+        )
+    );
+}
+async function dh(privateKey, publicKey) {
+    const imported = await crypto.subtle.importKey(
+        'jwk',
+        await validatePublicKey(publicKey),
+        { name: 'ECDH', namedCurve: 'P-384' },
+        false,
+        []
+    );
+    return new Uint8Array(
+        await native(
+            crypto.subtle.deriveBits(
+                { name: 'ECDH', public: imported },
+                privateCryptoKey(privateKey),
+                384
+            )
+        )
+    );
+}
+async function validatePair(privateKey, publicKey) {
+    const [probePublic, probePrivate] = await generatePair();
+    let a, b;
+    try {
+        a = await dh(privateKey, probePublic);
+        b = await dh(probePrivate, publicKey);
+        let mismatch = 0;
+        for (let i = 0; i < a.length; i++) mismatch |= a[i] ^ b[i];
+        if (mismatch) throw fail('RATCHET_STATE_LOST');
+    } finally {
+        a?.fill(0);
+        b?.fill(0);
+    }
+}
+async function initialRoot(privateKey, remotePublic, offer, answer) {
+    let secret, bytes;
+    const transcript = await hash(
+        fields('BE9-RATCHET-SESSION', [
+            bootstrapBytes(offer),
+            bootstrapBytes(answer, true),
+        ])
+    );
+    try {
+        secret = await dh(privateKey, remotePublic);
+        const input = await importSecret(secret);
+        bytes = await expand(
+            input,
+            decode32(transcript),
+            fields('BE9-RATCHET-SESSION-ROOT', [decode32(transcript)]),
+            256
+        );
+        return { root: await importSecret(bytes), transcript };
+    } finally {
+        secret?.fill(0);
+        bytes?.fill(0);
+    }
+}
+async function rootStep(root, privateKey, remotePublic, transcript) {
+    let secret, bytes;
+    try {
+        secret = await dh(privateKey, remotePublic);
+        // HKDF salt is the full fresh DH secret; prior non-extractable root is IKM.
+        bytes = await expand(
+            root,
+            secret,
+            fields('BE9-RATCHET-ROOT', [decode32(transcript)]),
+            512
+        );
+        return {
+            root: await importSecret(bytes.subarray(0, 32)),
+            chain: await importSecret(bytes.subarray(32)),
+        };
+    } finally {
+        secret?.fill(0);
+        bytes?.fill(0);
+    }
+}
+async function chainStep(chain, transcript) {
+    let bytes;
+    try {
+        bytes = await expand(
+            chain,
+            zero,
+            fields('BE9-RATCHET-CHAIN', [decode32(transcript)]),
+            512
+        );
+        return {
+            chain: await importSecret(bytes.subarray(0, 32)),
+            seed: await importSecret(bytes.subarray(32), true),
+        };
+    } finally {
+        bytes?.fill(0);
+    }
+}
+async function messageKey(seed, header, transcript, usage) {
+    return native(
+        crypto.subtle.deriveKey(
+            {
+                name: 'HKDF',
+                hash: 'SHA-256',
+                salt: zero,
+                info: fields('BE9-RATCHET-MESSAGE', [
+                    decode32(transcript),
+                    ...bindingBytes(header),
+                    pointBytes(header.ratchetPublicKey),
+                    counterBytes(header.previousChainLength),
+                    counterBytes(header.messageNumber),
+                    header.purpose,
+                ]),
+            },
+            requireSecret(seed, true),
+            { name: 'AES-GCM', length: 256 },
+            false,
+            [usage]
+        )
+    );
+}
+async function blankState(
+    sessionID,
+    root,
+    transcript,
+    localPublic,
+    localPrivate,
+    remotePublic
+) {
+    return {
+        sessionID,
+        revision: 0,
+        root,
+        transcript,
+        localPublic: publicPoint(localPublic),
+        localPrivate,
+        remotePublic: publicPoint(remotePublic),
+        remoteFingerprint: await jwkThumbprint(remotePublic),
+        sendChain: null,
+        receiveChain: null,
+        sendNumber: '0',
+        receiveNumber: '0',
+        previousChainLength: '0',
+        remotePreviousChainLength: null,
+        steps: 0,
+        retired: [],
+        skipped: [],
+    };
+}
+async function commitment(key, domain) {
+    if (!key) return new Uint8Array();
+    const native = await crypto.subtle.deriveKey(
+        {
+            name: 'HKDF',
+            hash: 'SHA-256',
+            salt: zero,
+            info: fields(domain, ['state']),
+        },
+        key,
+        { name: 'HMAC', hash: 'SHA-256', length: 256 },
+        false,
+        ['sign']
+    );
+    return new Uint8Array(
+        await crypto.subtle.sign(
+            'HMAC',
+            native,
+            fields('BE9-STATE-COMMITMENT', [domain])
+        )
+    );
+}
+async function stateTag(state, session, skipped) {
+    requireSecret(state.root);
+    const send = await commitment(state.sendChain, 'BE9-RATCHET-STATE-SEND');
+    const receive = await commitment(
+        state.receiveChain,
+        'BE9-RATCHET-STATE-RECEIVE'
+    );
+    const inventory = [];
+    for (const item of skipped)
+        inventory.push(
+            fields('BE9-RATCHET-STATE-SKIP', [
+                decode32(item.chain),
+                counterBytes(item.number),
+                counterBytes(item.previousChainLength),
+                await commitment(item.seed, 'BE9-RATCHET-STATE-SEED'),
+            ])
+        );
+    const body = fields('BE9-RATCHET-STATE', [
+        session.namespace,
+        session.peerID,
+        new Uint8Array([session.initiator ? 1 : 0]),
+        session.status,
+        bootstrapBytes(session.offer),
+        bootstrapBytes(session.answer, true),
+        decode32(state.transcript),
+        counterBytes(String(state.revision)),
+        pointBytes(state.localPublic),
+        pointBytes(state.remotePublic),
+        decode32(state.remoteFingerprint),
+        counterBytes(state.sendNumber),
+        counterBytes(state.receiveNumber),
+        counterBytes(state.previousChainLength),
+        state.remotePreviousChainLength === null
+            ? new Uint8Array()
+            : counterBytes(state.remotePreviousChainLength),
+        counterBytes(String(state.steps)),
+        send,
+        receive,
+        fields('BE9-RATCHET-RETIRED', state.retired.map(decode32)),
+        fields('BE9-RATCHET-INVENTORY', inventory),
+    ]);
+    const mac = await crypto.subtle.deriveKey(
+        {
+            name: 'HKDF',
+            hash: 'SHA-256',
+            salt: zero,
+            info: fields('BE9-RATCHET-STATE-AUTH', [
+                decode32(state.transcript),
+            ]),
+        },
+        state.root,
+        { name: 'HMAC', hash: 'SHA-256', length: 256 },
+        false,
+        ['sign']
+    );
+    return encodeBase64url(await crypto.subtle.sign('HMAC', mac, body));
+}
+async function validateState(state, session, skipped, registry) {
+    try {
+        if (
+            !state ||
+            state.sessionID !== session.sessionID ||
+            state.revision !== registry.revision ||
+            state.tag !== registry.tag ||
+            !Number.isSafeInteger(state.revision) ||
+            state.revision < 0 ||
+            !Number.isInteger(state.steps) ||
+            state.steps < 0 ||
+            state.steps > SESSION_LIMITS.ratchetSteps ||
+            !Array.isArray(state.retired) ||
+            state.retired.length !== state.steps ||
+            state.retired.length > SESSION_LIMITS.ratchetSteps ||
+            new Set(state.retired).size !== state.retired.length ||
+            !Array.isArray(state.skipped) ||
+            state.skipped.length > SESSION_LIMITS.skipped ||
+            state.skipped.length !== skipped.length
+        )
+            throw new Error();
+        requireSecret(state.root);
+        if (state.sendChain) requireSecret(state.sendChain);
+        if (state.receiveChain) requireSecret(state.receiveChain);
+        for (const name of [
+            'sendNumber',
+            'receiveNumber',
+            'previousChainLength',
+        ])
+            sequenceValue(state[name]);
+        if (state.remotePreviousChainLength !== null)
+            sequenceValue(state.remotePreviousChainLength);
+        if (
+            (!state.sendChain && state.sendNumber !== '0') ||
+            (!state.receiveChain && state.receiveNumber !== '0')
+        )
+            throw new Error();
+        for (let i = 0; i < skipped.length; i++) {
+            const item = skipped[i],
+                ref = state.skipped[i];
+            if (
+                !item ||
+                item.sessionID !== session.sessionID ||
+                item.namespace !== state.namespace ||
+                item.chain !== ref.chain ||
+                item.number !== ref.number
+            )
+                throw new Error();
+            decode32(item.chain);
+            sequenceValue(item.number);
+            sequenceValue(item.previousChainLength);
+            requireSecret(item.seed, true);
+        }
+        if (
+            (await jwkThumbprint(state.remotePublic)) !==
+                state.remoteFingerprint ||
+            (await stateTag(state, session, skipped)) !== state.tag
+        )
+            throw new Error();
+        await validatePair(state.localPrivate, state.localPublic);
+    } catch {
+        throw fail('RATCHET_STATE_LOST');
+    }
+}
+async function advanceSend(state) {
+    if (!state.sendChain) throw fail('SESSION_NOT_READY');
+    if (sequenceValue(state.sendNumber) === MAX_SEQUENCE)
+        throw fail('COUNTER_EXHAUSTED');
+    const { chain, seed } = await chainStep(state.sendChain, state.transcript);
+    return {
+        seed,
+        state: {
+            ...state,
+            sendChain: chain,
+            sendNumber: String(sequenceValue(state.sendNumber) + 1n),
+        },
+    };
+}
+async function advanceReceive(source, saved, header) {
+    const state = { ...source, retired: [...source.retired] },
+        skipped = [...saved];
+    const fingerprint = await jwkThumbprint(header.ratchetPublicKey);
+    const existing = skipped.findIndex(
+        (item) =>
+            item.chain === fingerprint && item.number === header.messageNumber
+    );
+    if (existing !== -1) {
+        const [item] = skipped.splice(existing, 1);
+        if (item.previousChainLength !== header.previousChainLength)
+            throw fail('INVALID_ENVELOPE');
+        return { state, skipped, seed: item.seed };
+    }
+    async function skipTo(until) {
+        const target = sequenceValue(until),
+            current = sequenceValue(state.receiveNumber);
+        if (target < current) throw fail('RATCHET_DUPLICATE');
+        if (target - current > BigInt(SESSION_LIMITS.gap))
+            throw fail('RATCHET_MESSAGE_TOO_FAR');
+        if (skipped.length + Number(target - current) > SESSION_LIMITS.skipped)
+            throw fail('SKIPPED_KEY_LIMIT');
+        if (target > current && !state.receiveChain)
+            throw fail('RATCHET_STATE_LOST');
+        while (sequenceValue(state.receiveNumber) < target) {
+            const step = await chainStep(state.receiveChain, state.transcript);
+            skipped.push({
+                namespace: state.namespace,
+                sessionID: state.sessionID,
+                chain: state.remoteFingerprint,
+                number: state.receiveNumber,
+                previousChainLength: state.remotePreviousChainLength,
+                seed: step.seed,
+            });
+            state.receiveChain = step.chain;
+            state.receiveNumber = String(
+                sequenceValue(state.receiveNumber) + 1n
+            );
+        }
+    }
+    if (fingerprint !== state.remoteFingerprint) {
+        if (state.retired.includes(fingerprint))
+            throw fail('RATCHET_DUPLICATE');
+        if (state.steps >= SESSION_LIMITS.ratchetSteps)
+            throw fail('RATCHET_LIMIT');
+        await skipTo(header.previousChainLength);
+        state.retired.push(state.remoteFingerprint);
+        state.previousChainLength = state.sendNumber;
+        state.sendNumber = '0';
+        state.receiveNumber = '0';
+        state.remotePublic = header.ratchetPublicKey;
+        state.remoteFingerprint = fingerprint;
+        state.remotePreviousChainLength = header.previousChainLength;
+        const receive = await rootStep(
+            state.root,
+            state.localPrivate,
+            state.remotePublic,
+            state.transcript
+        );
+        state.root = receive.root;
+        state.receiveChain = receive.chain;
+        const [publicKey, privateKey] = await generatePair();
+        state.localPublic = publicPoint(publicKey);
+        state.localPrivate = privateKey;
+        const send = await rootStep(
+            state.root,
+            privateKey,
+            state.remotePublic,
+            state.transcript
+        );
+        state.root = send.root;
+        state.sendChain = send.chain;
+        state.steps++;
+    } else if (header.previousChainLength !== state.remotePreviousChainLength)
+        throw fail('INVALID_ENVELOPE');
+    await skipTo(header.messageNumber);
+    if (sequenceValue(state.receiveNumber) === MAX_SEQUENCE)
+        throw fail('COUNTER_EXHAUSTED');
+    const step = await chainStep(state.receiveChain, state.transcript);
+    state.receiveChain = step.chain;
+    state.receiveNumber = String(sequenceValue(state.receiveNumber) + 1n);
+    return { state, skipped, seed: step.seed };
+}
+async function gcm(key, header, bytes, aad, decrypt = false) {
+    try {
+        return new Uint8Array(
+            await crypto.subtle[decrypt ? 'decrypt' : 'encrypt'](
+                {
+                    name: 'AES-GCM',
+                    tagLength: 128,
+                    iv: decodeBase64url(header.iv, 12),
+                    additionalData: aad,
+                },
+                key,
+                bytes
+            )
+        );
+    } catch {
+        throw fail('AUTHENTICATION_FAILED');
+    }
+}
+
+const SESSION_STORES = [
+    STORES.sessionRegistry,
+    STORES.sessions,
+    STORES.ratchetState,
+    STORES.skippedKeys,
+];
+class SessionStore {
+    constructor(keys, signing) {
+        this.keys = keys;
+        this.signing = signing;
+    }
+    id(id) {
+        decode32(id);
+        schemaAvailable(this.keys, SESSION_STORES);
+        return [this.keys.namespace, id];
+    }
+    async snapshot(id) {
+        const key = this.id(id);
+        const snapshot = await this.keys.run(SESSION_STORES, 'readonly', (tx) =>
+            Promise.all([
+                requestResult(tx.objectStore(STORES.sessionRegistry).get(key)),
+                requestResult(tx.objectStore(STORES.sessions).get(key)),
+                requestResult(
+                    tx.objectStore(STORES.ratchetState).get(key),
+                    (state) => {
+                        if (
+                            !state ||
+                            !Array.isArray(state.skipped) ||
+                            state.skipped.length > SESSION_LIMITS.skipped
+                        )
+                            return { state, skipped: [] };
+                        if (
+                            !state.skipped.every(
+                                (ref) =>
+                                    ref &&
+                                    typeof ref.chain === 'string' &&
+                                    typeof ref.number === 'string'
+                            )
+                        )
+                            throw fail('RATCHET_STATE_LOST');
+                        return requestResult(
+                            tx
+                                .objectStore(STORES.skippedKeys)
+                                .index('session')
+                                .getAll(key, SESSION_LIMITS.skipped + 1),
+                            (rows) => {
+                                if (rows.length !== state.skipped.length)
+                                    throw fail('RATCHET_STATE_LOST');
+                                const skipped = state.skipped.map((ref) =>
+                                    rows.find(
+                                        (row) =>
+                                            row.chain === ref.chain &&
+                                            row.number === ref.number
+                                    )
+                                );
+                                return { state, skipped };
+                            }
+                        );
+                    }
+                ),
+            ])
+        );
+        const [registry, session, ratchet] = snapshot;
+        if (!registry) {
+            if (session || ratchet.state) throw fail('SESSION_STATE_LOST');
+            throw fail('SESSION_NOT_FOUND');
+        }
+        if (!session) throw fail('SESSION_STATE_LOST');
+        if (
+            session.namespace !== this.keys.namespace ||
+            session.sessionID !== id ||
+            session.status !== registry.status ||
+            !['pending', 'active', 'closed'].includes(session.status)
+        )
+            throw fail('SESSION_STATE_LOST');
+        if (session.status === 'closed') throw fail('SESSION_CLOSED');
+        if (
+            typeof session.initiator !== 'boolean' ||
+            session.offer?.sessionID !== id ||
+            (session.initiator
+                ? session.offer.sender
+                : session.offer.receiver) !== this.keys.accID ||
+            (session.initiator
+                ? session.offer.receiver
+                : session.offer.sender) !== session.peerID
+        )
+            throw fail('SESSION_STATE_LOST');
+        if (session.status === 'active') {
+            if (
+                !ratchet.state ||
+                ratchet.state.namespace !== this.keys.namespace
+            )
+                throw fail('RATCHET_STATE_LOST');
+            await validateState(
+                ratchet.state,
+                session,
+                ratchet.skipped,
+                registry
+            );
+        } else {
+            if (
+                ratchet.state ||
+                !session.initiator ||
+                registry.revision !== 0 ||
+                session.offer?.sessionID !== id ||
+                (await hash(bootstrapBytes(session.offer))) !== registry.tag
+            )
+                throw fail('SESSION_STATE_LOST');
+            await validatePair(
+                session.pendingPrivate,
+                session.offer.ratchetPublicKey
+            );
+        }
+        return { registry, session, ...ratchet };
+    }
+    async create(session, state, identity) {
+        const key = this.id(session.sessionID);
+        session = { ...session, namespace: this.keys.namespace };
+        if (state) {
+            state = { ...state, namespace: this.keys.namespace };
+            state.tag = await stateTag(state, session, []);
+        }
+        const registry = {
+            namespace: this.keys.namespace,
+            sessionID: session.sessionID,
+            status: session.status,
+            revision: 0,
+            tag: state?.tag || (await hash(bootstrapBytes(session.offer))),
+        };
+        return this.keys.run(
+            [...SESSION_STORES, ...IDENTITY_STORES],
+            'readwrite',
+            (tx) =>
+                requestResult(
+                    tx
+                        .objectStore(STORES.sessionRegistry)
+                        .index('namespace')
+                        .getAll(
+                            this.keys.namespace,
+                            SESSION_LIMITS.registry + 2
+                        ),
+                    (rows) => {
+                        if (
+                            rows.some(
+                                (row) => row.sessionID === session.sessionID
+                            )
+                        )
+                            throw fail('SESSION_ALREADY_EXISTS');
+                        if (
+                            rows.length >= SESSION_LIMITS.registry ||
+                            rows.filter(
+                                (row) =>
+                                    row.sessionID !== '@signing' &&
+                                    ['active', 'pending'].includes(row.status)
+                            ).length >= SESSION_LIMITS.sessions
+                        )
+                            throw fail('SESSION_LIMIT');
+                        return this.signing.check(tx, identity).then(() =>
+                            requestResult(
+                                tx.objectStore(STORES.sessions).get(key),
+                                (existing) => {
+                                    if (existing)
+                                        throw fail('SESSION_STATE_LOST');
+                                    tx.objectStore(STORES.sessionRegistry).add(
+                                        registry
+                                    );
+                                    tx.objectStore(STORES.sessions).add(
+                                        session
+                                    );
+                                    if (state)
+                                        tx.objectStore(STORES.ratchetState).add(
+                                            state
+                                        );
+                                }
+                            )
+                        );
+                    }
+                )
+        );
+    }
+    async commit(
+        snapshot,
+        state,
+        skipped,
+        identity,
+        session = snapshot.session
+    ) {
+        const key = this.id(session.sessionID);
+        state = {
+            ...state,
+            namespace: this.keys.namespace,
+            revision: snapshot.registry.revision + 1,
+            skipped: skipped.map(({ chain, number }) => ({ chain, number })),
+        };
+        if (!Number.isSafeInteger(state.revision))
+            throw fail('COUNTER_EXHAUSTED');
+        state.tag = await stateTag(state, session, skipped);
+        await this.keys.run(
+            [...SESSION_STORES, ...IDENTITY_STORES],
+            'readwrite',
+            (tx) =>
+                requestResult(
+                    tx.objectStore(STORES.sessionRegistry).get(key),
+                    (registry) => {
+                        if (!registry) throw fail('SESSION_STATE_LOST');
+                        if (registry.status === 'closed')
+                            throw fail('SESSION_CLOSED');
+                        if (
+                            registry.revision !== snapshot.registry.revision ||
+                            registry.tag !== snapshot.registry.tag ||
+                            registry.status !== snapshot.registry.status
+                        )
+                            throw fail('RATCHET_CONFLICT');
+                        return this.signing.check(tx, identity).then(() =>
+                            requestResult(
+                                tx.objectStore(STORES.sessions).get(key),
+                                (existing) => {
+                                    if (
+                                        !existing ||
+                                        existing.status !==
+                                            snapshot.session.status ||
+                                        existing.peerID !==
+                                            snapshot.session.peerID ||
+                                        existing.initiator !==
+                                            snapshot.session.initiator
+                                    )
+                                        throw fail('SESSION_STATE_LOST');
+                                    return requestResult(
+                                        tx
+                                            .objectStore(STORES.ratchetState)
+                                            .get(key),
+                                        (current) => {
+                                            if (!snapshot.state && current)
+                                                throw fail(
+                                                    'RATCHET_STATE_LOST'
+                                                );
+                                            if (
+                                                snapshot.state &&
+                                                (!current ||
+                                                    current.tag !==
+                                                        snapshot.state.tag ||
+                                                    current.revision !==
+                                                        snapshot.state.revision)
+                                            )
+                                                throw fail(
+                                                    'RATCHET_STATE_LOST'
+                                                );
+                                            if (
+                                                current &&
+                                                snapshot.state &&
+                                                [
+                                                    'sendNumber',
+                                                    'receiveNumber',
+                                                    'previousChainLength',
+                                                    'remotePreviousChainLength',
+                                                    'steps',
+                                                    'transcript',
+                                                    'remoteFingerprint',
+                                                ].some(
+                                                    (name) =>
+                                                        current[name] !==
+                                                        snapshot.state[name]
+                                                )
+                                            )
+                                                throw fail(
+                                                    'RATCHET_STATE_LOST'
+                                                );
+                                            return requestResult(
+                                                tx
+                                                    .objectStore(
+                                                        STORES.skippedKeys
+                                                    )
+                                                    .index('session')
+                                                    .getAll(
+                                                        key,
+                                                        SESSION_LIMITS.skipped +
+                                                            1
+                                                    ),
+                                                (rows) => {
+                                                    if (
+                                                        rows.length !==
+                                                            snapshot.skipped
+                                                                .length ||
+                                                        !snapshot.skipped.every(
+                                                            (item) =>
+                                                                rows.some(
+                                                                    (row) =>
+                                                                        row.chain ===
+                                                                            item.chain &&
+                                                                        row.number ===
+                                                                            item.number
+                                                                )
+                                                        )
+                                                    )
+                                                        throw fail(
+                                                            'RATCHET_STATE_LOST'
+                                                        );
+                                                    // Both reads and writes use the same native transaction lock.
+                                                    for (const ref of snapshot
+                                                        .state?.skipped || [])
+                                                        tx.objectStore(
+                                                            STORES.skippedKeys
+                                                        ).delete([
+                                                            ...key,
+                                                            ref.chain,
+                                                            ref.number,
+                                                        ]);
+                                                    for (const row of skipped)
+                                                        tx.objectStore(
+                                                            STORES.skippedKeys
+                                                        ).put(row);
+                                                    tx.objectStore(
+                                                        STORES.sessions
+                                                    ).put(session);
+                                                    tx.objectStore(
+                                                        STORES.ratchetState
+                                                    ).put(state);
+                                                    return requestResult(
+                                                        tx
+                                                            .objectStore(
+                                                                STORES.sessionRegistry
+                                                            )
+                                                            .put({
+                                                                ...registry,
+                                                                status: session.status,
+                                                                revision:
+                                                                    state.revision,
+                                                                tag: state.tag,
+                                                            })
+                                                    );
+                                                }
+                                            );
+                                        }
+                                    );
+                                }
+                            )
+                        );
+                    }
+                )
+        );
+    }
+    async close(id) {
+        const key = this.id(id);
+        return this.keys.run(SESSION_STORES, 'readwrite', (tx) =>
+            requestResult(
+                tx.objectStore(STORES.sessionRegistry).get(key),
+                (registry) => {
+                    if (!registry) throw fail('SESSION_NOT_FOUND');
+                    if (registry.status === 'closed') return;
+                    return requestResult(
+                        tx.objectStore(STORES.ratchetState).get(key),
+                        (state) => {
+                            if (state?.skipped?.length > SESSION_LIMITS.skipped)
+                                throw fail('RATCHET_STATE_LOST');
+                            for (const ref of state?.skipped || [])
+                                tx.objectStore(STORES.skippedKeys).delete([
+                                    ...key,
+                                    ref.chain,
+                                    ref.number,
+                                ]);
+                            tx.objectStore(STORES.ratchetState).delete(key);
+                            tx.objectStore(STORES.sessions).put({
+                                namespace: this.keys.namespace,
+                                sessionID: id,
+                                status: 'closed',
+                            });
+                            return requestResult(
+                                tx
+                                    .objectStore(STORES.sessionRegistry)
+                                    .put({ ...registry, status: 'closed' })
+                            );
+                        }
+                    );
+                }
+            )
+        );
+    }
+}
+
+function matchIdentity(header, identity, outgoing) {
+    const localPrefix = outgoing ? 'sender' : 'receiver',
+        peerPrefix = outgoing ? 'receiver' : 'sender';
+    if (
+        header[localPrefix + 'IdentityFingerprint'] !==
+            identity.localFingerprint ||
+        header[peerPrefix + 'IdentityFingerprint'] !==
+            identity.peerFingerprint ||
+        header[localPrefix + 'SigningFingerprint'] !==
+            identity.localSigningFingerprint ||
+        header[peerPrefix + 'SigningFingerprint'] !==
+            identity.peerSigningFingerprint
+    )
+        throw fail('SESSION_IDENTITY_MISMATCH');
+}
+class Sessions {
+    constructor(keys, signing) {
+        this.keys = keys;
+        this.signing = signing;
+        this.store = new SessionStore(keys, signing);
+    }
+    async create(peer, options) {
+        endpoint(peer);
+        const { contextID } = exact(options, ['contextID'], 'INVALID_OPTIONS');
+        scalarString(contextID);
+        const identity = await this.signing.snapshot(peer),
+            [publicKey, privateKey] = await generatePair();
+        const header = bootstrapHeader({
+            version: 3,
+            suite: RATCHET_SUITE,
+            sessionID: randomID(),
+            contextID,
+            sender: this.keys.accID,
+            receiver: peer,
+            senderIdentityFingerprint: identity.localFingerprint,
+            receiverIdentityFingerprint: identity.peerFingerprint,
+            senderSigningFingerprint: identity.localSigningFingerprint,
+            receiverSigningFingerprint: identity.peerSigningFingerprint,
+            generation: randomID(),
+            ratchetPublicKey: publicPoint(publicKey),
+        });
+        const signature = await sign(
+            identity.privateKey,
+            bootstrapBytes(header)
+        );
+        await this.store.create(
+            {
+                sessionID: header.sessionID,
+                status: 'pending',
+                peerID: peer,
+                initiator: true,
+                offer: header,
+                pendingPrivate: privateKey,
+            },
+            null,
+            identity
+        );
+        return { header, signature };
+    }
+    async accept(value, expected) {
+        const packet = bootstrapPacket(value),
+            exp = bootstrapExpected(expected);
+        checkExpectations(packet.header, exp, this.keys.accID);
+        const identity = await this.signing.snapshot(exp.sender);
+        matchIdentity(packet.header, identity, false);
+        await verify(
+            identity.publicKey,
+            packet.signature,
+            bootstrapBytes(packet.header)
+        );
+        const [publicKey, privateKey] = await generatePair();
+        const answer = bootstrapHeader(
+            {
+                ...reverse(packet.header, publicKey),
+                offerHash: await hash(bootstrapBytes(packet.header)),
+            },
+            true
+        );
+        const signature = await sign(
+            identity.privateKey,
+            bootstrapBytes(answer, true)
+        );
+        const { root, transcript } = await initialRoot(
+            privateKey,
+            packet.header.ratchetPublicKey,
+            packet.header,
+            answer
+        );
+        const state = await blankState(
+            exp.sessionID,
+            root,
+            transcript,
+            publicKey,
+            privateKey,
+            packet.header.ratchetPublicKey
+        );
+        await this.store.create(
+            {
+                sessionID: exp.sessionID,
+                status: 'active',
+                peerID: exp.sender,
+                initiator: false,
+                offer: packet.header,
+                answer,
+            },
+            state,
+            identity
+        );
+        return { header: answer, signature };
+    }
+    async finish(value, expected) {
+        const packet = bootstrapPacket(value, true),
+            exp = bootstrapExpected(expected);
+        checkExpectations(packet.header, exp, this.keys.accID);
+        const snapshot = await this.store.snapshot(exp.sessionID);
+        if (snapshot.session.status !== 'pending')
+            throw fail('SESSION_ALREADY_EXISTS');
+        const identity = await this.signing.snapshot(snapshot.session.peerID);
+        matchIdentity(packet.header, identity, false);
+        const offer = snapshot.session.offer,
+            reversed = reverse(offer, packet.header.ratchetPublicKey);
+        if (
+            Object.keys(binding(reversed)).some(
+                (k) => reversed[k] !== packet.header[k]
+            ) ||
+            packet.header.offerHash !== (await hash(bootstrapBytes(offer)))
+        )
+            throw fail('SESSION_BOOTSTRAP_INVALID');
+        await verify(
+            identity.publicKey,
+            packet.signature,
+            bootstrapBytes(packet.header, true)
+        );
+        const initial = await initialRoot(
+            snapshot.session.pendingPrivate,
+            packet.header.ratchetPublicKey,
+            offer,
+            packet.header
+        );
+        const [localPublic, localPrivate] = await generatePair();
+        const step = await rootStep(
+            initial.root,
+            localPrivate,
+            packet.header.ratchetPublicKey,
+            initial.transcript
+        );
+        const state = await blankState(
+            exp.sessionID,
+            step.root,
+            initial.transcript,
+            localPublic,
+            localPrivate,
+            packet.header.ratchetPublicKey
+        );
+        state.sendChain = step.chain;
+        const session = {
+            namespace: this.keys.namespace,
+            sessionID: exp.sessionID,
+            peerID: snapshot.session.peerID,
+            initiator: true,
+            status: 'active',
+            offer,
+            answer: packet.header,
+        };
+        await this.store.commit(snapshot, state, [], identity, session);
+        return this.inspect(exp.sessionID);
+    }
+    async bound(snapshot) {
+        const identity = await this.signing.snapshot(snapshot.session.peerID);
+        matchIdentity(
+            snapshot.session.initiator
+                ? snapshot.session.offer
+                : snapshot.session.answer,
+            identity,
+            true
+        );
+        return identity;
+    }
+    async inspect(id) {
+        const snapshot = await this.store.snapshot(id);
+        await this.bound(snapshot);
+        return {
+            sessionID: id,
+            peerID: snapshot.session.peerID,
+            contextID: snapshot.session.offer.contextID,
+            status: snapshot.session.status,
+            sendNumber: snapshot.state?.sendNumber || '0',
+            receiveNumber: snapshot.state?.receiveNumber || '0',
+            ratchetSteps: snapshot.state?.steps || 0,
+        };
+    }
+    async seal(id, value, options) {
+        this.store.id(id);
+        const bytes = bytesSnapshot(value, V2_LIMITS.plaintextBytes);
+        const purposeValue = purpose(
+            exact(options, ['purpose'], 'INVALID_OPTIONS').purpose
+        );
+        for (let attempt = 0; attempt < SESSION_LIMITS.retries; attempt++) {
+            const snapshot = await this.store.snapshot(id),
+                identity = await this.bound(snapshot);
+            if (snapshot.session.status !== 'active')
+                throw fail('SESSION_NOT_READY');
+            const { state, seed } = await advanceSend(snapshot.state);
+            const base = snapshot.session.initiator
+                ? snapshot.session.offer
+                : snapshot.session.answer;
+            const header = ratchetHeader({
+                ...binding(base),
+                ratchetPublicKey: state.localPublic,
+                previousChainLength: state.previousChainLength,
+                messageNumber: snapshot.state.sendNumber,
+                purpose: purposeValue,
+                iv: encodeBase64url(crypto.getRandomValues(new Uint8Array(12))),
+            });
+            const key = await messageKey(
+                seed,
+                header,
+                state.transcript,
+                'encrypt'
+            );
+            try {
+                await this.store.commit(
+                    snapshot,
+                    state,
+                    snapshot.skipped,
+                    identity
+                );
+            } catch (error) {
+                if (error.code === 'RATCHET_CONFLICT') continue;
+                throw error;
+            }
+            // The committed chain step is burned on any subsequent error.
+            const ciphertext = encodeBase64url(
+                await gcm(key, header, bytes, encodeRatchetAAD(header))
+            );
+            return { header, ciphertext };
+        }
+        throw fail('RATCHET_CONFLICT');
+    }
+    async receive(value, expected, text = false) {
+        const packet = ratchetPacket(value),
+            exp = expectations$1(expected);
+        checkExpectations(packet.header, exp, this.keys.accID);
+        for (let attempt = 0; attempt < SESSION_LIMITS.retries; attempt++) {
+            const snapshot = await this.store.snapshot(exp.sessionID),
+                identity = await this.bound(snapshot);
+            if (snapshot.session.status !== 'active')
+                throw fail('SESSION_NOT_READY');
+            const incoming = snapshot.session.initiator
+                ? snapshot.session.answer
+                : snapshot.session.offer;
+            if (
+                Object.keys(binding(incoming)).some(
+                    (k) => incoming[k] !== packet.header[k]
+                )
+            )
+                throw fail('SESSION_IDENTITY_MISMATCH');
+            const proposed = await advanceReceive(
+                snapshot.state,
+                snapshot.skipped,
+                packet.header
+            );
+            const key = await messageKey(
+                proposed.seed,
+                packet.header,
+                proposed.state.transcript,
+                'decrypt'
+            );
+            const bytes = await gcm(
+                key,
+                packet.header,
+                packet.payload.bytes,
+                encodeRatchetAAD(packet.header),
+                true
+            );
+            let result;
+            try {
+                result = text ? decodeText(bytes) : bytes;
+                await this.store.commit(
+                    snapshot,
+                    proposed.state,
+                    proposed.skipped,
+                    identity
+                );
+            } catch (error) {
+                bytes.fill(0);
+                if (error.code === 'RATCHET_CONFLICT') continue;
+                throw error;
+            }
+            if (text) bytes.fill(0);
+            return result;
+        }
+        throw fail('RATCHET_CONFLICT');
+    }
+    close(id) {
+        return this.store.close(id);
+    }
+}
+
+/* global BigInt */
+
+const REPLAY_WINDOW = 128;
+const MASK = (1n << 128n) - 1n;
+const emptyBitmap = '0'.repeat(32);
+async function streamIdentity(header, legacy = false) {
+    const g = header.group;
+    const fields = [
+        header.suite,
+        header.contextID,
+        header.sender,
+        header.receiver,
+        header.senderFingerprint,
+        header.receiverFingerprint,
+        header.purpose,
+        g?.groupID || '',
+        g?.epoch || '',
+        g?.generation || '',
+    ];
+    if (header.senderSigningFingerprint !== undefined)
+        fields.push(header.senderSigningFingerprint);
+    const bytes = encodeFields(
+        legacy ? BE8_DOMAINS.replay : 'BE9-REPLAY-STREAM',
+        fields.map((value) => new TextEncoder().encode(value))
+    );
+    return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
+}
+function contextRecord(record) {
+    if (!record)
+        throw engineError(
+            'explicitly open the local context first',
+            'CONTEXT_NOT_OPEN'
+        );
+    if (record.status === 'closed')
+        throw engineError(
+            'context is permanently closed; use a fresh context ID',
+            'CONTEXT_CLOSED'
+        );
+    if (
+        record.status !== 'open' ||
+        !Array.isArray(record.streams) ||
+        record.streams.length > SESSION_LIMITS.contextStreams ||
+        !record.streams.every(
+            (entry) =>
+                entry &&
+                typeof entry.streamID === 'string' &&
+                /^[A-Za-z0-9_-]{43}$/.test(entry.streamID) &&
+                ['send', 'receive'].includes(entry.direction)
+        )
+    )
+        throw engineError('invalid context state', 'STATE_LOST');
+    return record;
+}
+class Replay {
+    constructor(keys) {
+        this.keys = keys;
+    }
+    async openContext(contextID) {
+        scalarString(contextID);
+        return this.keys.run([STORES.contexts], 'readwrite', (tx) => {
+            const store = tx.objectStore(STORES.contexts);
+            return requestResult(
+                store.get([this.keys.namespace, contextID]),
+                (current) => {
+                    if (current) {
+                        contextRecord(current);
+                        return { contextID, status: 'open' };
+                    }
+                    return requestResult(
+                        store.add({
+                            namespace: this.keys.namespace,
+                            contextID,
+                            status: 'open',
+                            streams: [],
+                        }),
+                        () => ({ contextID, status: 'open' })
+                    );
+                }
+            );
+        });
+    }
+    async closeContext(contextID) {
+        scalarString(contextID);
+        return this.keys.run([STORES.contexts], 'readwrite', (tx) => {
+            const store = tx.objectStore(STORES.contexts);
+            return requestResult(
+                store.get([this.keys.namespace, contextID]),
+                (record) => {
+                    if (!record)
+                        throw engineError(
+                            'context is not open',
+                            'CONTEXT_NOT_OPEN'
+                        );
+                    if (record.status === 'closed') return;
+                    contextRecord(record);
+                    return requestResult(
+                        store.put({ ...record, status: 'closed' })
+                    );
+                }
+            );
+        });
+    }
+    async initialize(header, direction, legacy = false) {
+        const streamID = await streamIdentity(header, legacy);
+        const name =
+            direction === 'send' ? STORES.sendState : STORES.receiveState;
+        return this.keys.run([STORES.contexts, name], 'readwrite', (tx) => {
+            const contexts = tx.objectStore(STORES.contexts);
+            const states = tx.objectStore(name);
+            return requestResult(
+                contexts.get([this.keys.namespace, header.contextID]),
+                (value) => {
+                    const context = contextRecord(value);
+                    const known = context.streams.some(
+                        (entry) =>
+                            entry.streamID === streamID &&
+                            entry.direction === direction
+                    );
+                    return requestResult(
+                        states.get([
+                            this.keys.namespace,
+                            header.contextID,
+                            streamID,
+                        ]),
+                        (state) => {
+                            if (known) {
+                                if (!state)
+                                    throw engineError(
+                                        'registered stream state is missing; no reset is allowed',
+                                        'STATE_LOST'
+                                    );
+                                return streamID;
+                            }
+                            if (
+                                state ||
+                                context.streams.length >=
+                                    SESSION_LIMITS.contextStreams
+                            )
+                                throw engineError(
+                                    'inconsistent or exhausted context state',
+                                    'STATE_LOST'
+                                );
+                            const base = {
+                                namespace: this.keys.namespace,
+                                contextID: header.contextID,
+                                streamID,
+                            };
+                            states.add(
+                                direction === 'send'
+                                    ? { ...base, last: '0' }
+                                    : {
+                                          ...base,
+                                          highest: '0',
+                                          bitmap: emptyBitmap,
+                                      }
+                            );
+                            return requestResult(
+                                contexts.put({
+                                    ...context,
+                                    streams: [
+                                        ...context.streams,
+                                        { streamID, direction },
+                                    ],
+                                }),
+                                () => streamID
+                            );
+                        }
+                    );
+                }
+            );
+        });
+    }
+    async reserve(header) {
+        const streamID = await this.initialize(header, 'send');
+        return this.keys.run(
+            [STORES.contexts, STORES.sendState],
+            'readwrite',
+            (tx) =>
+                requestResult(
+                    tx
+                        .objectStore(STORES.contexts)
+                        .get([this.keys.namespace, header.contextID]),
+                    (context) => {
+                        contextRecord(context);
+                        const store = tx.objectStore(STORES.sendState);
+                        return requestResult(
+                            store.get([
+                                this.keys.namespace,
+                                header.contextID,
+                                streamID,
+                            ]),
+                            (record) => {
+                                if (!record)
+                                    throw engineError(
+                                        'send counter is missing',
+                                        'STATE_LOST'
+                                    );
+                                const last = sequenceValue(record.last);
+                                if (last === MAX_SEQUENCE)
+                                    throw engineError(
+                                        'uint64 send counter exhausted',
+                                        'COUNTER_EXHAUSTED'
+                                    );
+                                const sequence = String(last + 1n);
+                                return requestResult(
+                                    store.put({ ...record, last: sequence }),
+                                    () => sequence
+                                );
+                            }
+                        );
+                    }
+                )
+        );
+    }
+    async accept(header, legacy = false) {
+        const streamID = await streamIdentity(header, legacy);
+        return this.keys.run(
+            [STORES.contexts, STORES.receiveState],
+            'readwrite',
+            (tx) => this.acceptInTransaction(tx, header, streamID)
+        );
+    }
+    acceptInTransaction(tx, header, streamID) {
+        return requestResult(
+            tx
+                .objectStore(STORES.contexts)
+                .get([this.keys.namespace, header.contextID]),
+            (value) => {
+                const context = contextRecord(value);
+                if (
+                    !context.streams.some(
+                        (entry) =>
+                            entry.streamID === streamID &&
+                            entry.direction === 'receive'
+                    )
+                )
+                    throw engineError(
+                        'explicitly initialize expected receive stream first',
+                        'STREAM_NOT_OPEN'
+                    );
+                const store = tx.objectStore(STORES.receiveState);
+                return requestResult(
+                    store.get([
+                        this.keys.namespace,
+                        header.contextID,
+                        streamID,
+                    ]),
+                    (record) => {
+                        if (
+                            !record ||
+                            typeof record.bitmap !== 'string' ||
+                            !/^[0-9a-f]{32}$/.test(record.bitmap)
+                        )
+                            throw engineError(
+                                'receive state is missing or invalid',
+                                'STATE_LOST'
+                            );
+                        let highest = sequenceValue(record.highest);
+                        let bitmap = BigInt('0x' + record.bitmap);
+                        if (
+                            (highest < 128n && bitmap >> highest !== 0n) ||
+                            (highest > 0n && !(bitmap & 1n))
+                        )
+                            throw engineError(
+                                'invalid receive window',
+                                'STATE_LOST'
+                            );
+                        const sequence = sequenceValue(header.sequence);
+                        if (sequence > highest) {
+                            const distance = sequence - highest;
+                            bitmap =
+                                distance >= 128n
+                                    ? 1n
+                                    : ((bitmap << distance) | 1n) & MASK;
+                            highest = sequence;
+                        } else {
+                            const distance = highest - sequence;
+                            if (distance >= 128n)
+                                throw engineError(
+                                    'sequence is outside the replay window',
+                                    'REPLAY_TOO_OLD'
+                                );
+                            const bit = 1n << distance;
+                            if (bitmap & bit)
+                                throw engineError(
+                                    'sequence was already accepted',
+                                    'REPLAY_DUPLICATE'
+                                );
+                            bitmap |= bit;
+                        }
+                        return requestResult(
+                            store.put({
+                                ...record,
+                                highest: String(highest),
+                                bitmap: bitmap.toString(16).padStart(32, '0'),
+                            })
+                        );
+                    }
+                );
+            }
+        );
+    }
+}
+
+const names = [
+    'version',
+    'suite',
+    'contextID',
+    'sender',
+    'receiver',
+    'senderFingerprint',
+    'receiverFingerprint',
+    'purpose',
+    'salt',
+    'iv',
+    'sequence',
+    'group',
+    'senderSigningFingerprint',
+];
+function header(value) {
+    const h = exact(value, names);
+    if (h.version !== 3 || h.suite !== SIGNED_GROUP_SUITE)
+        throw fail('INVALID_ENVELOPE');
+    decode32(h.senderSigningFingerprint);
+    const previous = { ...h, version: 2, suite: GROUP_SUITE };
+    delete previous.senderSigningFingerprint;
+    const checked = headerSnapshot(previous);
+    return Object.freeze({
+        ...checked,
+        version: 3,
+        suite: SIGNED_GROUP_SUITE,
+        senderSigningFingerprint: h.senderSigningFingerprint,
+    });
+}
+function encodeSignedGroupInfo(value) {
+    const h = header(value);
+    return fields('BE9-SIGNED-GROUP-KEY', [
+        new Uint8Array([3]),
+        h.suite,
+        encodeGroupInfo({ ...h, version: 2, suite: GROUP_SUITE }),
+        decode32(h.senderSigningFingerprint),
+    ]);
+}
+function encodeSignedGroupAAD(value) {
+    const h = header(value),
+        previous = { ...h, version: 2, suite: GROUP_SUITE };
+    delete previous.senderSigningFingerprint;
+    return boundedHeader(
+        fields('BE9-SIGNED-GROUP-AAD', [
+            encodeSignedGroupInfo(h),
+            encodeEnvelopeAAD$1(previous),
+        ])
+    );
+}
+async function groupSignatureInput(h, ciphertext) {
+    return fields('BE9-GROUP-MESSAGE-SIGNATURE', [
+        encodeSignedGroupAAD(h),
+        new Uint8Array(await crypto.subtle.digest('SHA-256', ciphertext)),
+    ]);
+}
+function expectations(value) {
+    return exact(
+        value,
+        ['sender', 'contextID', 'purpose', 'groupID', 'epoch', 'generation'],
+        'ENVELOPE_EXPECTATION_REQUIRED'
+    );
+}
+async function aes(epoch, h, usage) {
+    return crypto.subtle.deriveKey(
+        {
+            name: 'HKDF',
+            hash: 'SHA-256',
+            salt: decode32(h.salt),
+            info: encodeSignedGroupInfo(h),
+        },
+        requireGroupSecret(epoch.key),
+        { name: 'AES-GCM', length: 256 },
+        false,
+        [usage]
+    );
+}
+class SignedGroups {
+    constructor(keys, groups, signing, replay) {
+        this.keys = keys;
+        this.groups = groups;
+        this.signing = signing;
+        this.replay = replay;
+    }
+    async liveCheck(tx, expected, identity, work) {
+        return this.signing.check(tx, identity).then(() =>
+            requestResult(
+                tx
+                    .objectStore(STORES.activeEpochs)
+                    .get([this.keys.namespace, expected.groupID]),
+                (active) => {
+                    if (!active || active.epoch !== expected.epoch)
+                        throw fail('GROUP_EPOCH_NOT_ACTIVE');
+                    return requestResult(
+                        tx
+                            .objectStore(STORES.groupEpochs)
+                            .get([
+                                this.keys.namespace,
+                                expected.groupID,
+                                expected.epoch,
+                            ]),
+                        (epoch) => {
+                            if (
+                                !epoch ||
+                                epoch.generation !== expected.generation
+                            )
+                                throw fail('GROUP_EPOCH_CONFLICT');
+                            return work();
+                        }
+                    );
+                }
+            )
+        );
+    }
+    async openReceive(value) {
+        const expected = expectations(value);
+        const identity = await this.signing.snapshot(expected.sender);
+        const { header: base } = await this.groups.stream(expected);
+        const metadata = {
+            ...base,
+            version: 3,
+            suite: SIGNED_GROUP_SUITE,
+            senderSigningFingerprint: identity.peerSigningFingerprint,
+        };
+        const active = await this.groups.active(expected.groupID);
+        if (
+            !active ||
+            active.epoch !== expected.epoch ||
+            active.generation !== expected.generation
+        )
+            throw fail('GROUP_EPOCH_NOT_ACTIVE');
+        await this.replay.openContext(expected.contextID);
+        await this.replay.initialize(metadata, 'receive');
+    }
+    async seal(id, value, options) {
+        options = exact(options, ['contextID', 'purpose'], 'INVALID_OPTIONS');
+        purpose(options.purpose);
+        const bytes = bytesSnapshot(value, V2_LIMITS.plaintextBytes);
+        const identity = await this.signing.snapshot(this.keys.accID);
+        const active = await this.groups.active(id);
+        if (!active) throw fail('GROUP_EPOCH_NOT_ACTIVE');
+        const { record, header: base } = await this.groups.stream({
+            ...active,
+            sender: this.keys.accID,
+            ...options,
+        });
+        const metadata = {
+            ...base,
+            version: 3,
+            suite: SIGNED_GROUP_SUITE,
+            senderSigningFingerprint: identity.localSigningFingerprint,
+            salt: encodeBase64url(crypto.getRandomValues(new Uint8Array(32))),
+        };
+        const sequence = await this.replay.reserve(metadata);
+        const h = header({
+            ...metadata,
+            sequence,
+            iv: encodeBase64url(crypto.getRandomValues(new Uint8Array(12))),
+        });
+        await this.keys.reserveUsage(
+            await usageIdentity(h.salt, encodeSignedGroupInfo(h)),
+            bytes.length,
+            encodeSignedGroupAAD(h).length
+        );
+        const ciphertext = await gcm(
+            await aes(record, h, 'encrypt'),
+            h,
+            bytes,
+            encodeSignedGroupAAD(h)
+        );
+        const signature = await sign(
+            identity.privateKey,
+            await groupSignatureInput(h, ciphertext)
+        );
+        await this.keys.run(
+            [...IDENTITY_STORES, STORES.activeEpochs, STORES.groupEpochs],
+            'readonly',
+            (tx) => this.liveCheck(tx, active, identity, () => undefined)
+        );
+        return {
+            header: h,
+            ciphertext: encodeBase64url(ciphertext),
+            signature,
+        };
+    }
+    async open(value, expectedValue, receive = true, asText = false) {
+        const packet = exact(value, ['header', 'ciphertext', 'signature']);
+        const h = header(packet.header),
+            expected = expectations(expectedValue);
+        const payload = payloadSnapshot(packet.ciphertext, h.iv);
+        signatureBytes(packet.signature);
+        if (
+            h.sender !== expected.sender ||
+            h.contextID !== expected.contextID ||
+            h.purpose !== expected.purpose ||
+            h.group.groupID !== expected.groupID ||
+            h.group.epoch !== expected.epoch ||
+            h.group.generation !== expected.generation
+        )
+            throw fail('ENVELOPE_EXPECTATION_MISMATCH');
+        // Verify locally trusted sender identity and signature BEFORE epoch lookup/decryption.
+        const identity = await this.signing.snapshot(h.sender);
+        if (
+            identity.peerFingerprint !== h.senderFingerprint ||
+            identity.peerSigningFingerprint !== h.senderSigningFingerprint
+        )
+            throw fail('SESSION_IDENTITY_MISMATCH');
+        await verify(
+            identity.publicKey,
+            packet.signature,
+            await groupSignatureInput(h, payload.bytes)
+        );
+        const { record } = await this.groups.stream(expected);
+        const bytes = await gcm(
+            await aes(record, h, 'decrypt'),
+            h,
+            payload.bytes,
+            encodeSignedGroupAAD(h),
+            true
+        );
+        let result;
+        try {
+            result = asText ? decodeText(bytes) : bytes;
+            const streamID = await streamIdentity(h);
+            await this.keys.run(
+                [
+                    ...IDENTITY_STORES,
+                    STORES.activeEpochs,
+                    STORES.groupEpochs,
+                    ...(receive ? [STORES.contexts, STORES.receiveState] : []),
+                ],
+                receive ? 'readwrite' : 'readonly',
+                (tx) =>
+                    receive
+                        ? this.liveCheck(tx, expected, identity, () =>
+                              this.replay.acceptInTransaction(tx, h, streamID)
+                          )
+                        : this.signing.check(tx, identity)
+            );
+        } catch (error) {
+            bytes.fill(0);
+            throw error;
+        }
+        if (asText) bytes.fill(0);
+        return result;
+    }
+}
+
+function getTypeOfKey(id) {
+    if (!id) {
+        throw new Error('engine: id is required in getTypeOfKey');
+    }
+    if (id.charAt(0) === 'g') {
+        return 'group';
+    }
+    if (id.charAt(0) === 'c') {
+        return 'channel';
+    }
+
+    return 'dialog';
 }
 
 /* global WeakRef */
@@ -2088,11 +5490,15 @@ class KeyStore {
             (name) =>
                 name !== STORES.scopes &&
                 name !== STORES.keyUsage &&
+                name !== STORES.sessionRegistry &&
                 db.objectStoreNames.contains(name)
         );
+        const retained = db.objectStoreNames.contains(STORES.sessionRegistry)
+            ? [STORES.sessionRegistry]
+            : [];
         return withTransaction(
             this.connection,
-            [STORES.scopes, ...owned],
+            [STORES.scopes, ...owned, ...retained],
             'readwrite',
             (tx) => {
                 this.#register(tx);
@@ -2130,6 +5536,34 @@ class KeyStore {
                                 )
                         );
                     });
+                    if (retained.length)
+                        removals.push(
+                            requestResult(
+                                tx
+                                    .objectStore(STORES.sessionRegistry)
+                                    .index('namespace')
+                                    .getAll(this.namespace),
+                                (rows) =>
+                                    Promise.all(
+                                        rows.map((row) =>
+                                            requestResult(
+                                                tx
+                                                    .objectStore(
+                                                        STORES.sessionRegistry
+                                                    )
+                                                    .put({
+                                                        ...row,
+                                                        status:
+                                                            row.sessionID ===
+                                                            '@signing'
+                                                                ? 'invalidated'
+                                                                : 'closed',
+                                                    })
+                                            )
+                                        )
+                                    )
+                            )
+                        );
                     const tombstone = requestResult(
                         scopes.put({
                             namespace: this.namespace,
@@ -2225,797 +5659,6 @@ class KeyStore {
     resume(generation) {
         this.#generation = generation;
         this.#blocked = false;
-    }
-}
-
-const V2_SUITE = 'BE9-P384-HKDF-SHA256-A256GCM';
-const V2_PURPOSES = Object.freeze(['data', 'attachment', 'key-wrap']);
-const fields$1 = [
-    'version',
-    'suite',
-    'contextID',
-    'sender',
-    'receiver',
-    'senderFingerprint',
-    'receiverFingerprint',
-    'purpose',
-    'salt',
-];
-const encoder = new TextEncoder();
-
-function fail(
-    message = 'invalid v2 derivation context',
-    code = 'INVALID_DERIVATION_CONTEXT'
-) {
-    return engineError(message, code);
-}
-
-function scalarString(value, maxBytes = 1024) {
-    if (typeof value !== 'string' || !value.length || value.length > maxBytes)
-        throw fail();
-    // Reject lone UTF-16 surrogates rather than silently replacing them in UTF-8.
-    for (const character of value) {
-        const code = character.codePointAt(0);
-        if (code >= 0xd800 && code <= 0xdfff) throw fail();
-    }
-    const bytes = encoder.encode(value);
-    if (bytes.length > maxBytes) throw fail();
-    return bytes;
-}
-
-function decode32(value) {
-    fingerprintValue(value);
-    const bytes = decodeBase64url(value, 32);
-    if (bytes.length !== 32) throw fail();
-    return bytes;
-}
-
-function endpoint(value) {
-    scalarString(value, 256);
-    if (
-        !/^(0|[1-9][0-9]*)$/.test(value) &&
-        !/^g[A-Za-z0-9_-]+:[1-9][0-9]*$/.test(value)
-    )
-        throw fail();
-    if (
-        value.startsWith('g') &&
-        !Number.isSafeInteger(Number(value.slice(value.lastIndexOf(':') + 1)))
-    )
-        throw fail();
-    return value;
-}
-
-function derivationSnapshot(value, legacy = false) {
-    if (!value)
-        throw fail(
-            'v2 derivation metadata is required; use the explicit legacy reader for old ciphertexts',
-            'DERIVATION_CONTEXT_REQUIRED'
-        );
-    try {
-        if (
-            typeof value !== 'object' ||
-            Array.isArray(value) ||
-            Object.keys(value).length !== fields$1.length ||
-            !fields$1.every((field) => Object.keys(value).includes(field))
-        )
-            throw fail();
-        const snapshot = Object.fromEntries(
-            fields$1.map((field) => [field, value[field]])
-        );
-        if (
-            snapshot.version !== 2 ||
-            snapshot.suite !== (legacy ? BE8_V2_SUITE : V2_SUITE) ||
-            !V2_PURPOSES.includes(snapshot.purpose)
-        )
-            throw fail();
-        scalarString(snapshot.contextID);
-        endpoint(snapshot.sender);
-        endpoint(snapshot.receiver);
-        decode32(snapshot.salt);
-        decode32(snapshot.senderFingerprint);
-        decode32(snapshot.receiverFingerprint);
-        return Object.freeze(snapshot);
-    } catch {
-        throw fail();
-    }
-}
-
-// Fixed domain prefix plus eight ordered, uint32-BE length-prefixed byte strings.
-// No separators, normalization, optional fields or object serialization enter info.
-function encodeV2DerivationInfo$1(metadata, legacy = false) {
-    const context = derivationSnapshot(metadata, legacy);
-    const values = [
-        encoder.encode('2'),
-        encoder.encode(context.suite),
-        scalarString(context.contextID),
-        scalarString(context.sender, 256),
-        scalarString(context.receiver, 256),
-        decode32(context.senderFingerprint),
-        decode32(context.receiverFingerprint),
-        encoder.encode(context.purpose),
-    ];
-    return encodeFields(
-        legacy ? BE8_DOMAINS.pairInfo : 'BE9-HKDF-INFO',
-        values
-    );
-}
-
-function encodeFields(domain, values) {
-    const prefix = encoder.encode(domain);
-    const info = new Uint8Array(
-        prefix.length +
-            values.reduce((length, value) => length + 4 + value.length, 0)
-    );
-    info.set(prefix);
-    const view = new DataView(info.buffer);
-    let offset = prefix.length;
-    for (const value of values) {
-        view.setUint32(offset, value.length, false);
-        offset += 4;
-        info.set(value, offset);
-        offset += value.length;
-    }
-    return info;
-}
-
-async function createV2Metadata(localID, ownPublicKey, peerPublicKey, options) {
-    if (!options || typeof options !== 'object' || Array.isArray(options))
-        throw fail();
-    // Snapshot all application inputs before crypto yields.
-    const { contextID, sender, receiver, purpose } = options;
-    if (sender !== localID)
-        throw fail('only the sender creates a new derivation context');
-    scalarString(contextID);
-    endpoint(sender);
-    endpoint(receiver);
-    if (!V2_PURPOSES.includes(purpose)) throw fail();
-    const [own, peer] = await Promise.all([
-        preparePublicKey(ownPublicKey),
-        preparePublicKey(peerPublicKey),
-    ]);
-    if (sender === receiver && own.fingerprint !== peer.fingerprint)
-        throw fail();
-    const salt = crypto.getRandomValues(new Uint8Array(32));
-    return derivationSnapshot({
-        version: 2,
-        suite: V2_SUITE,
-        contextID,
-        sender,
-        receiver,
-        senderFingerprint: own.fingerprint,
-        receiverFingerprint: peer.fingerprint,
-        purpose,
-        salt: encodeBase64url(salt),
-    });
-}
-
-// Internal helper also exercised against RFC 5869 public test vectors.
-// It never returns IKM, PRK, raw AES bytes or an extractable derived key.
-async function hkdfAES(secret, salt, info, purpose, readOnly = false) {
-    if (!V2_PURPOSES.includes(purpose)) throw fail();
-    let material;
-    try {
-        material = await crypto.subtle.importKey('raw', secret, 'HKDF', false, [
-            'deriveKey',
-        ]);
-    } finally {
-        secret.fill(0);
-    }
-    const usages =
-        purpose === 'key-wrap'
-            ? readOnly
-                ? ['unwrapKey']
-                : ['wrapKey', 'unwrapKey']
-            : readOnly
-            ? ['decrypt']
-            : ['encrypt', 'decrypt'];
-    return crypto.subtle.deriveKey(
-        { name: 'HKDF', hash: 'SHA-256', salt, info },
-        material,
-        { name: 'AES-GCM', length: 256 },
-        false,
-        usages
-    );
-}
-
-async function deriveV2AES(
-    localID,
-    ownPublicKey,
-    peerPublicKey,
-    privateKey,
-    metadata,
-    legacy = false
-) {
-    const context = derivationSnapshot(metadata, legacy);
-    const priv = privateCryptoKey(privateKey);
-    if (priv.usages[0] !== 'deriveBits') {
-        throw fail(
-            'stored non-extractable deriveKey-only identity cannot derive v2; it is retained for explicit legacy reading',
-            'V2_KEY_USAGE_UNAVAILABLE'
-        );
-    }
-    if (localID !== context.sender && localID !== context.receiver)
-        throw fail('local endpoint is not a participant in this context');
-    const [own, peer] = await Promise.all([
-        preparePublicKey(ownPublicKey),
-        preparePublicKey(peerPublicKey),
-    ]);
-    const sending = localID === context.sender;
-    const ownExpected = sending
-        ? context.senderFingerprint
-        : context.receiverFingerprint;
-    const peerExpected = sending
-        ? context.receiverFingerprint
-        : context.senderFingerprint;
-    if (own.fingerprint !== ownExpected || peer.fingerprint !== peerExpected) {
-        throw fail(
-            'derivation fingerprints do not match the actual endpoint keys',
-            'DERIVATION_KEY_MISMATCH'
-        );
-    }
-    const imported = await crypto.subtle.importKey(
-        'jwk',
-        peer.key,
-        { name: 'ECDH', namedCurve: 'P-384' },
-        peer.key.ext,
-        []
-    );
-    let secret;
-    try {
-        // P-384's complete fixed-width ECDH x-coordinate, including leading zeros.
-        secret = new Uint8Array(
-            await crypto.subtle.deriveBits(
-                { name: 'ECDH', public: imported },
-                priv,
-                384
-            )
-        );
-        if (secret.length !== 48)
-            throw fail('unexpected P-384 ECDH output length');
-        return await hkdfAES(
-            secret,
-            decode32(context.salt),
-            encodeV2DerivationInfo$1(context, legacy),
-            context.purpose,
-            legacy
-        );
-    } finally {
-        // Best effort only: WebCrypto/runtime copies and GC are outside our control.
-        secret?.fill(0);
-    }
-}
-
-function requireAES(key, usage) {
-    if (!key)
-        throw engineError(
-            'no derived key passed to AES operation',
-            'INVALID_KEY'
-        );
-    if (
-        !(key instanceof CryptoKey) ||
-        key.type !== 'secret' ||
-        key.algorithm.name !== 'AES-GCM' ||
-        key.algorithm.length !== 256 ||
-        key.extractable
-    ) {
-        throw engineError(
-            'a non-extractable AES-256-GCM key is required',
-            'INVALID_KEY'
-        );
-    }
-    if (!key.usages.includes(usage))
-        throw new DOMException(
-            'AES key does not permit this operation',
-            'InvalidAccessError'
-        );
-}
-
-function payloadSnapshot(ciphertext, iv, legacy = false) {
-    if (iv === undefined || iv === null)
-        throw engineError(
-            'no iv (Initialization vector) passed to decrypt',
-            'INVALID_IV'
-        );
-    let nonce;
-    if (legacy) {
-        if (
-            typeof iv !== 'string' ||
-            !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
-                iv
-            )
-        ) {
-            throw engineError('invalid legacy UUID IV', 'INVALID_IV');
-        }
-        // UUID bytes were ASCII/UTF-8. No random bytes pass through text codecs.
-        nonce = Uint8Array.from(iv, (character) => character.charCodeAt(0));
-    } else {
-        try {
-            nonce = decodeBytes(iv, V2_LIMITS.ivBytes);
-        } catch {
-            throw engineError(
-                'v2 IV must be exactly 12 bytes in canonical base64url or binary',
-                'INVALID_IV'
-            );
-        }
-        if (nonce.length !== V2_LIMITS.ivBytes)
-            throw engineError('v2 IV must be exactly 12 bytes', 'INVALID_IV');
-    }
-    const bytes = legacy
-        ? decodeLegacyBase64(ciphertext)
-        : decodeBytes(ciphertext);
-    if (bytes.length < V2_LIMITS.tagBits / 8)
-        throw engineError(
-            'ciphertext is shorter than the GCM tag',
-            'INVALID_CIPHERTEXT'
-        );
-    return { bytes, iv: nonce };
-}
-
-async function encryptPayload(key, bytes) {
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ciphertext = await crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv, tagLength: 128 },
-        key,
-        bytes
-    );
-    return { cipherText: encodeBase64url(ciphertext), iv: encodeBase64url(iv) };
-}
-
-function decryptPayload(key, payload) {
-    return crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: payload.iv, tagLength: 128 },
-        key,
-        payload.bytes
-    );
-}
-
-// Only actual, validated derivation inputs enter this identity. No caller alias
-// or storage namespace can make the same HKDF key get a fresh local budget.
-async function derivationUsageID(derivation) {
-    const info = encodeV2DerivationInfo$1(derivation);
-    return usageIdentity(derivation.salt, info);
-}
-
-async function usageIdentity(salt, info) {
-    const prefix = new TextEncoder().encode('BE9-GCM-USAGE');
-    const bytes = new Uint8Array(prefix.length + 32 + info.length);
-    bytes.set(prefix);
-    bytes.set(decode32(salt), prefix.length);
-    bytes.set(info, prefix.length + 32);
-    return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
-}
-
-/* global BigInt */
-const GROUP_SUITE = 'BE9-GROUP-HKDF-SHA256-A256GCM';
-const fields = [
-    'version',
-    'suite',
-    'contextID',
-    'sender',
-    'receiver',
-    'senderFingerprint',
-    'receiverFingerprint',
-    'purpose',
-    'salt',
-];
-function groupDerivationSnapshot(value, legacy = false) {
-    const result = Object.fromEntries(
-        fields.map((field) => [field, value[field]])
-    );
-    if (
-        result.version !== 2 ||
-        result.suite !== (legacy ? BE8_GROUP_SUITE : GROUP_SUITE) ||
-        !['data', 'attachment'].includes(result.purpose) ||
-        typeof result.sender !== 'string' ||
-        !/^(0|[1-9][0-9]*)$/.test(result.sender) ||
-        typeof result.receiver !== 'string' ||
-        result.receiver.length > 128 ||
-        !/^g[A-Za-z0-9_-]+$/.test(result.receiver)
-    ) {
-        throw engineError('invalid group derivation', 'INVALID_ENVELOPE');
-    }
-    scalarString(result.contextID);
-    scalarString(result.sender, 256);
-    decode32(result.senderFingerprint);
-    decode32(result.receiverFingerprint);
-    decode32(result.salt);
-    return Object.freeze(result);
-}
-function encodeGroupInfo(header, legacy = false) {
-    const h = groupDerivationSnapshot(header, legacy);
-    const g = header.group;
-    if (
-        !g ||
-        g.groupID !== h.receiver ||
-        g.generation !== h.receiverFingerprint
-    )
-        throw engineError('group binding mismatch', 'INVALID_ENVELOPE');
-    const epoch = new Uint8Array(8);
-    new DataView(epoch.buffer).setBigUint64(0, BigInt(g.epoch), false);
-    return encodeFields(
-        legacy ? BE8_DOMAINS.groupInfo : 'BE9-GROUP-HKDF-INFO',
-        [
-            scalarString('2'),
-            scalarString(h.suite),
-            scalarString(h.contextID),
-            scalarString(h.sender, 256),
-            scalarString(h.receiver),
-            decode32(h.senderFingerprint),
-            decode32(h.receiverFingerprint),
-            scalarString(h.purpose),
-            scalarString(g.groupID),
-            epoch,
-            decode32(g.generation),
-        ]
-    );
-}
-async function groupGeneration(bytes) {
-    return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
-}
-async function importGroupSecret(bytes) {
-    try {
-        const key = await crypto.subtle.importKey('raw', bytes, 'HKDF', false, [
-            'deriveKey',
-        ]);
-        if (typeof structuredClone !== 'function') throw new Error();
-        const clone = structuredClone(key);
-        requireGroupSecret(clone);
-        return key;
-    } catch {
-        throw engineError(
-            'browser must support non-extractable CryptoKey structured clone',
-            'CRYPTOKEY_STORAGE_UNSUPPORTED'
-        );
-    }
-}
-function requireGroupSecret(key) {
-    if (
-        !(key instanceof CryptoKey) ||
-        key.algorithm.name !== 'HKDF' ||
-        key.type !== 'secret' ||
-        key.extractable ||
-        key.usages.length !== 1 ||
-        key.usages[0] !== 'deriveKey'
-    )
-        throw engineError(
-            'invalid persisted group secret',
-            'INVALID_GROUP_KEY'
-        );
-    return key;
-}
-async function deriveGroupAES(key, header, legacy = false) {
-    return crypto.subtle.deriveKey(
-        {
-            name: 'HKDF',
-            hash: 'SHA-256',
-            salt: decode32(header.salt),
-            info: encodeGroupInfo(header, legacy),
-        },
-        requireGroupSecret(key),
-        { name: 'AES-GCM', length: 256 },
-        false,
-        legacy ? ['decrypt'] : ['encrypt', 'decrypt']
-    );
-}
-
-/* global BigInt */
-
-const MAX_SEQUENCE = (1n << 64n) - 1n;
-const text = (value) => new TextEncoder().encode(value);
-const metadataFields = [
-    'version',
-    'suite',
-    'contextID',
-    'sender',
-    'receiver',
-    'senderFingerprint',
-    'receiverFingerprint',
-    'purpose',
-    'salt',
-];
-const headerFields = [...metadataFields, 'iv', 'sequence', 'group'];
-function invalidEnvelope() {
-    return engineError(
-        'invalid or unsupported v2 envelope',
-        'INVALID_ENVELOPE'
-    );
-}
-function exactObject(value, fields) {
-    try {
-        if (
-            !value ||
-            typeof value !== 'object' ||
-            Array.isArray(value) ||
-            Reflect.ownKeys(value).length !== fields.length ||
-            !fields.every((field) => Object.hasOwn(value, field))
-        )
-            throw invalidEnvelope();
-        const snapshot = {};
-        for (const field of fields) {
-            const descriptor = Object.getOwnPropertyDescriptor(value, field);
-            if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value'))
-                throw invalidEnvelope();
-            snapshot[field] = descriptor.value;
-        }
-        return snapshot;
-    } catch {
-        throw invalidEnvelope();
-    }
-}
-function sequenceValue(value) {
-    if (
-        typeof value !== 'string' ||
-        value.length > 20 ||
-        !/^(0|[1-9][0-9]*)$/.test(value)
-    )
-        throw invalidEnvelope();
-    const number = BigInt(value);
-    if (number > MAX_SEQUENCE) throw invalidEnvelope();
-    return number;
-}
-function uint64(value) {
-    const bytes = new Uint8Array(8);
-    new DataView(bytes.buffer).setBigUint64(0, sequenceValue(value), false);
-    return bytes;
-}
-function groupSnapshot(value) {
-    if (value === null) return null;
-    value = exactObject(value, ['groupID', 'epoch', 'generation']);
-    if (
-        typeof value.groupID !== 'string' ||
-        value.groupID.length > 128 ||
-        !/^g[A-Za-z0-9_-]+$/.test(value.groupID) ||
-        sequenceValue(value.epoch) === 0n
-    )
-        throw invalidEnvelope();
-    decode32(value.generation);
-    return Object.freeze({
-        groupID: value.groupID,
-        epoch: value.epoch,
-        generation: value.generation,
-    });
-}
-function headerMetadata(header, legacy = false) {
-    const value = Object.fromEntries(
-        metadataFields.map((field) => [field, header[field]])
-    );
-    return header.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE)
-        ? groupDerivationSnapshot(value, legacy)
-        : derivationSnapshot(value, legacy);
-}
-function headerSnapshot(value, legacy = false) {
-    try {
-        value = exactObject(value, headerFields);
-        const metadata = headerMetadata(value, legacy);
-        const iv = decodeBase64url(value.iv, 12);
-        if (iv.length !== 12 || sequenceValue(value.sequence) === 0n)
-            throw invalidEnvelope();
-        const group = groupSnapshot(value.group);
-        if (metadata.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE)) {
-            if (
-                !group ||
-                group.groupID !== metadata.receiver ||
-                group.generation !== metadata.receiverFingerprint
-            )
-                throw invalidEnvelope();
-        } else {
-            if (
-                !/^(0|[1-9][0-9]*)$/.test(metadata.sender) ||
-                !/^(0|[1-9][0-9]*)$/.test(metadata.receiver) ||
-                (group !== null) !== (metadata.purpose === 'key-wrap')
-            )
-                throw invalidEnvelope();
-        }
-        return Object.freeze({
-            ...metadata,
-            iv: value.iv,
-            sequence: value.sequence,
-            group,
-        });
-    } catch {
-        throw invalidEnvelope();
-    }
-}
-function envelopeSnapshot(value, legacy = false) {
-    value = exactObject(value, ['header', 'ciphertext']);
-    const header = headerSnapshot(value.header, legacy);
-    if (typeof value.ciphertext !== 'string') throw invalidEnvelope();
-    const payload = payloadSnapshot(value.ciphertext, header.iv);
-    return { header, payload, ciphertext: value.ciphertext };
-}
-function encodeEnvelopeAAD$1(value, legacy = false) {
-    const h = headerSnapshot(value, legacy);
-    const g = h.group;
-    const aad = encodeFields(legacy ? BE8_DOMAINS.aad : 'BE9-ENVELOPE-AAD', [
-        h.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE)
-            ? encodeGroupInfo(h, legacy)
-            : encodeV2DerivationInfo$1(headerMetadata(h, legacy), legacy),
-        decode32(h.salt),
-        decodeBase64url(h.iv, 12),
-        uint64(h.sequence),
-        text(g ? 'group' : ''),
-        text(g?.groupID || ''),
-        g ? uint64(g.epoch) : new Uint8Array(),
-        g ? decode32(g.generation) : new Uint8Array(),
-    ]);
-    if (aad.length > 4096) throw invalidEnvelope();
-    return aad;
-}
-function checkExpected(header, expected, localID) {
-    if (!expected || typeof expected !== 'object')
-        throw engineError(
-            'independent envelope expectations are required',
-            'ENVELOPE_EXPECTATION_REQUIRED'
-        );
-    scalarString(expected.contextID);
-    if (
-        expected.sender !== header.sender ||
-        expected.receiver !== header.receiver ||
-        expected.contextID !== header.contextID ||
-        expected.purpose !== header.purpose ||
-        header.receiver !== localID
-    ) {
-        throw engineError(
-            'envelope does not match the expected endpoints, context or purpose',
-            'ENVELOPE_EXPECTATION_MISMATCH'
-        );
-    }
-}
-
-// One byte-based authenticated operation. Wrapping is internal; no public
-// group-secret decoder or private-key export is introduced.
-async function sealBytes(key, header, bytes) {
-    const additionalData = encodeEnvelopeAAD$1(header);
-    const algorithm = {
-        name: 'AES-GCM',
-        iv: decodeBase64url(header.iv, 12),
-        tagLength: 128,
-        additionalData,
-    };
-    if (header.purpose === 'key-wrap') {
-        if (bytes.length !== 32 || !header.group) throw invalidEnvelope();
-        const temporary = await crypto.subtle.importKey(
-            'raw',
-            bytes,
-            'AES-GCM',
-            true,
-            ['encrypt', 'decrypt']
-        );
-        return encodeBase64url(
-            await crypto.subtle.wrapKey('raw', temporary, key, algorithm)
-        );
-    }
-    return encodeBase64url(await crypto.subtle.encrypt(algorithm, key, bytes));
-}
-async function openBytes(key, snapshot, legacy = false) {
-    const h = snapshot.header;
-    const algorithm = {
-        name: 'AES-GCM',
-        iv: snapshot.payload.iv,
-        tagLength: 128,
-        additionalData: encodeEnvelopeAAD$1(h, legacy),
-    };
-    if (h.purpose === 'key-wrap') {
-        if (snapshot.payload.bytes.length !== 48 || !h.group)
-            throw invalidEnvelope();
-        const temporary = await crypto.subtle.unwrapKey(
-            'raw',
-            snapshot.payload.bytes,
-            key,
-            algorithm,
-            'AES-GCM',
-            true,
-            ['encrypt', 'decrypt']
-        );
-        return new Uint8Array(await crypto.subtle.exportKey('raw', temporary));
-    }
-    return new Uint8Array(
-        await crypto.subtle.decrypt(algorithm, key, snapshot.payload.bytes)
-    );
-}
-
-class Envelopes {
-    constructor(keys, localID, replay) {
-        this.keys = keys;
-        this.localID = localID;
-        this.replay = replay;
-    }
-    async seal(
-        sender,
-        receiver,
-        value,
-        { contextID, purpose, group = null } = {}
-    ) {
-        if (typeof receiver === 'string' && receiver.startsWith('g'))
-            throw engineError(
-                'ECDH group endpoints are legacy-only',
-                'LEGACY_GROUP_API'
-            );
-        if (sender !== this.localID)
-            throw engineError(
-                'Missing private key for local sender account',
-                'INVALID_PRIVATE_KEY'
-            );
-        const bytes = bytesSnapshot(value, V2_LIMITS.plaintextBytes);
-        scalarString(contextID);
-        const [peer, privateKey, own] = await this.keys.endpointKeys(
-            receiver,
-            sender,
-            true
-        );
-        if (!peer)
-            throw engineError(
-                'Missing public key for selected peer',
-                'INVALID_KEY'
-            );
-        if (!privateKey)
-            throw engineError(
-                'Missing private key for local endpoint',
-                'INVALID_PRIVATE_KEY'
-            );
-        const metadata = await createV2Metadata(sender, own, peer, {
-            contextID,
-            sender,
-            receiver,
-            purpose,
-        });
-        const key = await deriveV2AES(sender, own, peer, privateKey, metadata);
-        const sequence = await this.replay.reserve({ ...metadata, group });
-        const template = headerSnapshot({
-            ...metadata,
-            iv: encodeBase64url(new Uint8Array(12)),
-            sequence,
-            group,
-        });
-        await this.keys.reserveUsage(
-            await derivationUsageID(metadata),
-            bytes.length,
-            encodeEnvelopeAAD$1(template).length
-        );
-        const header = headerSnapshot({
-            ...template,
-            iv: encodeBase64url(crypto.getRandomValues(new Uint8Array(12))),
-        });
-        return { header, ciphertext: await sealBytes(key, header, bytes) };
-    }
-    async open(value, expected, legacy = false) {
-        const snapshot = envelopeSnapshot(value, legacy);
-        expected = expected && {
-            sender: expected.sender,
-            receiver: expected.receiver,
-            contextID: expected.contextID,
-            purpose: expected.purpose,
-        };
-        if (snapshot.header.suite === (legacy ? BE8_GROUP_SUITE : GROUP_SUITE))
-            throw invalidEnvelope();
-        checkExpected(snapshot.header, expected, this.localID);
-        const [peer, privateKey, own] = await this.keys.endpointKeys(
-            snapshot.header.sender,
-            expected.receiver,
-            true
-        );
-        if (!peer)
-            throw engineError(
-                'Missing public key for selected peer',
-                'INVALID_KEY'
-            );
-        if (!privateKey)
-            throw engineError(
-                'Missing private key for local endpoint',
-                'INVALID_PRIVATE_KEY'
-            );
-        const key = await deriveV2AES(
-            expected.receiver,
-            own,
-            peer,
-            privateKey,
-            headerMetadata(snapshot.header, legacy),
-            legacy
-        );
-        return {
-            header: snapshot.header,
-            bytes: await openBytes(key, snapshot, legacy),
-        };
     }
 }
 
@@ -3120,7 +5763,10 @@ class Groups {
         options = groupOptions(options);
         const contextID = options.contextID;
         scalarString(contextID);
-        if (!Array.isArray(recipients) || recipients.length > 256)
+        if (
+            !Array.isArray(recipients) ||
+            recipients.length > SESSION_LIMITS.recipients
+        )
             throw engineError(
                 'explicit recipient array of at most 256 accounts required',
                 'INVALID_ACCOUNT'
@@ -3431,306 +6077,6 @@ class Groups {
     }
 }
 
-/* global BigInt */
-
-const REPLAY_WINDOW = 128;
-const MASK = (1n << 128n) - 1n;
-const emptyBitmap = '0'.repeat(32);
-async function streamIdentity(header, legacy = false) {
-    const g = header.group;
-    const fields = [
-        header.suite,
-        header.contextID,
-        header.sender,
-        header.receiver,
-        header.senderFingerprint,
-        header.receiverFingerprint,
-        header.purpose,
-        g?.groupID || '',
-        g?.epoch || '',
-        g?.generation || '',
-    ];
-    const bytes = encodeFields(
-        legacy ? BE8_DOMAINS.replay : 'BE9-REPLAY-STREAM',
-        fields.map((value) => new TextEncoder().encode(value))
-    );
-    return encodeBase64url(await crypto.subtle.digest('SHA-256', bytes));
-}
-function contextRecord(record) {
-    if (!record)
-        throw engineError(
-            'explicitly open the local context first',
-            'CONTEXT_NOT_OPEN'
-        );
-    if (record.status === 'closed')
-        throw engineError(
-            'context is permanently closed; use a fresh context ID',
-            'CONTEXT_CLOSED'
-        );
-    if (
-        record.status !== 'open' ||
-        !Array.isArray(record.streams) ||
-        record.streams.length > 1024 ||
-        !record.streams.every(
-            (entry) =>
-                entry &&
-                typeof entry.streamID === 'string' &&
-                /^[A-Za-z0-9_-]{43}$/.test(entry.streamID) &&
-                ['send', 'receive'].includes(entry.direction)
-        )
-    )
-        throw engineError('invalid context state', 'STATE_LOST');
-    return record;
-}
-class Replay {
-    constructor(keys) {
-        this.keys = keys;
-    }
-    async openContext(contextID) {
-        scalarString(contextID);
-        return this.keys.run([STORES.contexts], 'readwrite', (tx) => {
-            const store = tx.objectStore(STORES.contexts);
-            return requestResult(
-                store.get([this.keys.namespace, contextID]),
-                (current) => {
-                    if (current) {
-                        contextRecord(current);
-                        return { contextID, status: 'open' };
-                    }
-                    return requestResult(
-                        store.add({
-                            namespace: this.keys.namespace,
-                            contextID,
-                            status: 'open',
-                            streams: [],
-                        }),
-                        () => ({ contextID, status: 'open' })
-                    );
-                }
-            );
-        });
-    }
-    async closeContext(contextID) {
-        scalarString(contextID);
-        return this.keys.run([STORES.contexts], 'readwrite', (tx) => {
-            const store = tx.objectStore(STORES.contexts);
-            return requestResult(
-                store.get([this.keys.namespace, contextID]),
-                (record) => {
-                    if (!record)
-                        throw engineError(
-                            'context is not open',
-                            'CONTEXT_NOT_OPEN'
-                        );
-                    if (record.status === 'closed') return;
-                    contextRecord(record);
-                    return requestResult(
-                        store.put({ ...record, status: 'closed' })
-                    );
-                }
-            );
-        });
-    }
-    async initialize(header, direction, legacy = false) {
-        const streamID = await streamIdentity(header, legacy);
-        const name =
-            direction === 'send' ? STORES.sendState : STORES.receiveState;
-        return this.keys.run([STORES.contexts, name], 'readwrite', (tx) => {
-            const contexts = tx.objectStore(STORES.contexts);
-            const states = tx.objectStore(name);
-            return requestResult(
-                contexts.get([this.keys.namespace, header.contextID]),
-                (value) => {
-                    const context = contextRecord(value);
-                    const known = context.streams.some(
-                        (entry) =>
-                            entry.streamID === streamID &&
-                            entry.direction === direction
-                    );
-                    return requestResult(
-                        states.get([
-                            this.keys.namespace,
-                            header.contextID,
-                            streamID,
-                        ]),
-                        (state) => {
-                            if (known) {
-                                if (!state)
-                                    throw engineError(
-                                        'registered stream state is missing; no reset is allowed',
-                                        'STATE_LOST'
-                                    );
-                                return streamID;
-                            }
-                            if (state || context.streams.length >= 1024)
-                                throw engineError(
-                                    'inconsistent or exhausted context state',
-                                    'STATE_LOST'
-                                );
-                            const base = {
-                                namespace: this.keys.namespace,
-                                contextID: header.contextID,
-                                streamID,
-                            };
-                            states.add(
-                                direction === 'send'
-                                    ? { ...base, last: '0' }
-                                    : {
-                                          ...base,
-                                          highest: '0',
-                                          bitmap: emptyBitmap,
-                                      }
-                            );
-                            return requestResult(
-                                contexts.put({
-                                    ...context,
-                                    streams: [
-                                        ...context.streams,
-                                        { streamID, direction },
-                                    ],
-                                }),
-                                () => streamID
-                            );
-                        }
-                    );
-                }
-            );
-        });
-    }
-    async reserve(header) {
-        const streamID = await this.initialize(header, 'send');
-        return this.keys.run(
-            [STORES.contexts, STORES.sendState],
-            'readwrite',
-            (tx) =>
-                requestResult(
-                    tx
-                        .objectStore(STORES.contexts)
-                        .get([this.keys.namespace, header.contextID]),
-                    (context) => {
-                        contextRecord(context);
-                        const store = tx.objectStore(STORES.sendState);
-                        return requestResult(
-                            store.get([
-                                this.keys.namespace,
-                                header.contextID,
-                                streamID,
-                            ]),
-                            (record) => {
-                                if (!record)
-                                    throw engineError(
-                                        'send counter is missing',
-                                        'STATE_LOST'
-                                    );
-                                const last = sequenceValue(record.last);
-                                if (last === MAX_SEQUENCE)
-                                    throw engineError(
-                                        'uint64 send counter exhausted',
-                                        'COUNTER_EXHAUSTED'
-                                    );
-                                const sequence = String(last + 1n);
-                                return requestResult(
-                                    store.put({ ...record, last: sequence }),
-                                    () => sequence
-                                );
-                            }
-                        );
-                    }
-                )
-        );
-    }
-    async accept(header, legacy = false) {
-        const streamID = await streamIdentity(header, legacy);
-        return this.keys.run(
-            [STORES.contexts, STORES.receiveState],
-            'readwrite',
-            (tx) =>
-                requestResult(
-                    tx
-                        .objectStore(STORES.contexts)
-                        .get([this.keys.namespace, header.contextID]),
-                    (value) => {
-                        const context = contextRecord(value);
-                        if (
-                            !context.streams.some(
-                                (entry) =>
-                                    entry.streamID === streamID &&
-                                    entry.direction === 'receive'
-                            )
-                        )
-                            throw engineError(
-                                'explicitly initialize expected receive stream first',
-                                'STREAM_NOT_OPEN'
-                            );
-                        const store = tx.objectStore(STORES.receiveState);
-                        return requestResult(
-                            store.get([
-                                this.keys.namespace,
-                                header.contextID,
-                                streamID,
-                            ]),
-                            (record) => {
-                                if (
-                                    !record ||
-                                    typeof record.bitmap !== 'string' ||
-                                    !/^[0-9a-f]{32}$/.test(record.bitmap)
-                                )
-                                    throw engineError(
-                                        'receive state is missing or invalid',
-                                        'STATE_LOST'
-                                    );
-                                let highest = sequenceValue(record.highest);
-                                let bitmap = BigInt('0x' + record.bitmap);
-                                if (
-                                    (highest < 128n &&
-                                        bitmap >> highest !== 0n) ||
-                                    (highest > 0n && !(bitmap & 1n))
-                                )
-                                    throw engineError(
-                                        'invalid receive window',
-                                        'STATE_LOST'
-                                    );
-                                const sequence = sequenceValue(header.sequence);
-                                if (sequence > highest) {
-                                    const distance = sequence - highest;
-                                    bitmap =
-                                        distance >= 128n
-                                            ? 1n
-                                            : ((bitmap << distance) | 1n) &
-                                              MASK;
-                                    highest = sequence;
-                                } else {
-                                    const distance = highest - sequence;
-                                    if (distance >= 128n)
-                                        throw engineError(
-                                            'sequence is outside the replay window',
-                                            'REPLAY_TOO_OLD'
-                                        );
-                                    const bit = 1n << distance;
-                                    if (bitmap & bit)
-                                        throw engineError(
-                                            'sequence was already accepted',
-                                            'REPLAY_DUPLICATE'
-                                        );
-                                    bitmap |= bit;
-                                }
-                                return requestResult(
-                                    store.put({
-                                        ...record,
-                                        highest: String(highest),
-                                        bitmap: bitmap
-                                            .toString(16)
-                                            .padStart(32, '0'),
-                                    })
-                                );
-                            }
-                        );
-                    }
-                )
-        );
-    }
-}
-
 const encodeV2DerivationInfo = (metadata) => encodeV2DerivationInfo$1(metadata);
 const encodeBe8DerivationInfo = (metadata) =>
     encodeV2DerivationInfo$1(metadata, true);
@@ -3753,6 +6099,13 @@ class Be9 {
     static encodeEnvelopeAAD = encodeEnvelopeAAD;
     static REPLAY_WINDOW = REPLAY_WINDOW;
 
+    static RATCHET_SUITE = RATCHET_SUITE;
+    static SIGNED_GROUP_SUITE = SIGNED_GROUP_SUITE;
+    static SESSION_LIMITS = SESSION_LIMITS;
+    static encodeRatchetAAD = encodeRatchetAAD;
+    #signing;
+    #sessions;
+    #signedGroups;
     #keys;
     #envelopes;
     #replay;
@@ -3783,27 +6136,38 @@ class Be9 {
             return Promise.reject(error);
         }
         if (this.#guarded.has(original)) return this.#guarded.get(original);
-        const guarded = Promise.resolve(original).then(async (result) => {
-            try {
+        const guarded = Promise.resolve(original).then(
+            async (result) => {
+                try {
+                    this.#keys.assertActive();
+                    if (generation !== this.#generation)
+                        throw engineError(
+                            'operation generation invalidated',
+                            'ENGINE_LOCKED'
+                        );
+                    await this.#keys.checkLifecycle();
+                    this.#keys.assertActive();
+                    if (generation !== this.#generation)
+                        throw engineError(
+                            'operation generation invalidated',
+                            'ENGINE_LOCKED'
+                        );
+                    return result;
+                } catch (error) {
+                    if (result instanceof Uint8Array) result.fill(0);
+                    throw error;
+                }
+            },
+            (error) => {
                 this.#keys.assertActive();
                 if (generation !== this.#generation)
                     throw engineError(
                         'operation generation invalidated',
                         'ENGINE_LOCKED'
                     );
-                await this.#keys.checkLifecycle();
-                this.#keys.assertActive();
-                if (generation !== this.#generation)
-                    throw engineError(
-                        'operation generation invalidated',
-                        'ENGINE_LOCKED'
-                    );
-                return result;
-            } catch (error) {
-                if (result instanceof Uint8Array) result.fill(0);
                 throw error;
             }
-        });
+        );
         this.#guarded.set(original, guarded);
         return guarded;
     }
@@ -3824,6 +6188,14 @@ class Be9 {
             this.#envelopes,
             this.#replay,
             this.#accID
+        );
+        this.#signing = new Signing(this.#keys);
+        this.#sessions = new Sessions(this.#keys, this.#signing);
+        this.#signedGroups = new SignedGroups(
+            this.#keys,
+            this.#groups,
+            this.#signing,
+            this.#replay
         );
         this.#keys.onLock = () => this.#invalidateLocal();
         // Guard every public async operation, including raw AES/archive/getters.
@@ -4723,6 +7095,128 @@ class Be9 {
         return this.#legacySimple(sender, receiver, cipherImage, iv);
     }
 
+    async setupSigningIdentity() {
+        return this.#signing.setup();
+    }
+    async getSigningPublicKey() {
+        return this.#signing.getPublic();
+    }
+    async addSigningPublicKey(peer, key, decision) {
+        return this.#signing.import(peer, key, decision);
+    }
+    async replaceSigningPublicKey(peer, key, confirmation) {
+        return this.#signing.replace(peer, key, confirmation);
+    }
+    async rotateSigningIdentity(confirmation) {
+        return this.#signing.rotate(confirmation);
+    }
+    async createSession(peer, options) {
+        return this.#sessions.create(peer, options);
+    }
+    async acceptSession(offer, expected) {
+        return this.#sessions.accept(offer, expected);
+    }
+    async finishSession(answer, expected) {
+        return this.#sessions.finish(answer, expected);
+    }
+    async getSession(id) {
+        return this.#sessions.inspect(id);
+    }
+    async closeSession(id) {
+        return this.#sessions.close(id);
+    }
+    async encryptRatchetEnvelope(id, bytes, options) {
+        return this.#sessions.seal(id, bytes, options);
+    }
+    async encryptRatchetText(id, text = '') {
+        return this.#sessions.seal(id, encodeText(text), { purpose: 'data' });
+    }
+    async encryptRatchetImage(id, image) {
+        return this.#sessions.seal(id, encodeText(image), {
+            purpose: 'attachment',
+        });
+    }
+    async receiveRatchetEnvelope(packet, expected) {
+        return this.#sessions.receive(packet, expected);
+    }
+    async receiveRatchetText(packet, expected) {
+        if (expected?.purpose !== 'data')
+            throw engineError('text purpose expected', 'INVALID_PURPOSE');
+        return this.#sessions.receive(packet, expected, true);
+    }
+    async receiveRatchetImage(packet, expected) {
+        if (expected?.purpose !== 'attachment')
+            throw engineError('attachment purpose expected', 'INVALID_PURPOSE');
+        return this.#sessions.receive(packet, expected, true);
+    }
+    async openReceiveSignedGroupContext(expected) {
+        return this.#signedGroups.openReceive(expected);
+    }
+    async encryptSignedGroupEnvelope(id, bytes, options) {
+        return this.#signedGroups.seal(id, bytes, options);
+    }
+    async encryptSignedGroupText(id, text = '', options) {
+        return this.#signedGroups.seal(id, encodeText(text), {
+            contextID: groupOptions(options).contextID,
+            purpose: 'data',
+        });
+    }
+    async encryptSignedGroupImage(id, image, options) {
+        return this.#signedGroups.seal(id, encodeText(image), {
+            contextID: groupOptions(options).contextID,
+            purpose: 'attachment',
+        });
+    }
+    async receiveSignedGroupEnvelope(packet, expected) {
+        return this.#signedGroups.open(packet, expected);
+    }
+    async receiveSignedGroupText(packet, expected) {
+        if (expected?.purpose !== 'data')
+            throw engineError('text purpose expected', 'INVALID_PURPOSE');
+        return this.#signedGroups.open(packet, expected, true, true);
+    }
+    async receiveSignedGroupImage(packet, expected) {
+        if (expected?.purpose !== 'attachment')
+            throw engineError('attachment purpose expected', 'INVALID_PURPOSE');
+        return this.#signedGroups.open(packet, expected, true, true);
+    }
+    async decryptArchivedSignedGroupEnvelope(packet, expected) {
+        return this.#signedGroups.open(packet, expected, false);
+    }
+    async decryptArchivedSignedGroupText(packet, expected) {
+        if (expected?.purpose !== 'data')
+            throw engineError('text purpose expected', 'INVALID_PURPOSE');
+        return this.#signedGroups.open(packet, expected, false, true);
+    }
+    async decryptArchivedSignedGroupImage(packet, expected) {
+        if (expected?.purpose !== 'attachment')
+            throw engineError('attachment purpose expected', 'INVALID_PURPOSE');
+        return this.#signedGroups.open(packet, expected, false, true);
+    }
+    // Explicit repeatable archive names. Existing APIs keep their original semantics.
+    async decryptArchivedEnvelope(packet, expected) {
+        return this.decryptEnvelope(packet, expected);
+    }
+    async decryptArchivedText(packet, expected) {
+        if (expected?.purpose !== 'data')
+            throw engineError('text purpose expected', 'INVALID_PURPOSE');
+        return decodeText(await this.decryptEnvelope(packet, expected));
+    }
+    async decryptArchivedImage(packet, expected) {
+        if (expected?.purpose !== 'attachment')
+            throw engineError('attachment purpose expected', 'INVALID_PURPOSE');
+        return decodeText(await this.decryptEnvelope(packet, expected));
+    }
+    async decryptArchivedGroupEnvelope(packet, expected) {
+        return this.decryptGroupEnvelope(packet, expected);
+    }
+    async decryptArchivedGroupText(packet, expected) {
+        return this.decryptGroupText(packet, expected);
+    }
+    async decryptArchivedGroupImage(packet, expected) {
+        return this.decryptGroupImage(packet, expected);
+    }
+
     panic() {
         // Synchronous lock even if opening/deleting the database subsequently fails.
         this.#keys.lock();
@@ -4772,7 +7266,10 @@ class Be9 {
 
 export {
     GROUP_SUITE,
+    RATCHET_SUITE,
     REPLAY_WINDOW,
+    SESSION_LIMITS,
+    SIGNED_GROUP_SUITE,
     STORES,
     V2_LIMITS,
     V2_SUITE,
@@ -4782,6 +7279,7 @@ export {
     encodeBe8DerivationInfo,
     encodeBe8EnvelopeAAD,
     encodeEnvelopeAAD,
+    encodeRatchetAAD,
     encodeV2DerivationInfo,
     jwkThumbprint,
     migrateBe8Schema,

@@ -1,3 +1,11 @@
+For new sender-authenticated messages use `encryptSignedGroup*`,
+`openReceiveSignedGroupContext`, `receiveSignedGroup*` and
+`decryptArchivedSignedGroup*` from [profile 3](ratchet-migration.md).
+The APIs below describe the retained **unsigned v2 compatibility profile**;
+its live/archive behavior is unchanged. The new signed live path requires the
+active expected epoch and verifies locally trusted ECDSA authorship before
+selecting an epoch key. Only the explicit signed archive path permits retired epochs.
+
 # Symmetric group epochs
 
 This page specifies new Be9 packages. Retained Be8 key packages/group data use

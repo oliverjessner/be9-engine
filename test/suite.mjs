@@ -36,4 +36,6 @@ await import('./envelope.mjs');
 await import('./replay.mjs');
 await import('./panic.mjs');
 await import('./rename.mjs');
+await import('./ratchet.mjs');
+await import('./signed-group.mjs');
 QUnit.start();

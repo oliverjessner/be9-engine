@@ -74,3 +74,10 @@ remains outside engine control. Malicious JavaScript in the same context can
 bypass engine logic/use stored keys; non-extractable is neither XSS-safe nor
 hardware-protected. No wrapping-key erasure claim, complete security claim or
 passed audit is made.
+
+## Profile 3 state
+
+Signing, session, ratchet and skipped-key records participate in the same native
+namespace-generation invalidation. Session registry rows are retained and marked
+closed; the signing-generation marker survives. They cannot be blanket-deleted
+with operational state. See the exact [delete/retain policy](ratchet-migration.md#lifecycle-and-storage-ownership).

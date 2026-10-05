@@ -91,7 +91,7 @@ QUnit.module('Non-extractable local keys / explicit migration', hooks => {
         const { key: aes } = await alice.engine.createDerivationContext(bob.publicKey, generated.keyReference,
             { contextID: 'private export test', sender: alice.id, receiver: bob.id, purpose: 'data' });
         assert.false(aes.extractable, 'Derived AES keys are non-extractable');
-        assert.deepEqual(aes.usages, ['encrypt', 'decrypt'], 'AES allows only encryption and decryption');
+        assert.deepEqual([...aes.usages].sort(), ['decrypt', 'encrypt'], 'AES allows only encryption and decryption');
         await assert.rejects(crypto.subtle.exportKey('raw', aes),
             error => error instanceof DOMException && error.name === 'InvalidAccessError', 'Derived AES export is denied');
         assert.true(noPrivateJWK(rows), 'New database records contain no private d field');

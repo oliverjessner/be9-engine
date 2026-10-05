@@ -10,7 +10,73 @@ and domain identifiers; retained Be8 ciphertexts require explicit Be8 readers.
 See [rename and migration](docs/be9-migration.md) for breaking changes, code,
 compatibility APIs and validation results.
 
-## usage
+## New communication: authenticated sessions and signed groups
+
+New pairwise sessions use profile 3: separate ECDSA signing identities authenticate
+an interactive bootstrap, fresh P-384 ratchet keys update HKDF root/chain keys,
+and each message consumes a distinct non-extractable AES-GCM key. Group messages
+use a new signed suite so holding the shared epoch secret does not authorize
+another sender's authorship. No transport or messenger features are included.
+
+Read [bootstrap and trust](docs/session-bootstrap.md), [ratchet/state/limits](docs/ratchet.md),
+[properties and compromise boundaries](docs/security-properties.md), and
+[migration/API choices](docs/ratchet-migration.md) before integration.
+
+After application-owned schema integration and `setup()` on each independent engine:
+
+```javascript
+// alice and bob have separate local databases/identities, accounts '1'/'2'.
+// Their ECDH public keys have already been independently confirmed locally.
+const a = await alice.setupSigningIdentity();
+const b = await bob.setupSigningIdentity();
+// confirmedAliceSigner / confirmedBobSigner originate in application trust state,
+// not the same unconfirmed source that supplied the public key.
+await alice.addSigningPublicKey('2', b.publicKey, {
+    identityFingerprint: b.identityFingerprint,
+    expectedFingerprint: confirmedBobSigner,
+});
+await bob.addSigningPublicKey('1', a.publicKey, {
+    identityFingerprint: a.identityFingerprint,
+    expectedFingerprint: confirmedAliceSigner,
+});
+const contextID = 'application-chosen-context';
+const offer = await alice.createSession('2', { contextID });
+// The application retains this locally generated ID and independently supplies
+// expected bootstrap bindings to Bob; the engine provides no delivery mechanism.
+const sessionID = offer.header.sessionID;
+const expectedBob = { sender: '1', receiver: '2', sessionID, contextID };
+const expectedAlice = { ...expectedBob, sender: '2', receiver: '1' };
+const answer = await bob.acceptSession(offer, expectedBob);
+await alice.finishSession(answer, expectedAlice);
+const packet = await alice.encryptRatchetText(sessionID, 'Hello 🐈');
+const plaintext = await bob.receiveRatchetText(packet, { ...expectedBob, purpose: 'data' });
+// Bob can reply after receiving Alice's first authenticated ratchet packet.
+```
+
+Live receive commits acceptance before returning plaintext. Explicit
+`decryptArchived*` methods are repeatable readers for existing static v2/group
+archives. Old unqualified decrypt methods retain their compatibility semantics
+and are deprecated for live receipt. Ratchet messages have no repeatable archive
+reader or secret-export API. Applications must not construct expectations from
+incoming envelopes. Passing a complete wire header is rejected; provenance of a
+manually copied subset cannot be inferred by the engine.
+
+The static v2 and unsigned group methods described below remain explicit
+compatibility APIs. They do not acquire ratchet secrecy or sender signatures.
+
+
+The schema helper also integrates six profile-3 stores, all indexed by namespace:
+
+| Store | Primary key | Contents |
+| --- | --- | --- |
+| `be9.signingKeys` | `[namespace, accID]` | Local non-extractable signing pair, public fingerprints |
+| `be9.signingTrust` | `[namespace, peerID]` | Public signing key and explicit ECDH-bound local trust |
+| `be9.sessionRegistry` | `[namespace, sessionID]` | Retained revisions/tags, closed IDs and signing-generation marker |
+| `be9.sessions` | `[namespace, sessionID]` | Immutable bindings/bootstrap; pending local DH private until finish |
+| `be9.ratchetState` | `[namespace, sessionID]` | Current non-extractable root/chains/DH and bounded acceptance state |
+| `be9.skippedKeys` | `[namespace, sessionID, chain, number]` | Bounded single-use non-extractable message seeds, with session index |
+
+## Database and static-profile compatibility usage
 
 The constructor takes a canonical nonnegative decimal account ID, a ready native
 `IDBDatabase` (or an existing request/adapter whose `result` is that database),
@@ -515,8 +581,8 @@ exists. UUID/UTF-8 IVs and padded Base64 are accepted only by explicit
 For older HKDF packets with UUID IVs, derive with their original v2 metadata and
 use the explicit legacy wire decoder, retaining HKDF rather than selecting the
 old direct-ECDH KDF. Existing ciphertext is not rewritten or deleted.
-These helpers do not yet implement the authenticated v2 envelope; see
-[integration limits](docs/v2-profile.md#envelope-integration-status-and-limits).
+These explicit unframed readers do not add authenticated application headers; see
+[integration limits](docs/v2-profile.md#envelope-integration-and-limits).
 
 ## Scripts
 ### building
@@ -529,23 +595,27 @@ npm run build
 
 ### Testing
 
-The automated QUnit suite runs the source modules in headless Chromium with
-native WebCrypto and IndexedDB. It requires Node.js 20 or newer. Install the
+The automated QUnit suite supports source, ESM distribution and IIFE distribution
+in headless Chromium, Firefox and WebKit with native WebCrypto and IndexedDB. It requires Node.js 20 or newer. Install the
 development dependencies and the Playwright browser once:
 
 ```bash
 npm ci
-npx playwright install chromium
+npx playwright install chromium firefox webkit
 ```
 
-On Linux CI hosts, use `npx playwright install --with-deps chromium` when browser
+On Linux CI hosts, use `npx playwright install --with-deps chromium firefox webkit` when browser
 system libraries are missing. Playwright is a development dependency only.
 See the [Playwright library documentation](https://playwright.dev/docs/library).
 
 Run the full suite:
 
 ```bash
-npm test
+npm test                    # source / Chromium
+npm run test:esm             # generated ESM / Chromium
+npm run test:iife            # generated IIFE / Chromium
+npm run test:all             # all nine browser × source/distribution cells
+npm run test:build           # compare distribution bytes against a fresh build
 ```
 
 Exit codes are `0` for a complete passing suite, `1` for failed assertions, and
@@ -611,13 +681,19 @@ synthetic peers; no trust record is taken from an exchanged key object.
 Timeouts in the runner and failure tests are failure deadlines, not readiness
 waits. Test output excludes assertion data and raw browser errors.
 
-The suite exercises native Chromium WebCrypto/IndexedDB. Other browsers,
-hardware failures, and storage exhaustion beyond native constraint/abort error
-paths were not validated here. Application-level trust decisions remain with the
+The browser matrix exercises native Chromium, Firefox and WebKit WebCrypto/IndexedDB.
+Hardware failures and storage exhaustion beyond native constraint/abort error
+paths are not simulated. Required native P-384 ECDH/ECDSA, HKDF and CryptoKey clone
+capabilities fail with exit code 2 if absent; there is no crypto mock or silent skip.
+HKDF export refuses with native InvalidAccessError or NotSupportedError depending
+on browser validation order. Exact usage **sets** are checked independent of native ordering.
+CI installs each browser and runs all nine cells, rebuilds after tests and checks
+committed distribution parity. A failed/unsupported cell remains a failed job. Application-level trust decisions remain with the
 caller. The [v2 profile](docs/v2-profile.md), authenticated
 [envelope and replay state](docs/envelope-state.md), [group epochs](docs/group-epochs.md)
-and [local invalidation](docs/lifecycle.md) are implemented. Shared group secrets
-do not prove individual authorship or enforce membership. Random IVs do not guarantee
+and [local invalidation](docs/lifecycle.md) are implemented. Unsigned v2 shared group secrets
+do not prove individual authorship or enforce membership; profile 3 adds separately
+trusted sender signatures, without membership management. Random IVs do not guarantee
 collision freedom; state coordination is limited to one application-owned
 database and assumes preserved counters. This is not a security audit, and no
 guaranteed secret-memory erasure is claimed.

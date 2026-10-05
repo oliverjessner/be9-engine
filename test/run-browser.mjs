@@ -1,4 +1,4 @@
-import { chromium } from 'playwright';
+import { chromium, firefox, webkit } from 'playwright';
 import { createTestServer } from './server.mjs';
 
 let server;
@@ -6,11 +6,17 @@ let browser;
 let phase = 'server startup';
 try {
     const args = process.argv.slice(2);
-    if (args.length && (args.length !== 2 || args[0] !== '--bundle' || !['source', 'esm', 'iife'].includes(args[1]))) throw new Error('Invalid test runner options');
-    const bundle = args[1] || 'source';
+    const options = {};
+    if (args.length % 2) throw new Error('Invalid runner options');
+    for (let i = 0; i < args.length; i += 2) {
+        if (!['--bundle', '--browser'].includes(args[i]) || options[args[i]]) throw new Error('Invalid runner options');
+        options[args[i]] = args[i + 1];
+    }
+    const bundle = options['--bundle'] || 'source', browserName = options['--browser'] || 'chromium';
+    if (!['source', 'esm', 'iife'].includes(bundle) || !['chromium', 'firefox', 'webkit'].includes(browserName)) throw new Error('Invalid runner options');
     server = await createTestServer(0, { bundle });
-    phase = 'browser launch (install with npx playwright install chromium)';
-    browser = await chromium.launch({ headless: true });
+    phase = 'browser launch (' + browserName + ')';
+    browser = await ({ chromium, firefox, webkit })[browserName].launch({ headless: true });
     const context = await browser.newContext();
     const page = await context.newPage();
     let browserErrors = 0;
@@ -30,15 +36,22 @@ try {
     phase = 'test page load';
     await page.goto(server.url);
     phase = 'native browser capabilities';
-    const nativeAvailable = await page.evaluate(() =>
-        window.isSecureContext && !!window.crypto?.subtle && !!window.indexedDB);
+    const nativeAvailable = await page.evaluate(async () => {
+        if (!window.isSecureContext || !window.crypto?.subtle || !window.indexedDB) return false;
+        try {
+            const dh = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-384' }, false, ['deriveBits']);
+            const signing = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-384' }, false, ['sign', 'verify']);
+            const hkdf = await crypto.subtle.importKey('raw', new Uint8Array(32), 'HKDF', false, ['deriveBits', 'deriveKey']);
+            return [dh.privateKey, signing.privateKey, hkdf].every(key => !structuredClone(key).extractable);
+        } catch { return false; }
+    });
     if (!nativeAvailable) {
         throw new Error('Browser capabilities unavailable');
     }
     phase = 'QUnit completion';
     // Event-driven completion; the timer is a failure deadline, not a readiness wait.
     const result = await page.evaluate(() => new Promise((resolve, reject) => {
-        const deadline = setTimeout(() => reject(new Error('Browser suite deadline exceeded')), 60000);
+        const deadline = setTimeout(() => reject(new Error('Browser suite deadline exceeded')), 120000);
         if (!window.__be9TestDone) {
             clearTimeout(deadline);
             reject(new Error('Browser suite not registered'));
@@ -54,7 +67,7 @@ try {
             ' (' + test.passed + '/' + test.total + ' assertions)');
     }
     const failedTests = result.tests.filter(test => test.failed).length;
-    console.log('Bundle: ' + bundle);
+    console.log('Browser: ' + browserName + ' ' + browser.version() + '; bundle: ' + bundle);
     console.log('Tests: ' + result.tests.length + ', failed: ' + failedTests +
         '; assertions: ' + result.assertions.passed + '/' + result.assertions.total +
         '; browser errors: ' + browserErrors + '; resource failures: ' + resourceFailures);

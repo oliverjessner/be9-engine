@@ -31,7 +31,7 @@ QUnit.module('Symmetric group epochs / isolated instances', hooks => {
             assert.strictEqual(rows.length, 1, 'Own database retains one independent epoch record');
             assert.true(rows[0].key instanceof CryptoKey && !rows[0].key.extractable, 'Operative group secret is non-extractable');
             assert.deepEqual(rows[0].key.usages, ['deriveKey'], 'Persisted HKDF material only derives keys');
-            await assert.rejects(crypto.subtle.exportKey('raw', rows[0].key), error => error.name === 'InvalidAccessError', 'Stored group export fails');
+            await assert.rejects(crypto.subtle.exportKey('raw', rows[0].key), error => error instanceof DOMException && ['InvalidAccessError', 'NotSupportedError'].includes(error.name), 'Stored group export fails');
             assert.deepEqual(await peer.engine.getGroupEpochs(groupID), [result.epoch], 'Getter exposes only public epoch metadata');
             assert.false(Object.hasOwn(rows[0], 'd'), 'Group record has no private JWK field');
             await activate(peer, '1');

@@ -82,7 +82,7 @@ Identität bleibt nach Migration gesperrt; nur das bereits vorhandene explizite
 
 Diese Schema-Migration exportiert und importiert keine Schlüssel. Bereits
 vorhandene private JWKs werden damit nicht automatisch konvertiert. Dafür bleibt
-nach Schema-Integration die separate explizite `migrateLegacyIdentity()` nötig.
+nach Schema-Integration die separate explizite `migratePrivateKeys()` nötig.
 Unscoped historische Stores (`publicKeys`, `privateKeys`, `groupKeys`) werden
 dabei wie bisher nur ausdrücklich und für die gewählten Datensätze behandelt.
 Nicht exportierbare `deriveKey`-only Identitäten behalten ihre Legacy-Lesbarkeit;
@@ -228,3 +228,13 @@ interne Codec-/Persistenz-Unit-Helpers importieren weiterhin den Quellcode.
 
 - [dist/bundle.min.js](../dist/bundle.min.js)
 - [dist/bundle.mjs](../dist/bundle.mjs)
+
+## Ratchet und Sender-Signaturen
+
+Neue Sessions und signierte Gruppen verwenden getrennte Profile der Version 3.
+Die oben beschriebene historische Be8-Migration bleibt explizit. Die Anwendung
+integriert zusätzlich die neuen Stores und etabliert eine eigenständige Signing-
+Identität sowie neue Ratchet-Sessions; bestehende Archive werden nicht konvertiert.
+Siehe [Ratchet-Migration](ratchet-migration.md). Die früheren Chromium-Ergebnisse
+oben dokumentieren die damalige Umbenennung; die aktuelle Browsermatrix umfasst
+Source, ESM und IIFE in Chromium, Firefox und WebKit.

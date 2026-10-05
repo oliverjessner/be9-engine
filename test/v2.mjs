@@ -164,7 +164,7 @@ QUnit.module('v2 / P-384 ECDH plus HKDF-SHA-256', hooks => {
         const { alice, bob } = this;
         const context = await alice.createContext(bob.publicKey, { purpose: 'key-wrap' });
         const recipient = await bob.derive(alice.publicKey, context.derivation);
-        assert.deepEqual(context.key.usages, ['wrapKey', 'unwrapKey'], 'Wrapping purpose does not permit direct data encryption');
+        assert.deepEqual([...context.key.usages].sort(), ['unwrapKey', 'wrapKey'], 'Wrapping purpose does not permit direct data encryption');
         const publicKey = await crypto.subtle.importKey('jwk', alice.publicKey, { name: 'ECDH', namedCurve: 'P-384' }, true, []);
         const wrapped = await crypto.subtle.wrapKey('jwk', publicKey, context.key, encryption);
         const restored = await crypto.subtle.unwrapKey('jwk', wrapped, recipient, encryption,

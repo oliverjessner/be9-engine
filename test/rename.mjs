@@ -41,7 +41,7 @@ QUnit.module('Be9 rename / explicit Be8 migration and readers', hooks => {
         await assert.rejects(blocked.setup(), fail('LEGACY_SCHEMA_MIGRATION_REQUIRED'), 'Setup never generates another identity beside old stores');
         assert.deepEqual(await rows(owner.database, BE8_STORES.privateKeys), allBefore[2], 'Original private records are untouched');
         const current = await migrate(this, owner);
-        const allAfter = await Promise.all(Object.values(STORES).map(name => rows(current.database, name)));
+        const allAfter = await Promise.all(Object.keys(BE8_STORES).map(key => rows(current.database, STORES[key])));
         assert.deepEqual(allAfter, allBefore, 'Every structured record and security counter survives rename');
         assert.strictEqual((await current.engine.getMyPublicKey()).x, alice.publicKey.x, 'Migration preserves cryptographic identity');
         assert.strictEqual((await current.engine.getPeerTrust('103')).status, 'unverified', 'Unverified records are never promoted to trusted');
@@ -152,7 +152,7 @@ QUnit.module('Be9 rename / explicit Be8 migration and readers', hooks => {
         assert.strictEqual(fresh.header.suite, GROUP_SUITE, 'Retained secret uses the current suite for new data');
         assert.strictEqual(await alice.engine.decryptGroupText(fresh, { ...exp, sender: bob.id, contextID: 'new group context' }), 'Be9 group', 'Migrated operative key interoperates under new group info');
         const key = (await rows(bob.database, STORES.groupEpochs))[0].key;
-        await assert.rejects(crypto.subtle.exportKey('raw', key), error => error.name === 'InvalidAccessError', 'No migration/export shortcut exposes group secret');
+        await assert.rejects(crypto.subtle.exportKey('raw', key), error => error instanceof DOMException && ['InvalidAccessError', 'NotSupportedError'].includes(error.name), 'No migration/export shortcut exposes group secret');
         await alice.engine.panic(); await assert.rejects(alice.engine.decryptBe8GroupText(packet, exp), fail('ENGINE_LOCKED'), 'Legacy readers obey panic lifecycle too');
     });
     QUnit.test('Migrated tombstones remain locked, retain generation and never create another identity implicitly', async function (assert) {
